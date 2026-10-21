@@ -11415,3 +11415,58 @@ fn scans_have_no_coordinates_to_give_away() {
     assert!(s.run("share.exportRaster", &json!({"path": out.display().to_string()})).is_ok());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The PostGIS tab's commands need a connection first, and a connection that isn't there fails
+/// as an error that never shows its password, leaving the session unconnected.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn postgis_tab_needs_a_connection() {
+    let mut s = Session::new(Project::default());
+    assert_eq!(s.run("pg.status", &json!({})).unwrap()["connected"], false);
+    for (id, p) in [("pg.tables", json!({})), ("pg.addLayer", json!({"table": "roads"})), ("pg.disconnect", json!({}))] {
+        let e = s.run(id, &p).unwrap_err();
+        assert!(e.contains("connect to a PostGIS database first"), "{id}: {e}");
+    }
+    let before = s.map().layers.len();
+    let e =
+        s.run("pg.connect", &json!({"host": "127.0.0.1", "port": 1, "database": "gis", "user": "me", "password": "s3cret"})).unwrap_err();
+    assert!(e.starts_with("gis: ") && !e.contains("s3cret"), "{e}");
+    let e = s.run("pg.connect", &json!({"connection": "postgresql://me:s3cret@127.0.0.1:1/gis"})).unwrap_err();
+    assert!(!e.contains("s3cret"), "{e}");
+    assert!(s.postgis.is_none());
+    assert_eq!(s.map().layers.len(), before);
+}
+
+/// A live PostGIS database through the PostGIS tab's commands: `RUSTGIS_TEST_POSTGIS` names one
+/// (as for `postgis_live_end_to_end`) with a table that has an integer primary key.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+#[ignore]
+fn postgis_tab_live() {
+    let Ok(dsn) = std::env::var("RUSTGIS_TEST_POSTGIS") else { return };
+    let mut s = Session::new(Project::default());
+    let dsn = dsn.trim_start_matches("postgres:").to_string();
+    let r = s.run("pg.connect", &json!({"connection": dsn})).unwrap();
+    assert_eq!(r["connected"], true);
+    assert_eq!(s.run("pg.status", &json!({})).unwrap()["connected"], true);
+    let listed = s.run("pg.tables", &json!({})).unwrap();
+    let names: Vec<String> = listed["tables"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).map(str::to_string).collect();
+    assert!(!names.is_empty());
+    // The first table with an integer key loads whole, every row with its version.
+    let r = names.iter().find_map(|n| s.run("pg.addLayer", &json!({"table": n, "limit": 500})).ok()).expect("a table with an integer key");
+    let id = r["layers"][0].as_u64().unwrap() as u32;
+    let l = s.map().layer(id).unwrap();
+    assert!(!l.is_streamed() && !l.dataset.features.is_empty());
+    let pg = l.postgis.as_ref().unwrap();
+    assert_eq!(pg.versions.len(), l.dataset.features.len());
+    assert!(l.dataset.features.iter().all(|f| pg.versions.get(f.id).is_some()));
+    // Saved with the project (never with a password), and read back.
+    let text = serde_json::to_string(l).unwrap();
+    assert!(text.contains("\"versions\"") && !text.contains("password"), "{}", &text[..text.len().min(400)]);
+    // A condition no row meets loads nothing, and a bad one is the server's error.
+    let table = l.postgis.as_ref().unwrap().origin.table.clone();
+    assert!(s.run("pg.addLayer", &json!({"table": table, "where": "1 = 1; DROP TABLE x"})).unwrap_err().contains("without ';'"));
+    assert!(s.run("pg.addLayer", &json!({"table": table, "where": "no_such_column > 1"})).is_err());
+    s.run("pg.disconnect", &json!({})).unwrap();
+    assert!(s.postgis.is_none());
+}

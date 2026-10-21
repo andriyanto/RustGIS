@@ -95,6 +95,74 @@ pub struct PostgisOrigin {
     pub crs: Option<String>,
 }
 
+/// A PostGIS table a layer was loaded from whole to be edited: what saving its edits writes to
+/// (desktop only). The layer's feature ids are the table's key.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PostgisEdit {
+    /// The connection (never with its password), the table and the family loaded.
+    pub origin: PostgisOrigin,
+    /// The table's integer primary key column.
+    pub key: String,
+    /// The SRID of the table's geometry.
+    pub srid: i32,
+    /// Whether the user it was loaded as may insert, update and delete rows.
+    pub writable: bool,
+    /// Each loaded row's version by its key, as read: saving checks the database against them,
+    /// so a row changed or deleted by someone else since is a conflict, not overwritten.
+    #[serde(default)]
+    pub versions: Versions,
+}
+
+/// Row versions (PostgreSQL's `xmin`) by key, shared until changed like a dataset's features:
+/// an undo snapshot copies a pointer, not the map.
+#[derive(Clone, Default, PartialEq)]
+pub struct Versions(Arc<std::collections::BTreeMap<u64, i64>>);
+
+impl Versions {
+    /// The version of the row with key `id`, if it was loaded.
+    pub fn get(&self, id: u64) -> Option<i64> {
+        self.0.get(&id).copied()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The keys and versions, in key order.
+    pub fn iter(&self) -> impl Iterator<Item = (u64, i64)> + '_ {
+        self.0.iter().map(|(k, v)| (*k, *v))
+    }
+}
+
+impl FromIterator<(u64, i64)> for Versions {
+    fn from_iter<I: IntoIterator<Item = (u64, i64)>>(it: I) -> Versions {
+        Versions(Arc::new(it.into_iter().collect()))
+    }
+}
+
+impl std::fmt::Debug for Versions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Versions({} rows)", self.0.len())
+    }
+}
+
+/// Saved as `[[key, version], …]` (JSON object keys would be text).
+impl Serialize for Versions {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(self.0.iter())
+    }
+}
+
+impl<'de> Deserialize<'de> for Versions {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Versions, D::Error> {
+        Vec::<(u64, i64)>::deserialize(d).map(|v| v.into_iter().collect())
+    }
+}
+
 /// A MySQL or MariaDB table a layer reads live.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MysqlOrigin {
@@ -722,4 +790,26 @@ pub fn set_waker(f: impl Fn() + Send + Sync + 'static) {
 /// Bumped whenever a background read finishes, so a cached map image knows to redraw.
 pub fn generation() -> u64 {
     GENERATION.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn postgis_edits_keep_their_row_versions() {
+        let edit = super::PostgisEdit {
+            origin: super::PostgisOrigin { database: "postgres:host=h dbname=g".into(), table: "roads".into(), family: None, crs: None },
+            key: "gid".into(),
+            srid: 3857,
+            writable: true,
+            versions: [(1, 700), (2, 701), (u64::MAX, 9)].into_iter().collect(),
+        };
+        let text = serde_json::to_string(&edit).unwrap_or_default();
+        assert!(text.contains("\"versions\":[[1,700],[2,701],"), "{text}");
+        let back: super::PostgisEdit = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(back, edit);
+        assert_eq!((back.versions.get(2), back.versions.get(3), back.versions.len()), (Some(701), None, 3));
+        // A copy (an undo snapshot) shares the versions.
+        let copy = edit.clone();
+        assert!(std::sync::Arc::ptr_eq(&copy.versions.0, &edit.versions.0));
+    }
 }

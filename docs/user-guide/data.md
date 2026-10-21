@@ -168,6 +168,33 @@ A query can read any file the app can and fetch any web address, and a database 
 server, so the [AI Assistant](assistant.md) asks before it runs a query or reads a database, and
 plugins need both the files and network permissions.
 
+### The PostGIS tab
+
+The **PostGIS** tab of the ribbon (desktop only) works with one PostgreSQL database with PostGIS
+at a time, and loads its tables to be edited.
+
+- **Connect PostGIS** (`pg.connect`) asks for the host, port, database, user, password and
+  encryption, or takes a whole connection string instead. The connection lasts until you
+  **Disconnect** (`pg.disconnect`) or close RustGIS. It isn't saved with the project, and neither
+  is the password. Without a password, `PGPASSWORD` or libpq's password file serve.
+- **Add Layer** (`pg.addLayer`) lists the database's tables with a geometry or geography column
+  (`pg.tables`) and loads the one you choose whole, up to 100,000 rows, in the order of its key.
+  A **condition** (an SQL expression on its columns, such as `population > 10000`) loads only the
+  rows it keeps. The layer is an ordinary layer in memory, so every editing tool works on it.
+
+A table needs a single-column integer primary key to be added this way. The key becomes each
+feature's id, and the layer keeps each row's version (PostgreSQL's `xmin`) as it was read, so
+saving the edits back to the database can tell a row someone else changed or deleted since from
+one to overwrite. The layer says when the database's user can't insert, update or delete the
+table's rows.
+
+```sh
+rustgis-cli run --cmd 'pg.connect={"host":"localhost","database":"gis","user":"postgres","password":"…"}'   --cmd 'pg.addLayer={"table":"public.roads","where":"lanes > 2"}' --cmd 'share.exportMap={"path":"roads.png"}'
+```
+
+Connecting and adding a layer read the database, so the [AI Assistant](assistant.md) asks
+before it connects or adds a table, and plugins can't connect at all.
+
 ## MySQL and MariaDB
 
 **Home › Add Data › Database…** (`layer.addDatabase`) also connects to a MySQL (8 or later) or

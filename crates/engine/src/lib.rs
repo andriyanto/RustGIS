@@ -392,6 +392,9 @@ pub struct Session {
     /// Edits per layer id since the project was last saved (Edit › Status). A failed command's
     /// are rolled back; undo doesn't subtract them, since they count edits made, not the net change.
     pub edit_counts: std::collections::HashMap<u32, cmd::design::EditCounts>,
+    /// The PostGIS database the PostGIS tab works with (`pg.connect`): its connection, never
+    /// with its password. Kept for the session, not in the project.
+    pub postgis: Option<String>,
     /// The feature cache fills itself after projection changes (Data › Feature Cache).
     pub auto_cache: bool,
     /// Mensuration results (Analyze › Mensuration › Results).
@@ -588,6 +591,7 @@ impl Session {
             topology_errors: Vec::new(),
             measurements: Vec::new(),
             auto_cache: false,
+            postgis: None,
             undo: Vec::new(),
             redo: Vec::new(),
             merge: None,

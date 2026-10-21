@@ -3104,3 +3104,27 @@ Zoom To World	Zoom ke Dunia
 — fps	— fps
 ⌘K	⌘K
 ▶ Simulate	▶ Simulasikan
+Connect\nPostGIS	Hubungkan\nPostGIS
+Add\nLayer	Tambah\nLayer
+Connect to a PostgreSQL database with PostGIS.	Hubungkan ke database PostgreSQL dengan PostGIS.
+Close the PostGIS connection.	Tutup koneksi PostGIS.
+Add a table of the database as a layer you can edit.	Tambahkan tabel database sebagai layer yang bisa diedit.
+Connect PostGIS	Hubungkan PostGIS
+Add PostGIS Layer	Tambah Layer PostGIS
+User	Pengguna
+Encryption	Enkripsi
+When the server offers it	Jika server menyediakannya
+Always, certificate not checked	Selalu, sertifikat tidak diperiksa
+Always, certificate checked	Selalu, sertifikat diperiksa
+Connection string	String koneksi
+instead: host=… dbname=… user=…, or postgresql://…	sebagai gantinya: host=… dbname=… user=…, atau postgresql://…
+A PostgreSQL database with PostGIS. The password is kept until RustGIS closes, never in the project; without one, PGPASSWORD or the password file serve.	Database PostgreSQL dengan PostGIS. Kata sandi disimpan sampai RustGIS ditutup, tidak pernah di proyek; tanpa kata sandi, PGPASSWORD atau berkas kata sandi yang dipakai.
+Condition	Kondisi
+optional, such as population > 10000	opsional, misalnya population > 10000
+Most rows	Baris maksimum
+Layer name	Nama layer
+the table's	nama tabel
+Choose a table	Pilih tabel
+Most rows: a whole number	Baris maksimum: bilangan bulat
+{n} tables with geometry	{n} tabel dengan geometri
+A table of the connected database, loaded whole so you can edit it (up to 100,000 rows). Its integer primary key tells the rows apart.	Tabel dari database yang terhubung, dimuat utuh agar bisa diedit (hingga 100.000 baris). Primary key integer-nya membedakan setiap baris.

@@ -28,6 +28,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Tables with an estimated row count above this aren't counted exactly when opened.
 const EXACT_COUNT_BELOW: f64 = 2_000_000.0;
 
+/// The most rows a table loaded to be edited holds ([`PostgisSource::read_editable`]).
+pub const MAX_EDITABLE: usize = 100_000;
+
 /// How long counting or measuring a table when it opens may take (one never analyzed has no
 /// estimate, and could be large): past it the count or extent is left unknown.
 const PROBE_TIMEOUT: &str = "10s";
@@ -614,6 +617,19 @@ pub fn families(conn: &Conn, table: &Table) -> Result<Vec<Family>> {
 // ---------------------------------------------------------------------------------------------
 // The source
 
+/// A table's rows read to be edited ([`PostgisSource::read_editable`]).
+#[derive(Debug, Default)]
+pub struct Editable {
+    /// The rows, in key order; each feature's id is its key.
+    pub features: Vec<Feature>,
+    /// Each row's key and version (`xmin`), as read.
+    pub versions: Vec<(u64, i64)>,
+    /// The rows the condition keeps, of which `features` holds the first.
+    pub matched: u64,
+    /// Whether this connection's user may insert, update and delete the table's rows.
+    pub writable: bool,
+}
+
 /// One geometry column of a table (one family of it, for a column of mixed types), read live.
 pub struct PostgisSource {
     info: SourceInfo,
@@ -627,6 +643,9 @@ pub struct PostgisSource {
     raw_srid: i32,
     /// The geometry, in its own coordinates.
     native: String,
+    /// The table's single-column integer primary key, which gives the ids: rows can be told
+    /// apart to be edited only with one.
+    key: Option<String>,
     /// The expression of each column read: the id, the geometry (as WKB, longitude/latitude),
     /// then the fields.
     select: Vec<String>,
@@ -744,6 +763,7 @@ impl PostgisSource {
         }
         let mut select = vec![id, wkb];
         select.extend(casts);
+        let key = pk;
 
         let family = family.or(table.declared_family());
         let reproject = match srid {
@@ -769,6 +789,7 @@ impl PostgisSource {
             srid,
             raw_srid,
             native,
+            key,
             select,
             reproject,
         };
@@ -776,6 +797,90 @@ impl PostgisSource {
         src.info.count = src.count_rows();
         src.info.extent = src.extent();
         Ok(src)
+    }
+
+    /// The table's single-column integer primary key, if it has one.
+    pub fn key(&self) -> Option<&str> {
+        self.key.as_deref()
+    }
+
+    /// The SRID of the geometry read (0 when it says none).
+    pub fn srid(&self) -> i32 {
+        self.srid
+    }
+
+    /// The table and geometry column read.
+    pub fn table(&self) -> &Table {
+        &self.table
+    }
+
+    /// Reads the rows to edit: at most `limit` of them (and [`MAX_EDITABLE`]) in key order, those
+    /// `condition` (an SQL expression on the table's columns) keeps, each with its version
+    /// (`xmin`), which saving checks the database against. One snapshot, read only: the
+    /// condition can't change anything. Needs the table's integer primary key.
+    pub fn read_editable(&self, condition: Option<&str>, limit: usize) -> Result<Editable> {
+        let key = self.key.as_deref().ok_or_else(|| {
+            DataError::Format(format!(
+                "{}: no single-column integer primary key, so its rows can't be told apart to edit",
+                self.table.label()
+            ))
+        })?;
+        let limit = limit.clamp(1, MAX_EDITABLE);
+        let from = self.table.sql_from();
+        let mut filter = self.filter(false);
+        if let Some(c) = condition.map(str::trim).filter(|c| !c.is_empty()) {
+            if c.contains(';') {
+                return Err(DataError::Format("the condition: one SQL expression, without ';'".into()));
+            }
+            filter = format!("{filter} AND ({c})");
+        }
+        let version = self.select.len();
+        let mut cols: Vec<String> = self.select.iter().enumerate().map(|(i, e)| format!("{e} AS c{i}")).collect();
+        cols.push(format!("xmin::text::int8 AS c{version}"));
+        let sql = format!("SELECT {} FROM {from} WHERE {filter} ORDER BY {} LIMIT {limit}", cols.join(", "), ident(key));
+        let rel = format!("{}.{}", ident(&self.table.schema), ident(&self.table.name));
+        let (matched, rows, writable) = self.conn.snapshot(None, |t| {
+            let n: i64 = t.query_one(format!("SELECT count(*) FROM {from} WHERE {filter}").as_str(), &[])?.try_get(0)?;
+            let writable: bool = t
+                .query_one(
+                    "SELECT has_table_privilege($1::text::regclass, 'INSERT') AND has_table_privilege($1::text::regclass, 'UPDATE')                      AND has_table_privilege($1::text::regclass, 'DELETE')",
+                    &[&rel],
+                )?
+                .try_get(0)?;
+            Ok((u64::try_from(n).unwrap_or(0), t.query(sql.as_str(), &[])?, writable))
+        })?;
+        let mut out = Editable { features: Vec::with_capacity(rows.len()), versions: Vec::with_capacity(rows.len()), matched, writable };
+        for r in &rows {
+            let (Some(f), Some(v)) = (self.feature(r), r.try_get::<_, Option<i64>>(version).ok().flatten()) else { continue };
+            out.versions.push((f.id, v));
+            out.features.push(f);
+        }
+        Ok(out)
+    }
+
+    /// A row read as a feature: the id, the geometry (WKB) and the fields, in the order of
+    /// `select`. `None` without an id or a geometry RustGIS reads.
+    fn feature(&self, r: &postgres::Row) -> Option<Feature> {
+        let id = r.try_get::<_, Option<i64>>(0).ok().flatten()?;
+        let geometry = r.try_get::<_, Option<Vec<u8>>>(1).ok().flatten().and_then(|b| wkb::decode(&b))?;
+        let attrs = self
+            .info
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let i = i + 2;
+                match f.ty {
+                    FieldType::Integer => r.try_get::<_, Option<i64>>(i).ok().flatten().map(Value::Int),
+                    FieldType::Double => r.try_get::<_, Option<f64>>(i).ok().flatten().map(Value::Float),
+                    FieldType::Boolean => r.try_get::<_, Option<bool>>(i).ok().flatten().map(Value::Bool),
+                    FieldType::Text => r.try_get::<_, Option<String>>(i).ok().flatten().map(Value::Text),
+                }
+                .unwrap_or(Value::Null)
+            })
+            .collect();
+        // A negative key keeps its bits: still one id per row, and the same on every read.
+        Some(Feature { id: id.cast_unsigned(), geometry: Some(geometry), attrs })
     }
 
     /// The table's spatial index on the column, if it has one (a view has none of its own).
@@ -967,35 +1072,18 @@ impl FeatureSource for PostgisSource {
         })?;
         out.matched = matched;
         for r in &rows {
-            let id = r.try_get::<_, Option<i64>>(0).ok().flatten();
-            let geom = r.try_get::<_, Option<Vec<u8>>>(1).ok().flatten().and_then(|b| wkb::decode(&b));
-            let (Some(id), Some(geometry)) = (id, geom) else {
+            let Some(feature) = self.feature(r) else {
                 out.skipped += 1;
                 continue;
             };
             // The index matched the request's box in the table's coordinates, which holds more
             // than the request when they are projected.
-            if !in_request(&geometry, req) {
+            if let Some(geometry) = &feature.geometry
+                && !in_request(geometry, req)
+            {
                 continue;
             }
-            let attrs = self
-                .info
-                .fields
-                .iter()
-                .enumerate()
-                .map(|(i, f)| {
-                    let i = i + 2;
-                    match f.ty {
-                        FieldType::Integer => r.try_get::<_, Option<i64>>(i).ok().flatten().map(Value::Int),
-                        FieldType::Double => r.try_get::<_, Option<f64>>(i).ok().flatten().map(Value::Float),
-                        FieldType::Boolean => r.try_get::<_, Option<bool>>(i).ok().flatten().map(Value::Bool),
-                        FieldType::Text => r.try_get::<_, Option<String>>(i).ok().flatten().map(Value::Text),
-                    }
-                    .unwrap_or(Value::Null)
-                })
-                .collect();
-            // A negative key keeps its bits: still one id per row, and the same on every read.
-            out.features.push(Feature { id: id.cast_unsigned(), geometry: Some(geometry), attrs });
+            out.features.push(feature);
         }
         out.complete = step <= 1 && (rows.len() as u64) >= out.matched;
         Ok(out)
