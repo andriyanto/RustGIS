@@ -72,6 +72,8 @@ impl Dialogs {
             "addDatabase" => "addDatabase",
             "pgConnect" => "pgConnect",
             "pgAddLayer" => "pgAddLayer",
+            "pgSave" => "pgSave",
+            "pgDiscard" => "pgDiscard",
             "s3" => "s3",
             "zarr" => "zarr",
             "exportLayer" => "exportLayer",
@@ -86,6 +88,9 @@ impl Dialogs {
         }
         if name == "pgAddLayer" && s.postgis.is_none() {
             return Err("connect to a PostGIS database first (PostGIS › Connect PostGIS)".into());
+        }
+        if matches!(name, "pgSave" | "pgDiscard") && !s.map().layers.iter().any(|l| l.postgis.is_some()) {
+            return Err("the map has no layer from PostGIS (PostGIS › Add Layer)".into());
         }
         if name == "selectByAttributes" && s.map().layers.is_empty() {
             return Err("the map has no layers".into());
@@ -121,6 +126,11 @@ impl Dialogs {
             "pgConnect" => {
                 (self.a, self.b) = ("localhost".into(), "5432".into());
                 self.mode = "prefer";
+            }
+            // The active layer when it is from PostGIS, else the first that is.
+            "pgSave" | "pgDiscard" => {
+                let pg = |l: &&rustgis_engine::map::Layer| l.postgis.is_some();
+                self.layer = active.filter(pg).or_else(|| s.map().layers.iter().find(pg)).map(|l| l.name.clone()).unwrap_or_default();
             }
             // A table of addresses is what's usually geocoded: picked by its id (`flag` says the
             // choice is a table), since names can repeat.
@@ -160,6 +170,8 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         "addDatabase" => "Add From Database",
         "pgConnect" => "Connect PostGIS",
         "pgAddLayer" => "Add PostGIS Layer",
+        "pgSave" => "Save PostGIS Edits",
+        "pgDiscard" => "Discard PostGIS Edits",
         "s3" => "S3 Buckets",
         "zarr" => "Add Zarr Variable",
         "exportLayer" => "Export Features",
@@ -252,6 +264,8 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
             "addDatabase" => close = add_database(app, ui),
             "pgConnect" => close = pg_connect(app, ui),
             "pgAddLayer" => close = pg_add_layer(app, ui),
+            "pgSave" => close = pg_save(app, ui),
+            "pgDiscard" => close = pg_discard(app, ui),
             "s3" => crate::s3ui::dialog(app, ui),
             "zarr" => close = crate::zarrui::dialog(app, ui),
             "exportLayer" => close = export_layer(app, ui),
@@ -1111,6 +1125,64 @@ fn pg_add_layer(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
         }
         app.run("pg.addLayer", p).map(|_| ())
     })
+}
+
+/// A PostGIS layer to save or discard the edits of, and what changed in it: its table and how
+/// many rows are new, changed and deleted (counted again when another layer is chosen).
+fn pg_layer_edits(app: &mut RustGisApp, ui: &mut egui::Ui) {
+    let layers: Vec<String> = app.session.map().layers.iter().filter(|l| l.postgis.is_some()).map(|l| l.name.clone()).collect();
+    if app.dialogs.text != app.dialogs.layer {
+        app.dialogs.text = app.dialogs.layer.clone();
+        app.dialogs.list = match app.run("pg.pendingEdits", json!({"layer": app.dialogs.layer})) {
+            Ok(v) => vec![
+                v["table"].as_str().unwrap_or_default().to_string(),
+                v["inserts"].to_string(),
+                v["updates"].to_string(),
+                v["deletes"].to_string(),
+            ],
+            Err(_) => Vec::new(),
+        };
+    }
+    egui::Grid::new("pg_edits").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
+        ui.label(tl!("Layer"));
+        egui::ComboBox::from_id_salt("pg_edit_layer").selected_text(app.dialogs.layer.clone()).width(260.0).show_ui(ui, |ui| {
+            for l in layers {
+                ui.selectable_value(&mut app.dialogs.layer, l.clone(), l);
+            }
+        });
+        ui.end_row();
+        let shown = app.dialogs.list.clone();
+        for (label, value) in [
+            (tl!("Table"), shown.first()),
+            (tl!("New rows"), shown.get(1)),
+            (tl!("Changed rows"), shown.get(2)),
+            (tl!("Deleted rows"), shown.get(3)),
+        ] {
+            ui.label(label);
+            ui.label(egui::RichText::new(value.cloned().unwrap_or_default()).strong());
+            ui.end_row();
+        }
+    });
+}
+
+/// Save PostGIS Edits: a PostGIS layer's edits written to its table in one transaction, or none
+/// of them when a row changed there since.
+fn pg_save(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
+    ui.label(egui::RichText::new(tl!("Saves the layer's edits to its table in one transaction. When a row you changed or deleted was changed or deleted in the database since it was loaded, or a new row's key is taken, nothing is saved and the rows are listed.")).weak());
+    pg_layer_edits(app, ui);
+    buttons(app, ui, "Save", |app| {
+        let r = app.run("pg.saveEdits", json!({"layer": app.dialogs.layer})).map(|_| ());
+        // Counted again, whatever happened.
+        app.dialogs.text.clear();
+        r
+    })
+}
+
+/// Discard PostGIS Edits: a PostGIS layer's rows loaded again as they are in the database.
+fn pg_discard(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
+    ui.label(egui::RichText::new(tl!("Loads the layer's rows again as they are in the database now. Its edits that weren't saved are dropped (Undo brings them back).")).weak());
+    pg_layer_edits(app, ui);
+    buttons(app, ui, "Discard", |app| app.run("pg.discardEdits", json!({"layer": app.dialogs.layer})).map(|_| ()))
 }
 
 /// Add Tile Layer: an XYZ/TMS/WMS template, vector tiles or a MapLibre style by address.

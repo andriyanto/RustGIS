@@ -276,6 +276,8 @@ const NEVER: &[&str] = &[
     "earthdata.logout",
     "pg.connect",
     "pg.disconnect",
+    // Writes to a database: the user's to do, asked each time.
+    "pg.saveEdits",
 ];
 
 /// Commands that write files without naming one in their parameters.
@@ -300,6 +302,7 @@ const DATABASES: &[&str] = &[
     "layer.addZarr",
     "pg.tables",
     "pg.addLayer",
+    "pg.discardEdits",
 ];
 
 /// What a command reaches beyond the project when run with some parameters.

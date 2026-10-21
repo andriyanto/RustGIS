@@ -2184,6 +2184,30 @@ fn postgis_tab(app: &mut RustGisApp, ui: &mut Ui) {
             false,
         );
     });
+    group(ui, "Edit", |ui| {
+        big(
+            ui,
+            app,
+            "save",
+            "Save\nEdits",
+            "Save a PostGIS layer's edits to its table, unless rows changed there since.",
+            "ui.dialog",
+            json!({"name": "pgSave"}),
+            false,
+            false,
+        );
+        big(
+            ui,
+            app,
+            "update",
+            "Discard\nEdits",
+            "Load a PostGIS layer's rows again as they are in the database, dropping its edits.",
+            "ui.dialog",
+            json!({"name": "pgDiscard"}),
+            false,
+            false,
+        );
+    });
 }
 
 fn edit_tab(app: &mut RustGisApp, ui: &mut Ui) {

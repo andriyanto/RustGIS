@@ -5,6 +5,10 @@
 //! password, which is remembered for the session only. A table added with `pg.addLayer` is loaded
 //! whole, its feature ids its integer primary key, and the layer keeps each row's version
 //! (`xmin`) as read, so saving can tell a row someone else changed since from one to overwrite.
+//!
+//! `pg.saveEdits` writes what changed in such a layer back to its table in one transaction, and
+//! saves nothing when a row changed or deleted there was changed or deleted by someone else
+//! since, or a new row's key is taken. `pg.discardEdits` loads the rows again as they are now.
 
 use serde_json::Value;
 #[cfg(not(target_arch = "wasm32"))]
@@ -33,6 +37,11 @@ pub fn commands() -> Vec<C> {
         C::new("pg.disconnect", "Disconnect PostGIS", "PostGIS › Connection", disconnect).view().when(need_connection),
         C::new("pg.status", "PostGIS Connection", "PostGIS › Connection", status).view(),
         C::new("pg.tables", "List PostGIS Tables", "PostGIS › Layer", tables).view().when(need_connection).params(r#"{"schema"?: string}"#),
+        C::new("pg.pendingEdits", "PostGIS Edits", "PostGIS › Edit", pending_edits).view().params(r#"{"layer"?: "a layer added with pg.addLayer (default: the active one)"}"#),
+        C::new("pg.saveEdits", "Save PostGIS Edits", "PostGIS › Edit", save_edits)
+            .params(r#"{"layer"?: "a layer added with pg.addLayer (default: the active one)"}"#),
+        C::new("pg.discardEdits", "Discard PostGIS Edits", "PostGIS › Edit", discard_edits)
+            .params(r#"{"layer"?: "a layer added with pg.addLayer (default: the active one)"}"#),
         C::new("pg.addLayer", "Add PostGIS Layer", "PostGIS › Layer", add_layer).when(need_connection).params(
             r#"{"table": "table, schema.table, or table:column for one of several geometry columns", "where"?: "an SQL condition on the table's columns", "limit"?: "the most rows (default and most: 100000)", "name"?: string, "crs"?: "EPSG:… of a geometry that doesn't say"}"#,
         ),
@@ -41,6 +50,172 @@ pub fn commands() -> Vec<C> {
 
 pub(crate) fn need_connection(s: &Session) -> Option<&'static str> {
     s.postgis.is_none().then_some(NOT_CONNECTED)
+}
+
+/// The layer `p` names (or the active one), which must have been added from PostGIS: its id,
+/// name and table.
+fn postgis_layer(s: &Session, p: &Value) -> Result<(u32, String, rustgis_map::source::PostgisEdit), String> {
+    let id = s.layer_id(p)?;
+    let l = s.map().layer(id).ok_or("no such layer")?;
+    let edit = l.postgis.clone().ok_or_else(|| format!("{}: not a layer added with PostGIS › Add Layer", l.name))?;
+    Ok((id, l.name.clone(), edit))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// The rows of `features` that are loaded rows, with their versions and what they hold now:
+/// the new baseline after a save (`saved`: the versions written) or a load.
+fn versions_of(
+    features: &[rustgis_data::Feature],
+    old: &rustgis_map::source::Versions,
+    saved: &std::collections::HashMap<u64, i64>,
+) -> rustgis_map::source::Versions {
+    use rustgis_map::source::{RowVersion, row_hash};
+    let mut seen = std::collections::HashSet::new();
+    features
+        .iter()
+        .filter_map(|f| {
+            let version = saved.get(&f.id).copied().or_else(|| old.get(f.id).map(|r| r.version))?;
+            seen.insert(f.id).then(|| (f.id, RowVersion { version, hash: row_hash(f) }))
+        })
+        .collect()
+}
+
+fn pending_edits(s: &mut Session, p: &Value) -> CmdResult {
+    let (id, name, edit) = postgis_layer(s, p)?;
+    let l = s.map().layer(id).ok_or("no such layer")?;
+    let c = edit.changes(&l.dataset.features);
+    Ok(serde_json::json!({
+        "layer": name,
+        "table": edit.origin.table,
+        "inserts": c.inserts.len(),
+        "updates": c.updates.len(),
+        "deletes": c.deletes.len(),
+        "writable": edit.writable,
+    }))
+}
+
+fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (s, p);
+        Err("PostGIS databases are edited in the desktop app".into())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rustgis_data::source::{duckdb::Database, postgis};
+        let (id, name, edit) = postgis_layer(s, p)?;
+        let l = s.map().layer(id).ok_or("no such layer")?;
+        let changes = edit.changes(&l.dataset.features);
+        let fields = l.dataset.fields.clone();
+        if changes.is_empty() {
+            s.notify(format!("{name}: no edits to save"), false);
+            return Ok(json!({"saved": false, "inserted": 0, "updated": 0, "deleted": 0}));
+        }
+        let table = edit.origin.table.clone();
+        if !edit.writable {
+            return Err(format!("{name}: the database's user can't insert, update or delete the rows of {table}"));
+        }
+        let Database::Postgres(dsn) = Database::parse(&edit.origin.database) else {
+            return Err(format!("{name}: not a PostgreSQL connection"));
+        };
+        let label = Database::Postgres(dsn.clone()).short();
+        let err = |e: rustgis_data::DataError| format!("{label}: {e}");
+        // The user's own credentials (PGPASSWORD, the password file) go only to the database
+        // they connected to this session, never to one a project file names.
+        let ask = s.postgis.as_deref() == Some(dsn.as_str());
+        let conn =
+            postgis::connect_writable(&dsn, ask).map_err(|e| format!("{label}: {e} (connect again with PostGIS › Connect PostGIS)"))?;
+        let t = postgis::find_table(&conn, &table).map_err(err)?;
+        let src = postgis::PostgisSource::open(conn, t, edit.origin.family, edit.origin.crs.as_deref()).map_err(err)?;
+        let rows = changes.insert_rows.clone();
+        let edits = postgis::Edits { updates: changes.updates, deletes: changes.deletes, inserts: changes.inserts };
+        let saved = match src.save(&edits, &fields).map_err(err)? {
+            Ok(saved) => saved,
+            Err(conflicts) => {
+                let mut said: Vec<String> = conflicts.iter().take(20).map(ToString::to_string).collect();
+                if conflicts.len() > 20 {
+                    said.push(format!("{} more", conflicts.len() - 20));
+                }
+                return Err(format!(
+                    "{name}: nothing was saved to {table}, {} conflicts: {}. Discard Edits loads the rows as they are now",
+                    conflicts.len(),
+                    said.join("; ")
+                ));
+            }
+        };
+        // Saved: from here on nothing fails, so the layer matches the database. New features
+        // take the keys they were saved with.
+        let key_field = fields.iter().position(|f| f.name == edit.key);
+        let versions: std::collections::HashMap<u64, i64> = saved.versions.iter().copied().collect();
+        if let Some(l) = s.map_mut().layer_mut(id) {
+            for (row, (_, key)) in rows.iter().zip(&saved.inserted) {
+                if let Some(f) = l.dataset.features.get_mut(*row) {
+                    f.id = *key;
+                    if let Some(a) = key_field.and_then(|i| f.attrs.get_mut(i)) {
+                        *a = rustgis_data::Value::Int(key.cast_signed());
+                    }
+                }
+            }
+            let baseline = versions_of(&l.dataset.features, &edit.versions, &versions);
+            if let Some(pg) = l.postgis.as_mut() {
+                pg.versions = baseline;
+            }
+        }
+        s.notify(
+            format!("{name}: saved to {table}: {} new, {} changed, {} deleted", saved.inserted.len(), saved.updated, saved.deleted),
+            false,
+        );
+        if !saved.skipped_fields.is_empty() {
+            s.notify(format!("{name}: {table} has no column for {}, so it wasn't saved", saved.skipped_fields.join(", ")), false);
+        }
+        Ok(json!({
+            "saved": true,
+            "inserted": saved.inserted.len(),
+            "updated": saved.updated,
+            "deleted": saved.deleted,
+            "unchanged": saved.unchanged,
+            "keys": saved.inserted.iter().map(|(_, k)| k.cast_signed()).collect::<Vec<_>>(),
+            "skippedFields": saved.skipped_fields,
+        }))
+    }
+}
+
+fn discard_edits(s: &mut Session, p: &Value) -> CmdResult {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (s, p);
+        Err("PostGIS databases are read in the desktop app".into())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rustgis_data::source::{FeatureSource, duckdb::Database, postgis};
+        let (id, name, edit) = postgis_layer(s, p)?;
+        let Database::Postgres(dsn) = Database::parse(&edit.origin.database) else {
+            return Err(format!("{name}: not a PostgreSQL connection"));
+        };
+        let label = Database::Postgres(dsn.clone()).short();
+        let err = |e: rustgis_data::DataError| format!("{label}: {e}");
+        let ask = s.postgis.as_deref() == Some(dsn.as_str());
+        let conn = postgis::connect(&dsn, ask).map_err(|e| format!("{label}: {e} (connect again with PostGIS › Connect PostGIS)"))?;
+        let t = postgis::find_table(&conn, &edit.origin.table).map_err(err)?;
+        let src = postgis::PostgisSource::open(conn, t, edit.origin.family, edit.origin.crs.as_deref()).map_err(err)?;
+        let limit = if edit.limit == 0 { postgis::MAX_EDITABLE } else { edit.limit };
+        let editable = src.read_editable(edit.condition.as_deref(), limit).map_err(err)?;
+        let read: std::collections::HashMap<u64, i64> = editable.versions.iter().copied().collect();
+        let n = editable.features.len();
+        let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
+        l.dataset.fields = src.info().fields.clone();
+        l.dataset.features = editable.features.into();
+        l.selection.clear();
+        l.touch_geometry();
+        let baseline = versions_of(&l.dataset.features, &Default::default(), &read);
+        if let Some(pg) = l.postgis.as_mut() {
+            pg.versions = baseline;
+            pg.writable = editable.writable;
+        }
+        s.notify(format!("{name}: edits discarded; {n} rows loaded again from {}", edit.origin.table), false);
+        Ok(json!({"features": n, "matched": editable.matched}))
+    }
 }
 
 fn status(s: &mut Session, _: &Value) -> CmdResult {
@@ -202,6 +377,8 @@ fn add_layer(s: &mut Session, p: &Value) -> CmdResult {
             let mut ds = rustgis_data::Dataset::new(layer_name.clone(), info.geometry_type, info.fields.clone());
             ds.crs = u32::try_from(src.srid()).ok().filter(|&c| c != 0 && c != 4326).and_then(rustgis_data::raster::Crs::from_epsg);
             let n = editable.features.len() as u64;
+            let read: std::collections::HashMap<u64, i64> = editable.versions.iter().copied().collect();
+            let versions = versions_of(&editable.features, &Default::default(), &read);
             ds.features = editable.features.into();
             if n < editable.matched {
                 s.notify(
@@ -227,7 +404,9 @@ fn add_layer(s: &mut Session, p: &Value) -> CmdResult {
                     key: key.unwrap_or_default(),
                     srid: src.srid(),
                     writable: editable.writable,
-                    versions: editable.versions.into_iter().collect(),
+                    condition: condition.map(str::trim).filter(|c| !c.is_empty()).map(str::to_string),
+                    limit,
+                    versions,
                 });
             }
             ids.push(id);
