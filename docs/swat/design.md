@@ -332,15 +332,17 @@ security per `project_id`; rinciannya diputuskan di fase 5.
 | --- | --- | --- |
 | 0 | Baseline Fortran di CI, alat pembanding, dokumen ini | Artifact baseline tersedia untuk `Osu_1hru` dan `Ames_sub1` |
 | 1 | Repo engine `swatplus-rs` (LGPL-2.1): model, pembaca TxtInOut, iklim dan weather generator | Model dari kedua data contoh terbaca lengkap; data iklim harian cocok |
-| 2 | Neraca air HRU: `varinit` → `albedo` → `stmp_solt` → `sq_canopyint` → `sq_snom` → `et_pot` → `et_act` → `surface` → `swr_percmain` → `swr_latsed` → `stor_surfstor` → `swr_substor` → `sq_surfst` → `hru_hyds` | `hru_wb` harian `Osu_1hru` dalam toleransi |
+| 2 | Neraca air HRU, bertahap di skenario turunan Ames (lihat `docs/phase2.md` di repo engine): 2a tanah bera tanpa tanaman dan manajemen (`varinit` → … → `hru_hyds`, plus inisialisasi tanah dan curve number); 2b padang rumput tanpa manajemen (tambah pertumbuhan tanaman) | `hru_wb` harian `Ames_bare` lalu `Ames_past` dalam toleransi |
 | 3 | Objek spasial dan routing: loop `command`, routing unit, akuifer, kanal SWAT-DEG (Muskingum) | `channel_sd` dan `aquifer` harian dalam toleransi |
-| 4 | Tanaman dan manajemen (`pl_grow`, `mgt_operatn`, tabel keputusan), lalu nutrien, sedimen, karbon, waduk, dan lahan basah | `hru_nb`, `hru_ls`, `hru_pw`, hasil panen dalam toleransi |
+| 4 | Manajemen, irigasi, nutrien, sedimen, karbon (`mgt_operatn`, tabel keputusan), lalu waduk dan lahan basah termasuk sawah (Osu) | `Ames_sub1` dan `Osu_1hru` utuh: `hru_wb`, `hru_nb`, `hru_ls`, `hru_pw`, hasil panen dalam toleransi |
 | 5 | `swat-store` (PostGIS tulis/baca, Parquet), server API, antrean job, worker | Simulasi berjalan dari job server, output terbaca di web |
 | 6 | Editor di RustGIS (iklim, parameter, jadwal), perintah `swat.*`, panel SWAT di ribbon | Proyek bisa dibuat dan diedit tanpa SWAT+ Editor |
 | 7 | `swat-gis`: delineasi dengan Whitebox, pembentukan HRU, mode agen desktop | Proyek baru dari DEM sampai simulasi tanpa QSWAT+ |
 | 8 (opsional) | Pestisida, patogen, garam, konstituen, `gwflow`, alokasi air, kalibrasi | Sesuai kebutuhan |
 
 Engine versi web (WASM di Web Worker) bisa mulai diuji sejak fase 2 selesai.
+
+Catatan revisi (22 Okt 2026): kedua skenario acuan tidak bisa menguji neraca air secara terpisah. Osu adalah sawah dengan pematang dan tabel keputusan; Ames menanam jagung-kedelai dengan irigasi, pupuk, olah tanah, dan model karbon. Karena itu fase 2 divalidasi pada skenario turunan Ames yang dibuat oleh `scripts/make-variants.sh`, dan skenario acuan utuh dipindah ke fase 4.
 
 ## Risiko dan pertanyaan terbuka
 
