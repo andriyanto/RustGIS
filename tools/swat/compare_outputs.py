@@ -41,7 +41,9 @@ def number(token: str) -> float | None:
     return value if math.isfinite(value) else None
 
 
-def compare_file(expected: Path, actual: Path, abserr: float, relerr: float, max_report: int) -> FileResult:
+def compare_file(
+    expected: Path, actual: Path, abserr: float, relerr: float, max_report: int
+) -> FileResult:
     result = FileResult(expected.name)
     if not actual.is_file():
         result.status = "missing"
@@ -50,13 +52,17 @@ def compare_file(expected: Path, actual: Path, abserr: float, relerr: float, max
     act_lines = actual.read_text(encoding="latin-1").splitlines()[1:]
     if len(exp_lines) != len(act_lines):
         result.status = "shape"
-        result.examples.append(f"{len(exp_lines)} lines expected, {len(act_lines)} found")
+        result.examples.append(
+            f"{len(exp_lines)} lines expected, {len(act_lines)} found"
+        )
         return result
     for row, (a_line, b_line) in enumerate(zip(exp_lines, act_lines), start=2):
         a_tok, b_tok = a_line.split(), b_line.split()
         if len(a_tok) != len(b_tok):
             result.status = "shape"
-            result.examples.append(f"line {row}: {len(a_tok)} columns expected, {len(b_tok)} found")
+            result.examples.append(
+                f"line {row}: {len(a_tok)} columns expected, {len(b_tok)} found"
+            )
             return result
         for col, (a, b) in enumerate(zip(a_tok, b_tok), start=1):
             x, y = number(a), number(b)
@@ -74,28 +80,56 @@ def compare_file(expected: Path, actual: Path, abserr: float, relerr: float, max
             if diff > abserr and rel > relerr:
                 result.mismatches += 1
                 if len(result.examples) < max_report:
-                    result.examples.append(f"line {row} col {col}: {x} vs {y} (abs {diff:.3g}, rel {rel:.3g})")
+                    result.examples.append(
+                        f"line {row} col {col}: {x} vs {y} (abs {diff:.3g}, rel {rel:.3g})"
+                    )
     if result.mismatches:
         result.status = "mismatch"
     return result
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("expected", type=Path)
     parser.add_argument("actual", type=Path)
-    parser.add_argument("--pattern", default="*.txt", help="file name pattern (default: %(default)s)")
-    parser.add_argument("--abserr", type=float, default=1e-6, help="absolute tolerance (default: %(default)s)")
-    parser.add_argument("--relerr", type=float, default=1e-4, help="relative tolerance (default: %(default)s)")
-    parser.add_argument("--max-report", type=int, default=5, help="examples shown per file (default: %(default)s)")
+    parser.add_argument(
+        "--pattern", default="*.txt", help="file name pattern (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--abserr",
+        type=float,
+        default=1e-6,
+        help="absolute tolerance (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--relerr",
+        type=float,
+        default=1e-4,
+        help="relative tolerance (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--max-report",
+        type=int,
+        default=5,
+        help="examples shown per file (default: %(default)s)",
+    )
     parser.add_argument("--json", type=Path, help="also write the summary as JSON")
     args = parser.parse_args()
 
-    files = sorted(p for p in args.expected.iterdir() if p.is_file() and fnmatch.fnmatch(p.name, args.pattern))
+    files = sorted(
+        p
+        for p in args.expected.iterdir()
+        if p.is_file() and fnmatch.fnmatch(p.name, args.pattern)
+    )
     if not files:
         print(f"no files match {args.pattern!r} in {args.expected}", file=sys.stderr)
         return 2
-    results = [compare_file(f, args.actual / f.name, args.abserr, args.relerr, args.max_report) for f in files]
+    results = [
+        compare_file(f, args.actual / f.name, args.abserr, args.relerr, args.max_report)
+        for f in files
+    ]
 
     bad = 0
     for r in results:
@@ -104,9 +138,13 @@ def main() -> int:
         for example in r.examples:
             print(f"         {example}")
         bad += r.status != "ok"
-    print(f"\n{len(results) - bad} of {len(results)} files within tolerance (abs {args.abserr}, rel {args.relerr})")
+    print(
+        f"\n{len(results) - bad} of {len(results)} files within tolerance (abs {args.abserr}, rel {args.relerr})"
+    )
     if args.json:
-        args.json.write_text(json.dumps([asdict(r) for r in results], indent=1), encoding="utf-8")
+        args.json.write_text(
+            json.dumps([asdict(r) for r in results], indent=1), encoding="utf-8"
+        )
     return 1 if bad else 0
 
 
