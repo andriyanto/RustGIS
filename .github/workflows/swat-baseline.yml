@@ -111,9 +111,11 @@ jobs:
             cp -r "swatplus/refdata/$scenario" "$dir"
             # Daily output for the water balance, the nutrient, loss and plant tables and the
             # routing objects; the rest keep the scenario's own settings (all objects daily made
-            # a 1.6 GB baseline).
+            # a 1.6 GB baseline). Ames_sub1's daily carbon diagnostics (hru_cb, hru_cb_vars) are
+            # 9 GB uncompressed, so they print monthly and up only.
             python3 tools/swat/enable_daily_output.py \
               --only basin_wb,basin_aqu,basin_sd_cha,hru_wb,hru_nb,hru_ls,hru_pw,channel_sd,aquifer,ru \
+              --no-daily hru_cb,hru_cb_vars \
               "$dir"
             start=$(date +%s)
             (cd "$dir" && "$SWATPLUS_EXE" > run.log 2>&1)

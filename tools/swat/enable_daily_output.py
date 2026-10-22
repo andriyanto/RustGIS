@@ -4,9 +4,10 @@
 The SWAT+ baseline runs (see docs/swat/design.md) need daily output so a port of the engine can be
 compared day by day, not only on the average annual tables the reference data sets print. With
 `--only`, just the named objects are changed (the others keep their settings), which keeps the
-baseline small; without it, every object prints at every interval.
+baseline small; without it, every object prints at every interval. `--no-daily` turns daily output
+off for the named objects (Ames_sub1's daily carbon diagnostics alone are 9 GB).
 
-Usage: enable_daily_output.py [--only basin_wb,hru_wb,...] <scenario folder> [<scenario folder> ...]
+Usage: enable_daily_output.py [--only basin_wb,hru_wb,...] [--no-daily hru_cb,...] <folder> [...]
 """
 
 from __future__ import annotations
@@ -16,7 +17,9 @@ import sys
 from pathlib import Path
 
 
-def enable(prt: Path, only: set[str] | None) -> tuple[int, set[str]]:
+def enable(
+    prt: Path, only: set[str] | None, no_daily: set[str]
+) -> tuple[int, set[str]]:
     """Sets every flag of the chosen object rows to `y`; returns the rows changed and the names seen."""
     lines = prt.read_text(encoding="latin-1").splitlines()
     out: list[str] = []
@@ -29,8 +32,17 @@ def enable(prt: Path, only: set[str] | None) -> tuple[int, set[str]]:
             in_table = True
             out.append(line)
             continue
-        if in_table and len(tokens) == 5 and all(t in ("y", "n") for t in tokens[1:]):
+        if (
+            in_table
+            and len(tokens) == 5
+            and all(t in ("y", "n", "l") for t in tokens[1:])
+        ):
             seen.add(tokens[0])
+            if tokens[0] in no_daily:
+                out.append(
+                    f"{tokens[0]:<25}" + "".join(f"{t:>14}" for t in ["n", *tokens[2:]])
+                )
+                continue
             if only is None or tokens[0] in only:
                 out.append(f"{tokens[0]:<25}" + "".join(f"{'y':>14}" for _ in range(4)))
                 changed += 1
@@ -47,6 +59,11 @@ def main() -> int:
     parser.add_argument(
         "--only", help="comma-separated objects to change (default: all)"
     )
+    parser.add_argument(
+        "--no-daily",
+        default="",
+        help="comma-separated objects to print no daily output",
+    )
     parser.add_argument("folders", nargs="+", type=Path)
     args = parser.parse_args()
     only = (
@@ -62,7 +79,8 @@ def main() -> int:
             print(f"{prt}: not found", file=sys.stderr)
             status = 1
             continue
-        changed, seen = enable(prt, only)
+        no_daily = {n.strip() for n in args.no_daily.split(",") if n.strip()}
+        changed, seen = enable(prt, only, no_daily)
         if only:
             unknown = sorted(only - seen)
             if unknown:
