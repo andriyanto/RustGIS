@@ -10,8 +10,11 @@ ukurannya besar; belum ada rencana mengirimnya ke upstream `opengeos/RustGIS`.
 
 - Engine SWAT+ (Fortran) diport ke Rust lebih dulu, divalidasi hari per hari terhadap build
   Fortran asli. GIS dan editor menyusul di atas fondasi itu.
-- Ketiga modul berbagi satu **model proyek** dalam struct Rust. TxtInOut, PostGIS, dan Parquet
-  hanyalah adapter penyimpanan untuk model itu; engine tidak pernah membaca file sendiri.
+- Engine adalah program terpisah berlisensi LGPL-2.1 (native dan modul WASM), karena merupakan
+  terjemahan SWAT+. RustGIS (Apache-2.0) memanggilnya seperti alat `geolibre`, dan keduanya
+  hanya bertukar format data.
+- GIS dan editor di RustGIS berbagi satu **model proyek** dalam struct Rust. TxtInOut, PostGIS,
+  dan Parquet hanyalah adapter penyimpanan untuk model itu.
 - Delineasi DAS memakai alat Whitebox yang sudah ada di RustGIS (crate `geolibre`).
 - Mode kolaborasi bersifat hybrid: antarmuka di browser, pengolahan DEM besar di desktop secara
   native, simulasi di worker server, dan hasil di server yang bisa dilihat siapa pun yang
@@ -31,7 +34,7 @@ ukurannya besar; belum ada rencana mengirimnya ke upstream `opengeos/RustGIS`.
 | K8 | Browser dan desktop tidak berkomunikasi langsung; keduanya lewat API dan antrean job di server | Browser membatasi halaman web yang memanggil `localhost`; job tetap aman saat desktop offline |
 | K9 | Server bersifat opsional dan self-hosted | Tanpa server, RustGIS tetap bisa menjalankan seluruh alur secara lokal di desktop |
 | K10 | Inti SWAT harus tetap bisa dibangun untuk `wasm32-unknown-unknown` | Aturan RustGIS "Never break wasm"; engine juga harus bisa jalan di browser untuk DAS kecil |
-| K11 | Lisensi crate engine diputuskan sebelum rilis pertama (lihat Risiko) | SWAT+ berlisensi LGPL-2.1, berbeda dengan RustGIS (Apache-2.0) |
+| K11 | Engine adalah program terpisah berlisensi LGPL-2.1 (native dan modul WASM), dipanggil RustGIS seperti `geolibre`; semua bagian RustGIS tetap Apache-2.0 | SWAT+ berlisensi LGPL-2.1 (tanpa klausul "or later"). Terjemahan engine adalah karya turunan. Batas proses/modul memisahkan kedua lisensi dengan bersih, dan pengguna bisa mengganti engine tanpa membangun ulang RustGIS (lihat [Lisensi dan batas engine](#lisensi-dan-batas-engine)) |
 
 ## Temuan dari kode SWAT+
 
@@ -92,16 +95,43 @@ Di mana setiap komponen bisa berjalan:
 | Engine simulasi | Ya, native | Ya, untuk DAS kecil, di Web Worker | Ya, worker |
 | Penyimpanan | TxtInOut, Parquet, DuckDB lokal | Memori/IndexedDB, Parquet lewat HTTP | PostGIS + Parquet |
 
-### Crate baru
+### Lisensi dan batas engine
 
-Mengikuti lapisan RustGIS (`cargo xtask layers`): sebuah crate hanya boleh bergantung pada
-lapisan di bawahnya, dan semua crate di bawah `apps/` harus bisa dibangun untuk wasm32.
+Engine SWAT versi Rust adalah terjemahan kode SWAT+ (LGPL-2.1), jadi ia dikembangkan sebagai
+proyek tersendiri berlisensi LGPL-2.1, terpisah dari workspace RustGIS (Apache-2.0). Usulan nama
+repo: `andriyanto/swatplus-rs`.
+
+- **Batas yang memisahkan:** RustGIS tidak menautkan (link) kode engine. Natively RustGIS
+  menjalankan program engine sebagai subprocess; di browser, web app memuat modul WASM engine
+  saat dibutuhkan. Ini pola yang sama dengan `geolibre`.
+- **Antarmuka berupa format data, bukan kode bersama.** RustGIS mengirim proyek dan menerima
+  output dalam format yang terdokumentasi. Versi 1 memakai TxtInOut (folder, atau zip di
+  memori untuk browser), karena kedua sisi memang harus bisa membacanya untuk validasi. Output
+  dikirim balik sebagai Parquet, dan kemajuan simulasi sebagai baris JSON di stdout (seperti
+  protokol process plugin RustGIS).
+- **Dependensi engine:** hanya crate berlisensi MIT atau dual MIT/Apache (memakai opsi MIT).
+  Engine tidak bergantung pada crate `rustgis-*`, karena Apache-2.0 tidak kompatibel dengan
+  LGPL-2.1-only menurut FSF.
+- **Struktur internal engine** tetap mengikuti K2: model proyek dalam struct Rust, state
+  simulasi terpisah, I/O hanya di adapter. Engine punya tipe modelnya sendiri; RustGIS punya
+  `rustgis-swat-model` sendiri. Keduanya bertemu hanya lewat format data.
+- **Tempat engine berjalan:** program native di desktop dan worker server, modul WASM di Web
+  Worker browser. Satu basis kode, dua target build.
+
+Catatan: ini kesimpulan teknis, bukan nasihat hukum. Sebelum rilis publik pertama, sebaiknya
+ditinjau oleh orang yang paham lisensi open source.
+
+### Crate baru di RustGIS
+
+Semuanya Apache-2.0. Mengikuti lapisan RustGIS (`cargo xtask layers`): sebuah crate hanya boleh
+bergantung pada lapisan di bawahnya, dan semua crate di bawah `apps/` harus bisa dibangun untuk
+wasm32.
 
 | Lapisan | Crate | Tugas |
 | --- | --- | --- |
 | L1 | `rustgis-swat-model` | Struct model proyek: objek, koneksi, tanah, lahan, manajemen, iklim, parameter, pengaturan output. Tanpa I/O |
-| L2 | `rustgis-swat-engine` | Simulasi harian. Menerima `&Project`, mengirim output lewat trait `OutputSink`. Tanpa file, tanpa jaringan |
-| L2 | `rustgis-swat-txtinout` | Adapter TxtInOut: membaca dan menulis dari bytes/string, sehingga jalan di browser juga |
+| L2 | `rustgis-swat-txtinout` | Adapter TxtInOut: membaca dan menulis dari bytes/string, sehingga jalan di browser juga. Ditulis dari spesifikasi format file, bukan diterjemahkan dari kode baca SWAT+ |
+| L3 | `rustgis-swat-runner` | Menjalankan engine: mencari atau mengunduh program engine natively (seperti `geolibre`), memuat modul WASM-nya di browser, meneruskan kemajuan dan pembatalan |
 | L2 | `rustgis-swat-store` | Adapter PostGIS (tulis dan baca, desktop/server) dan Parquet (output) |
 | L3 | `rustgis-swat-gis` | Delineasi dan pembentukan HRU, memanggil alat Whitebox lewat registri `rustgis-analysis` (berdasarkan id alat), bukan bergantung langsung pada `geolibre` |
 | L4 | `rustgis-engine` (`cmd/swat.rs`) | Perintah `swat.*`: impor TxtInOut, delineasi, buat HRU, jalankan simulasi, ekspor |
@@ -113,7 +143,9 @@ dan AI Assistant.
 
 ### Model proyek
 
-Sketsa awal; bentuk akhirnya ditentukan saat porting iklim dan HRU (fase 1).
+Sketsa awal; bentuk akhirnya ditentukan saat porting iklim dan HRU (fase 1). Bentuk yang sama
+dipakai `rustgis-swat-model` di RustGIS dan model internal engine, tetapi keduanya ditulis
+terpisah karena berbeda lisensi.
 
 ```rust
 pub struct Project {
@@ -293,7 +325,7 @@ security per `project_id`; rinciannya diputuskan di fase 5.
 | Fase | Isi | Selesai jika |
 | --- | --- | --- |
 | 0 | Baseline Fortran di CI, alat pembanding, dokumen ini | Artifact baseline tersedia untuk `Osu_1hru` dan `Ames_sub1` |
-| 1 | `swat-model` + `swat-txtinout` (impor), iklim dan weather generator | Model dari kedua data contoh terbaca lengkap; data iklim harian cocok |
+| 1 | Repo engine `swatplus-rs` (LGPL-2.1): model, pembaca TxtInOut, iklim dan weather generator | Model dari kedua data contoh terbaca lengkap; data iklim harian cocok |
 | 2 | Neraca air HRU: `varinit` → `albedo` → `stmp_solt` → `sq_canopyint` → `sq_snom` → `et_pot` → `et_act` → `surface` → `swr_percmain` → `swr_latsed` → `stor_surfstor` → `swr_substor` → `sq_surfst` → `hru_hyds` | `hru_wb` harian `Osu_1hru` dalam toleransi |
 | 3 | Objek spasial dan routing: loop `command`, routing unit, akuifer, kanal SWAT-DEG (Muskingum) | `channel_sd` dan `aquifer` harian dalam toleransi |
 | 4 | Tanaman dan manajemen (`pl_grow`, `mgt_operatn`, tabel keputusan), lalu nutrien, sedimen, karbon, waduk, dan lahan basah | `hru_nb`, `hru_ls`, `hru_pw`, hasil panen dalam toleransi |
@@ -312,15 +344,10 @@ Engine versi web (WASM di Web Worker) bisa mulai diuji sejak fase 2 selesai.
   SWAT+ diterapkan secara sadar, dengan baseline baru.
 - **Perbedaan numerik `f32`.** Fungsi matematika (`exp`, `log`) di Rust dan gfortran bisa
   berbeda di digit terakhir. Bila toleransi 1e-4 tidak tercapai, perlu dikaji per variabel.
-- **Lisensi (perlu diputuskan sebelum rilis).** SWAT+ berlisensi LGPL-2.1, sedangkan RustGIS
-  Apache-2.0. Terjemahan engine ke Rust kemungkinan besar dihitung sebagai karya turunan,
-  sehingga crate `rustgis-swat-engine` (dan bagian lain yang menerjemahkan kode SWAT+) perlu
-  berlisensi LGPL-2.1. LGPL membolehkan dipakai bersama kode berlisensi lain, tetapi Rust dan
-  WASM menautkan secara statis, dan LGPL mensyaratkan pengguna bisa menautkan ulang dengan versi
-  library yang diubah. Pilihan yang perlu dikaji (sebaiknya dengan penasihat hukum): crate
-  engine berlisensi LGPL-2.1 dengan kode sumber dan cara build terbuka, atau engine sebagai
-  program/modul WASM terpisah yang dipanggil RustGIS. Crate yang ditulis sendiri (GIS, store,
-  server, UI) bisa tetap Apache-2.0.
+- **Lisensi.** Sudah diputuskan di K11: engine terpisah berlisensi LGPL-2.1. Risiko yang
+  tersisa adalah kebocoran batas: kode terjemahan SWAT+ tidak boleh masuk ke crate RustGIS
+  (misalnya menyalin rumus dari engine ke modul editor). Rumus yang dibutuhkan di sisi RustGIS
+  ditulis ulang dari dokumentasi teori SWAT, bukan dari kode engine.
 - **Format QSWAT+ dan SWAT+ Editor.** Kode keduanya (Python) belum dipetakan. Ini diperlukan
   sebelum fase 6 dan 7 agar logika pembentukan HRU dan nilai bawaan editor sama.
 - **Data uji besar.** Perlu satu proyek nyata dengan banyak subDAS, sebaiknya dari wilayah
