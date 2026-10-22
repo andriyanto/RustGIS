@@ -1,0 +1,149 @@
+name: SWAT+ baseline
+
+# Builds the original SWAT+ engine (Fortran) at a pinned commit, runs its reference scenarios with
+# daily output, and keeps the outputs as an artifact: the baseline the Rust port of the engine is
+# compared against, day by day (docs/swat/design.md). It also checks that this Fortran build
+# reproduces the average annual outputs committed in the SWAT+ repository, so the baseline itself
+# is trusted.
+#
+# Runs on demand, and when this workflow or the SWAT tools change.
+
+on:
+  workflow_dispatch:
+    inputs:
+      swatplus_ref:
+        description: "swat-model/swatplus commit or tag to build"
+        required: false
+        default: "6f515368525e7d84089ae0f9d33f4c9115de5679"
+  push:
+    paths:
+      - ".github/workflows/swat-baseline.yml"
+      - "tools/swat/**"
+  pull_request:
+    paths:
+      - ".github/workflows/swat-baseline.yml"
+      - "tools/swat/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SWATPLUS_REF: ${{ inputs.swatplus_ref || '6f515368525e7d84089ae0f9d33f4c9115de5679' }}
+
+jobs:
+  baseline:
+    name: Build SWAT+ and run reference scenarios
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out SWAT+
+        uses: actions/checkout@v7
+        with:
+          repository: swat-model/swatplus
+          ref: ${{ env.SWATPLUS_REF }}
+          path: swatplus
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install gfortran
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gfortran ninja-build
+          gfortran --version | head -1
+
+      - name: Build SWAT+ (Release)
+        working-directory: swatplus
+        run: |
+          short="${SWATPLUS_REF:0:7}"
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_Fortran_COMPILER=gfortran \
+            -DTAG="$short"
+          cmake --build build
+          exe=$(find build -maxdepth 1 -type f -name 'swatplus-*' -perm -u+x | head -1)
+          test -n "$exe" || { echo "::error::SWAT+ executable not found"; exit 1; }
+          echo "SWATPLUS_EXE=$PWD/$exe" >> "$GITHUB_ENV"
+          echo "Built $exe"
+
+      # The committed outputs may come from an older SWAT+ revision, so a difference here is reported
+      # in the summary rather than failing the baseline.
+      - name: Check the build against the committed reference outputs (Ames_sub1)
+        continue-on-error: true
+        run: |
+          mkdir -p runs/check
+          cp -r swatplus/refdata/Ames_sub1 runs/check/Ames_sub1
+          cp -r swatplus/refdata/Ames_sub1 runs/check/expected
+          (cd runs/check/Ames_sub1 && "$SWATPLUS_EXE" > run.log 2>&1)
+          test -f runs/check/Ames_sub1/success.fin || { tail -50 runs/check/Ames_sub1/run.log; exit 1; }
+          python3 tools/swat/compare_outputs.py runs/check/expected runs/check/Ames_sub1 \
+            --pattern '*_aa.txt' --abserr 1e-3 --relerr 1e-3 --json runs/check/compare.json \
+            | tee runs/check/compare.txt
+
+      - name: Run reference scenarios with daily output
+        run: |
+          for scenario in Osu_1hru Ames_sub1; do
+            dir="runs/baseline/$scenario"
+            mkdir -p runs/baseline
+            cp -r "swatplus/refdata/$scenario" "$dir"
+            python3 tools/swat/enable_daily_output.py "$dir"
+            start=$(date +%s)
+            (cd "$dir" && "$SWATPLUS_EXE" > run.log 2>&1)
+            end=$(date +%s)
+            test -f "$dir/success.fin" || { echo "::error::$scenario failed"; tail -50 "$dir/run.log"; exit 1; }
+            echo "$scenario: $((end - start)) s" | tee -a runs/baseline/timings.txt
+          done
+
+      - name: Write the baseline manifest
+        run: |
+          {
+            echo "swatplus_ref: $SWATPLUS_REF"
+            echo "compiler: $(gfortran --version | head -1)"
+            echo "runner: ubuntu-24.04"
+            echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "rustgis_commit: $GITHUB_SHA"
+          } > runs/baseline/MANIFEST.txt
+          cat runs/baseline/MANIFEST.txt
+          du -sh runs/baseline/*
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## SWAT+ baseline"
+            echo
+            echo "SWAT+ commit: \`$SWATPLUS_REF\`"
+            echo
+            echo "Reference outputs committed in SWAT+: $(head -1 swatplus/refdata/Ames_sub1/basin_wb_aa.txt | tr -s ' ')"
+            echo
+            echo "### Build check against committed outputs (Ames_sub1, average annual)"
+            echo '```'
+            tail -1 runs/check/compare.txt 2>/dev/null || echo "not run"
+            echo '```'
+            echo "### Run times"
+            echo '```'
+            cat runs/baseline/timings.txt 2>/dev/null || echo "not run"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the baseline
+        uses: actions/upload-artifact@v7
+        with:
+          name: swatplus-baseline-${{ env.SWATPLUS_REF }}
+          path: |
+            runs/baseline
+            runs/check/compare.txt
+            runs/check/compare.json
+          retention-days: 90
+
+      - name: Upload the SWAT+ executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: swatplus-exe-linux-${{ env.SWATPLUS_REF }}
+          path: ${{ env.SWATPLUS_EXE }}
+          retention-days: 90
