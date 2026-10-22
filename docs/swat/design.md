@@ -35,6 +35,9 @@ ukurannya besar; belum ada rencana mengirimnya ke upstream `opengeos/RustGIS`.
 | K9 | Server bersifat opsional dan self-hosted | Tanpa server, RustGIS tetap bisa menjalankan seluruh alur secara lokal di desktop |
 | K10 | Inti SWAT harus tetap bisa dibangun untuk `wasm32-unknown-unknown` | Aturan RustGIS "Never break wasm"; engine juga harus bisa jalan di browser untuk DAS kecil |
 | K11 | Engine adalah program terpisah berlisensi LGPL-2.1 (native dan modul WASM), dipanggil RustGIS seperti `geolibre`; semua bagian RustGIS tetap Apache-2.0 | SWAT+ berlisensi LGPL-2.1 (tanpa klausul "or later"). Terjemahan engine adalah karya turunan. Batas proses/modul memisahkan kedua lisensi dengan bersih, dan pengguna bisa mengganti engine tanpa membangun ulang RustGIS (lihat [Lisensi dan batas engine](#lisensi-dan-batas-engine)) |
+| K12 | Hasil Rust dianggap cocok bila selisih relatif setiap nilai harian ≤ 1e-4 (atau selisih absolut ≤ 1e-6) | Hasil identik sampai digit terakhir tidak mungkin antar-compiler. Ditinjau ulang setelah fase 2 |
+| K13 | Perilaku SWAT+ yang janggal ditiru persis secara bawaan; perbaikan hanya lewat opsi yang dinyalakan sadar, dan semuanya dicatat di `docs/swat-quirks.md` repo engine | Tanpa itu hasil tidak bisa divalidasi terhadap Fortran |
+| K14 | Acuan resmi adalah baseline build sendiri: SWAT+ commit `6f51536`, gfortran, Linux (workflow `swat-baseline.yml`). Commit dipatok selama port; pembaruan SWAT+ diterapkan terencana dengan baseline baru | Output acuan di repo SWAT+ berasal dari versi 2024 dan tidak lagi cocok dengan kodenya |
 
 ## Temuan dari kode SWAT+
 
@@ -318,7 +321,10 @@ security per `project_id`; rinciannya diputuskan di fase 5.
   perbedaan yang tersisa seharusnya hanya dari urutan operasi floating-point. Toleransi ini
   ditinjau ulang setelah fase 2.
 - **Data uji tambahan:** kedua data contoh tidak memiliki jaringan routing yang besar (Ames tanpa
-  kanal, Osu satu kanal). Untuk fase 3 dibutuhkan proyek dengan banyak subDAS dan kanal.
+  kanal, Osu satu kanal). Untuk fase 3, Andriyanto menyiapkan proyek QSWAT+ dari wilayah
+  Indonesia: folder TxtInOut hasil SWAT+ Editor beserta DEM, peta tutupan lahan, dan peta tanah
+  yang dipakai. TxtInOut-nya untuk validasi engine; data spasialnya untuk membandingkan modul GIS
+  (fase 7) dengan QSWAT+ pada masukan yang sama.
 
 ## Urutan kerja
 
