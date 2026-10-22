@@ -91,8 +91,15 @@ jobs:
           if [ "$status" -eq 0 ]; then
             echo "::notice title=Reference check (Ames_sub1)::$verdict"
           else
-            off=$(grep -E '^(mismatch|missing|shape) ' runs/check/compare.txt | awk '{print $2" (max_rel " $5 ")"}' | sed 's/max_rel=//' | head -8 | paste -sd ';' - || true)
-            echo "::warning title=Reference check (Ames_sub1)::$verdict. Outside tolerance: $off"
+            echo "::warning title=Reference check (Ames_sub1)::$verdict"
+            # One annotation per file outside tolerance, with its status and first example.
+            python3 - <<'PY'
+          import json
+          for r in json.load(open("runs/check/compare.json")):
+              if r["status"] != "ok":
+                  ex = " | ".join(r["examples"][:2])
+                  print(f"::warning title=Reference {r['name']}::{r['status']}, max_rel {r['max_rel']:.3g}: {ex}")
+          PY
           fi
           exit $status
 
@@ -116,6 +123,9 @@ jobs:
             size=$(du -sh "$dir" | cut -f1)
             echo "$scenario: $((end - start)) s, $files daily tables, $size" | tee -a runs/baseline/timings.txt
             echo "::notice title=Baseline $scenario::$((end - start)) s, $files daily tables, $size"
+            largest=$(find "$dir" -maxdepth 1 -type f -printf '%s %f\n' | sort -rn | head -6 \
+              | awk '{printf "%s %.0f MB; ", $2, $1/1048576}')
+            echo "::notice title=Largest files $scenario::$largest"
           done
 
       - name: Write the baseline manifest
