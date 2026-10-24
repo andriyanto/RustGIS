@@ -10,6 +10,11 @@ use crate::theme::{Tokens, semibold};
 
 #[derive(Default)]
 pub struct Dialogs {
+    /// The layer captured when Define Projection opens; changing selection must not retarget it.
+    pub projection_layer: Option<u32>,
+    /// Map-local layer IDs require the dialog to retain its original project and map as well.
+    pub projection_map: Option<(u64, usize, String)>,
+    pub geometry: Option<crate::geometrycalc::Form>,
     pub open: Option<&'static str>,
     pub layer: String,
     pub text: String,
@@ -22,8 +27,12 @@ pub struct Dialogs {
     pub flag: bool,
     pub error: Option<String>,
     pub info: Option<String>,
+    /// The saved connection this dialog was opened on, by id (see `connectionui::picked`).
+    pub connection: Option<String>,
     /// Choices found for the dialog (Add From Database's tables; Add Delimited Text's columns).
     pub list: Vec<String>,
+    /// Add From Database: the database whose tables were last listed (what Save as Connection keeps).
+    pub listed: Option<String>,
     /// Add Delimited Text's file, picked before the dialog opens.
     pub csv: Option<CsvFile>,
 }
@@ -42,6 +51,7 @@ pub enum CsvSource {
 }
 
 impl Dialogs {
+    /// Opens a dialog on the current selection, capturing the target of CRS changes.
     pub fn open(&mut self, which: &str, s: &Session) -> Result<(), String> {
         let active = s.active_layer.and_then(|id| s.map().layer(id));
         let name: &'static str = match which {
@@ -57,6 +67,8 @@ impl Dialogs {
             "renameServiceGroup" => "renameServiceGroup",
             "renameGroup" => "renameGroup",
             "coordinateSystem" => "coordinateSystem",
+            "defineProjection" => "defineProjection",
+            "addShapefile" => "addShapefile",
             "camera" => "camera",
             "addTiles" => "addTiles",
             "basemap" => "basemap",
@@ -74,13 +86,16 @@ impl Dialogs {
             "pgAddLayer" => "pgAddLayer",
             "pgSave" => "pgSave",
             "pgDiscard" => "pgDiscard",
+            "chooseConnection" => "chooseConnection",
             "s3" => "s3",
             "zarr" => "zarr",
             "exportLayer" => "exportLayer",
             "saveProject" => "saveProject",
             other => return Err(format!("unknown dialog '{other}'")),
         };
-        if matches!(name, "addField" | "calculateField" | "definitionQuery" | "renameLayer" | "exportLayer") && active.is_none() {
+        if matches!(name, "addField" | "calculateField" | "definitionQuery" | "renameLayer" | "exportLayer" | "defineProjection")
+            && active.is_none()
+        {
             return Err("select a layer in the Layers pane first".into());
         }
         if name == "exportLayer" && active.is_some_and(|l| l.is_raster()) {
@@ -98,6 +113,14 @@ impl Dialogs {
         *self = Dialogs { open: Some(name), mode: "new", ..Dialogs::default() };
         self.layer = active.or_else(|| s.map().layers.first()).map(|l| l.name.clone()).unwrap_or_default();
         match name {
+            "defineProjection" => {
+                self.projection_layer = active.map(|l| l.id);
+                self.projection_map = Some((s.opened, s.project.active_map, s.map().name.clone()));
+                self.text = active
+                    .and_then(|l| l.dataset.crs)
+                    .map(|c| c.custom_def().map(|d| d.proj4.clone()).unwrap_or_else(|| c.label()))
+                    .unwrap_or_else(|| "EPSG:4326".into());
+            }
             "coordinateSystem" => {
                 self.text = s.map().projection.code();
                 // An EPSG code goes in the code box; presets are picked from the list.
@@ -145,8 +168,13 @@ impl Dialogs {
     }
 }
 
+/// Draws the active dialog and leaves it open on validation failure or a newly opened dialog.
 pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     let Some(which) = app.dialogs.open else { return };
+    if which == "calculateGeometry" {
+        crate::geometrycalc::show(app, ctx);
+        return;
+    }
     let title = match which {
         "selectByAttributes" => "Select By Attributes",
         "goToXY" => "Go To XY",
@@ -155,6 +183,8 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         "calculateField" => "Calculate Field",
         "definitionQuery" => "Definition Query",
         "coordinateSystem" => "Coordinate System",
+        "defineProjection" => "Define Projection",
+        "addShapefile" => "Import Shapefile with Projection",
         "camera" => "Camera",
         "addTiles" => "Add Tile Layer",
         "basemap" => "Basemap",
@@ -172,6 +202,9 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         "pgAddLayer" => "Add PostGIS Layer",
         "pgSave" => "Save PostGIS Edits",
         "pgDiscard" => "Discard PostGIS Edits",
+        "newConnection" => "New Connection",
+        "editConnection" => "Edit Connection",
+        "chooseConnection" => "Choose Connection",
         "s3" => "S3 Buckets",
         "zarr" => "Add Zarr Variable",
         "exportLayer" => "Export Features",
@@ -187,7 +220,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     let mut close = false;
     // Opens centred and can be moved; each dialog remembers where it was put.
     egui::Window::new(tl!(title))
-        .id(egui::Id::new(("dialog", which)))
+        .id(egui::Id::unique(("dialog", which)))
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
@@ -197,6 +230,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         ui.set_width(match which {
             "coordinateSystem" | "zarr" => 660.0,
             "addTiles" | "addUrl" | "addService" | "s3" => 560.0,
+            "newConnection" | "editConnection" | "chooseConnection" => 520.0,
             _ => 440.0,
         });
         ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
@@ -223,6 +257,37 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 });
             }
             "coordinateSystem" => close = coordinate_system(app, ui, &t),
+            "addShapefile" => {
+                ui.label(tl!("Choose the source coordinate system before importing. It replaces a missing or incorrect .prj without changing the original file."));
+                ui.label(tl!("Source coordinate system"));
+                let response = ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text("EPSG:2263").desired_width(f32::INFINITY));
+                response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, tl!("Source coordinate system")));
+                ui.label(tl!("In the browser, pick the .shp and .dbf together, with any sidecars, or pick a ZIP. The override applies to every Shapefile in the ZIP."));
+                close = buttons(app, ui, "Choose File…", |app| app.run("ui.importShapefile", json!({"crs": app.dialogs.text.trim()})).map(|_| ()));
+            }
+            "defineProjection" => {
+                ui.label(egui::RichText::new(&app.dialogs.layer).strong());
+                ui.label(tl!("Interpret the layer's native coordinates in this coordinate system. This changes where it draws; the source file is unchanged."));
+                ui.label(tl!("Source coordinate system"));
+                let label = ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text("EPSG:2263").desired_width(f32::INFINITY));
+                label.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, tl!("Source coordinate system")));
+                ui.label(egui::RichText::new(tl!("Geometry lost during import cannot be recovered here. Use Import Original File to choose its coordinate system before reading it. Streamed layers must first be loaded into memory.")).weak());
+                if ui.button(tl!("Import Original File…")).clicked() {
+                    let crs = app.dialogs.text.clone();
+                    if app.dialogs.open("addShapefile", &app.session).is_ok() {
+                        app.dialogs.text = crs;
+                    }
+                }
+                close = buttons(app, ui, "Apply", |app| {
+                    if !app.dialogs.projection_map.as_ref().is_some_and(|(project, index, name)| {
+                        *project == app.session.opened && *index == app.session.project.active_map && *name == app.session.map().name
+                    }) {
+                        return Err(tl!("The active project or map changed; reopen Define Projection for the intended layer.").into());
+                    }
+                    let id = app.dialogs.projection_layer.ok_or(tl!("No layer selected"))?;
+                    app.run("layer.defineProjection", json!({"layer": id, "crs": app.dialogs.text.trim()})).map(|_| ())
+                });
+            }
             "basemap" | "body" | "addSample" | "layerTemplate" => {
                 // Menu items close their nearest closable parent. Keep that local to the
                 // gallery so picking an item doesn't persistently collapse the Window's body.
@@ -266,6 +331,8 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
             "pgAddLayer" => close = pg_add_layer(app, ui),
             "pgSave" => close = pg_save(app, ui),
             "pgDiscard" => close = pg_discard(app, ui),
+            "newConnection" | "editConnection" => close = crate::connectionui::dialog(app, ui),
+            "chooseConnection" => close = crate::connectionui::chooser(app, ui),
             "s3" => crate::s3ui::dialog(app, ui),
             "zarr" => close = crate::zarrui::dialog(app, ui),
             "exportLayer" => close = export_layer(app, ui),
@@ -636,6 +703,15 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     if app.dialogs.mode == "new" {
         app.dialogs.mode = "auto";
     }
+    let list = crate::sourcespane::connections_snapshot(app);
+    let address = if app.dialogs.mode == "csw" { &app.ui.csw.url } else { &app.dialogs.text };
+    let current = crate::connectionui::picked(&list, app.dialogs.connection.as_deref(), address);
+    if let Some(c) = crate::connectionui::picker(ui, "service_saved", &list, crate::connectionui::SERVICE_KINDS, current) {
+        if let Err(e) = crate::connectionui::open_connection(app, &c) {
+            app.dialogs.error = Some(e);
+        }
+        return false;
+    }
     let kinds = |app: &mut RustGisApp, ui: &mut egui::Ui| {
         ui.label(tl!("Type"));
         let shown = KINDS.iter().find(|(c, _)| *c == app.dialogs.mode).map(|(_, l)| tl!(*l).to_string()).unwrap_or_default();
@@ -681,6 +757,11 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     // A directory's folder or service to open, or Back to the directory before.
     let mut open: Option<String> = None;
     let mut back = false;
+    let keepable = app.ui.service.as_ref().and_then(|conn| {
+        let (url, kind) = app.ui.service_browse.back.first().map(|(u, k)| (u.as_str(), *k)).unwrap_or((&conn.url, conn.kind));
+        crate::connectionui::picked(&list, app.dialogs.connection.as_deref(), url).is_none().then(|| (url.to_string(), kind))
+    });
+    let mut keep_root = false;
     if let Some(conn) = &app.ui.service {
         ui.separator();
         if let Some(e) = &conn.error {
@@ -705,13 +786,18 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             let none = Vec::new();
             let layers = v.get("layers").and_then(Value::as_array).unwrap_or(&none);
             let grouped = kind.starts_with("OGC API");
-            ui.label(
-                egui::RichText::new(crate::i18n::fmt(
-                    "{kind} {title}: {count} layers",
-                    &[("kind", kind), ("title", title), ("count", &layers.len().to_string())],
-                ))
-                .strong(),
-            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(crate::i18n::fmt(
+                        "{kind} {title}: {count} layers",
+                        &[("kind", kind), ("title", title), ("count", &layers.len().to_string())],
+                    ))
+                    .strong(),
+                );
+                if keepable.is_some() && conn.pending.is_none() && conn.error.is_none() && conn.failure.is_none() {
+                    keep_root = crate::connectionui::keep_button(ui);
+                }
+            });
             for n in v.get("notes").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
                 ui.label(egui::RichText::new(n).small().weak());
             }
@@ -795,6 +881,13 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             });
         }
     }
+    if keep_root && let Some((url, kind)) = keepable {
+        // "auto" is the dialog's detection mode; saved connections call that kind "service".
+        match crate::connectionui::keep(app, json!({"kind": if kind == "auto" { "service" } else { kind }, "address": url})) {
+            Ok(id) => app.dialogs.connection = Some(id),
+            Err(e) => app.dialogs.error = Some(e),
+        }
+    }
     if let Some(p) = import
         && let Err(e) = app.run("ui.importService", p)
     {
@@ -820,60 +913,17 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
         });
     }
     if let (Some(l), Some(conn)) = (add, &app.ui.service) {
-        let (url, kind, text) = (conn.url.clone(), conn.kind, conn.text.clone().unwrap_or_default());
-        let name = l.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-        let title = l.get("title").and_then(Value::as_str).unwrap_or(&name).to_string();
-        let offer = l.get("offer").cloned().unwrap_or_default();
-        // Features are downloaded in the background, as From URL… does; map layers are added now.
-        let r = if offer.get("type").and_then(Value::as_str) == Some("features") {
-            let items = offer.get("url").and_then(Value::as_str).unwrap_or("").to_string();
-            app.run("ui.addUrl", json!({"url": items, "name": title, "service": true})).map(|_| tl!("Downloading…"))
-        } else if offer.get("type").and_then(Value::as_str) == Some("coverage") {
-            // A coverage: its description first, off the frame (poll_describe asks for it).
-            let describe = offer.get("describe").and_then(Value::as_str).unwrap_or("").to_string();
-            let mut p = json!({"url": url, "layer": name, "text": text, "name": title, "documents": conn.documents});
-            if kind != "auto" {
-                p["type"] = json!(kind);
-            }
-            let slot = crate::fetch_into(&describe);
-            if let Some(c) = &mut app.ui.service {
-                c.describing = Some((p, slot));
-            }
-            Ok(tl!("Describing"))
-        } else {
-            let mut p = json!({"url": url, "layer": name, "text": text, "documents": conn.documents, "source_url": l.get("source_url")});
-            if kind != "auto" {
-                p["type"] = json!(kind);
-            }
-            let time = app.ui.service_browse.time.trim();
-            if l.get("time").is_some() && !time.is_empty() {
-                p["time"] = json!(time);
-            }
-            match l.get("tilesets").and_then(Value::as_str) {
-                // An OGC API layer: its tileset's advertised template is read first, off the
-                // frame (poll_tiles_resolve adds the layer).
-                Some(list) => {
-                    p["name"] = json!(title);
-                    let fallback = offer.get("url").and_then(Value::as_str).unwrap_or("").to_string();
-                    let vector = offer.get("type").and_then(Value::as_str) == Some("vectorTiles");
-                    let slot = crate::fetch_into(list);
-                    if let Some(c) = &mut app.ui.service {
-                        c.resolving = Some(crate::TilesResolve {
-                            params: p,
-                            list: list.to_string(),
-                            doc: list.to_string(),
-                            read: 0,
-                            vector,
-                            fallback,
-                            slot,
-                        });
-                    }
-                    Ok(tl!("Reading the tileset of"))
-                }
-                None => app.run("service.add", p).map(|_| tl!("Added")),
-            }
+        let src = crate::serviceui::ServiceSource {
+            url: conn.url.clone(),
+            kind: conn.kind,
+            text: conn.text.clone().unwrap_or_default(),
+            documents: conn.documents.clone(),
         };
-        match r {
+        let name = l.get("name").and_then(Value::as_str).unwrap_or("");
+        let title = l.get("title").and_then(Value::as_str).unwrap_or(name).to_string();
+        // Features are downloaded in the background, as From URL… does; map layers are added now.
+        let time = app.ui.service_browse.time.trim().to_string();
+        match crate::serviceui::add_layer(app, &src, &l, &time, true) {
             Ok(m) => app.dialogs.info = Some(format!("{m} {title}")),
             Err(e) => app.dialogs.error = Some(e),
         }
@@ -925,8 +975,18 @@ fn add_database(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             a.to_string()
         }
     };
+    let connections = crate::sourcespane::connections_snapshot(app);
+    let typed = database(&app.dialogs.a);
+    let current = crate::connectionui::picked(&connections, app.dialogs.connection.as_deref(), &typed);
+    let mut pick = None;
     let mut list = false;
     egui::Grid::new("database").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
+        let kinds = rustgis_engine::connections::DATABASE_KINDS;
+        if connections.iter().any(|c| kinds.contains(&c.kind.as_str())) {
+            ui.label(tl!("Saved connection"));
+            pick = crate::connectionui::picker_combo(ui, "database_saved", &connections, kinds, current);
+            ui.end_row();
+        }
         ui.label(tl!("Connection"));
         ui.add(egui::TextEdit::singleline(&mut app.dialogs.a).hint_text("host=localhost dbname=gis user=postgres").desired_width(280.0));
         ui.end_row();
@@ -954,20 +1014,51 @@ fn add_database(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
         ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text(tl!("of a geometry that doesn't say")).desired_width(280.0));
         ui.end_row();
     });
+    // The tables listed and the one chosen belong to the address they were listed for.
+    if app.dialogs.listed.as_deref().is_some_and(|l| l != database(&app.dialogs.a)) {
+        app.dialogs.listed = None;
+        app.dialogs.list.clear();
+        app.dialogs.c.clear();
+        app.dialogs.info = None;
+    }
+    if let Some(c) = pick {
+        if let Err(e) = crate::connectionui::open_connection(app, &c) {
+            app.dialogs.error = Some(e);
+        }
+        return false;
+    }
     if list {
         let p = json!({"database": database(&app.dialogs.a), "password": app.dialogs.b});
         match app.run("info.databaseTables", p) {
             Ok(v) => {
                 app.dialogs.list = v["layers"].as_array().into_iter().flatten().filter_map(|t| t.as_str().map(str::to_string)).collect();
+                app.dialogs.listed = Some(database(&app.dialogs.a));
                 app.dialogs.error = None;
                 app.dialogs.info = Some(crate::i18n::fmt("{n} tables with geometry", &[("n", &app.dialogs.list.len().to_string())]));
             }
             Err(e) => {
+                // What a failed listing leaves can't be tied to an address any more, so it goes too.
+                app.dialogs.listed = None;
+                app.dialogs.list.clear();
+                app.dialogs.c.clear();
                 app.dialogs.info = None;
                 app.dialogs.error = Some(e);
             }
         }
     }
+    ui.horizontal(|ui| {
+        let address = database(&app.dialogs.a);
+        if app.dialogs.listed.as_deref() == Some(address.as_str())
+            && let Some(kind) = rustgis_engine::connections::database_kind(&address)
+            && crate::connectionui::picked(&connections, app.dialogs.connection.as_deref(), &address).is_none()
+            && crate::connectionui::keep_button(ui)
+        {
+            match crate::connectionui::keep(app, json!({"kind": kind, "address": address})) {
+                Ok(id) => app.dialogs.connection = Some(id),
+                Err(e) => app.dialogs.error = Some(e),
+            }
+        }
+    });
     buttons(app, ui, "Add", |app| {
         let mut p = json!({"database": database(&app.dialogs.a), "password": app.dialogs.b});
         for (key, v) in [("layer", &app.dialogs.c), ("crs", &app.dialogs.text)] {
@@ -1420,7 +1511,7 @@ fn coordinate_system(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) -> boo
             ui.separator();
             ui.horizontal(|ui| {
                 ui.label(tl!("EPSG or ESRI code"));
-                let r = ui.add(egui::TextEdit::singleline(&mut app.dialogs.a).hint_text("3035").desired_width(110.0));
+                let r = ui.add(egui::TextEdit::singleline(&mut app.dialogs.a).hint_text("3035, vn2000tm3").desired_width(120.0));
                 if r.changed() && !app.dialogs.a.trim().is_empty() {
                     app.dialogs.text = typed_crs(&app.dialogs.a);
                 }
@@ -1457,16 +1548,38 @@ fn coordinate_system(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) -> boo
     close
 }
 
+/// Formats degrees as an integer if whole (e.g. 105°), or with decimal places if fractional (e.g. 105.75°).
+pub(crate) fn format_degrees(deg: f64) -> String {
+    if (deg - deg.round()).abs() < 1e-6 { format!("{:.0}°", deg) } else { format!("{deg}°") }
+}
+
 /// The chosen preset's parameters (opengeos/RustGIS#517): the central meridian, and a conic's
 /// standard parallels, each written back into the chosen code. Nothing for a preset without any.
 fn preset_fields(app: &mut RustGisApp, ui: &mut egui::Ui) {
-    use rustgis_engine::map::projection::{parse_preset, preset_code, preset_params, preset_value};
+    use rustgis_engine::map::projection::{VN2000_UI_PROVINCES, parse_preset, preset_code, preset_params, preset_value};
+    // A province typed by name is already the preset (`typed_crs`), and `vn2000:hanoi` is one too.
     let Ok(Some((id, params))) = parse_preset(&app.dialogs.text) else { return };
     let takes = preset_params(id);
     if takes.is_empty() {
         return;
     }
     let mut next = params.clone();
+    if id == "vn2000tm3" {
+        let default_lon = preset_value(id, "lon_0").unwrap_or(105.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new(tl!("Provinces:")).weak());
+            for &(p_name, lon) in VN2000_UI_PROVINCES {
+                let label = crate::i18n::fmt("{name} ({lon})", &[("name", p_name), ("lon", &format_degrees(lon))]);
+                if ui.small_button(&label).clicked() {
+                    next.retain(|(k, _)| *k != "lon_0");
+                    if (lon - default_lon).abs() > 1e-6 {
+                        next.push(("lon_0", lon));
+                    }
+                }
+            }
+        });
+        ui.add_space(2.0);
+    }
     egui::Grid::new("preset_params").num_columns(2).spacing(vec2(10.0, 6.0)).show(ui, |ui| {
         for p in takes {
             let label = match p.key {
@@ -1500,10 +1613,17 @@ fn preset_fields(app: &mut RustGisApp, ui: &mut egui::Ui) {
 }
 
 /// A typed coordinate system code: `ESRI:102033` or `Epsg: 3035` as it is (`lookup` reads the
-/// prefix in any case and spacing), a bare number as an EPSG code.
+/// prefix in any case and spacing), a bare number as an EPSG code, or a Vietnamese province with
+/// the `vn2000:` prefix (`vn2000:hanoi`); a bare name such as `hue` is not taken for one.
 pub(crate) fn typed_crs(text: &str) -> String {
     let text = text.trim();
-    if text.starts_with(|c: char| c.is_ascii_digit()) { format!("EPSG:{text}") } else { text.to_string() }
+    if text.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("EPSG:{text}")
+    } else if let Some(lon) = rustgis_engine::map::projection::resolve_vn2000_alias(text) {
+        format!("vn2000tm3 +lon_0={lon}")
+    } else {
+        text.to_string()
+    }
 }
 
 /// What a coordinate system is: its kind, area of use, definition and epsg.io page.
@@ -1527,29 +1647,43 @@ fn crs_details(ui: &mut egui::Ui, chosen: &str, current: &str, t: &Tokens) {
     let preset = rustgis_engine::map::projection::parse_preset(&code).ok().flatten();
     let tuned = preset.as_ref().is_some_and(|(_, p)| !p.is_empty());
     let (kind, page): (&str, Option<String>) = match preset.map_or(code.as_str(), |(id, _)| id) {
-        "mercator" => ("World, conformal: the usual web map; areas grow towards the poles.", Some("3857".into())),
-        "globe" => ("A 3D globe seen from space.", None),
-        "equirectangular" => ("World, cylindrical: equal steps of longitude and latitude.", Some("4087".into())),
-        "miller" => ("World, cylindrical: a compromise between Mercator and equal steps.", Some("54003".into())),
-        "mollweide" => ("World, equal-area: true sizes, shapes bend towards the edges.", Some("54009".into())),
-        "cylindricalEqualArea" => ("World, equal-area, cylindrical: true sizes, flattened near the poles.", Some("54034".into())),
-        "robinson" => ("World, compromise: neither equal-area nor conformal, balanced for wall maps.", Some("54030".into())),
-        "equalEarth" => ("World, equal-area: true sizes with a Robinson-like look.", Some("8857".into())),
-        "naturalEarth" => ("World, compromise: rounded corners, gentle shapes near the poles.", None),
-        "winkelTripel" => ("World, compromise: low overall distortion, used for world atlases.", Some("54042".into())),
-        "eckertIV" => ("World, equal-area: true sizes with rounded poles.", Some("54012".into())),
-        "northPolar" => ("Polar, conformal: the Arctic and the northern lands.", None),
-        "southPolar" => ("Polar, conformal: Antarctica and the Southern Ocean.", Some("3031".into())),
-        "europeEqualArea" => ("Regional, equal-area: the European standard for statistics.", Some("3035".into())),
-        "usaAlbers" => ("Regional, equal-area: the contiguous United States.", Some("5070".into())),
-        "albers" => ("Conic, equal-area: true sizes across a mid-latitude region; set its meridian and parallels to the region.", None),
-        "lambertConformal" => {
-            ("Conic, conformal: true shapes across a mid-latitude region; set its meridian and parallels to the region.", None)
+        "mercator" => (tl!("World, conformal: the usual web map; areas grow towards the poles."), Some("3857".into())),
+        "globe" => (tl!("A 3D globe seen from space."), None),
+        "equirectangular" => (tl!("World, cylindrical: equal steps of longitude and latitude."), Some("4087".into())),
+        "miller" => (tl!("World, cylindrical: a compromise between Mercator and equal steps."), Some("54003".into())),
+        "mollweide" => (tl!("World, equal-area: true sizes, shapes bend towards the edges."), Some("54009".into())),
+        "cylindricalEqualArea" => (tl!("World, equal-area, cylindrical: true sizes, flattened near the poles."), Some("54034".into())),
+        "robinson" => (tl!("World, compromise: neither equal-area nor conformal, balanced for wall maps."), Some("54030".into())),
+        "equalEarth" => (tl!("World, equal-area: true sizes with a Robinson-like look."), Some("8857".into())),
+        "naturalEarth" => (tl!("World, compromise: rounded corners, gentle shapes near the poles."), None),
+        "winkelTripel" => (tl!("World, compromise: low overall distortion, used for world atlases."), Some("54042".into())),
+        "eckertIV" => (tl!("World, equal-area: true sizes with rounded poles."), Some("54012".into())),
+        "northPolar" => (tl!("Polar, conformal: the Arctic and the northern lands."), None),
+        "southPolar" => (tl!("Polar, conformal: Antarctica and the Southern Ocean."), Some("3031".into())),
+        "europeEqualArea" => (tl!("Regional, equal-area: the European standard for statistics."), Some("3035".into())),
+        "usaAlbers" => (tl!("Regional, equal-area: the contiguous United States."), Some("5070".into())),
+        "albers" => {
+            (tl!("Conic, equal-area: true sizes across a mid-latitude region; set its meridian and parallels to the region."), None)
         }
-        _ => ("A projected coordinate system.", epsg.clone()),
+        "lambertConformal" => {
+            (tl!("Conic, conformal: true shapes across a mid-latitude region; set its meridian and parallels to the region."), None)
+        }
+        "vn2000tm3" => (
+            tl!(
+                "Vietnam national coordinate system (VN-2000) using 3-degree Transverse Mercator with a 7-parameter Helmert shift to WGS 84."
+            ),
+            Some("5897".into()),
+        ),
+        "vn2000Utm48" => {
+            (tl!("Vietnam national coordinate system (VN-2000) UTM zone 48N (102°E–108°E, central meridian 105°E)."), Some("3405".into()))
+        }
+        "vn2000Utm49" => {
+            (tl!("Vietnam national coordinate system (VN-2000) UTM zone 49N (108°E–114°E, central meridian 111°E)."), Some("3406".into()))
+        }
+        _ => (tl!("A projected coordinate system."), epsg.clone()),
     };
     let page = page.filter(|_| !tuned);
-    ui.label(tl!(kind));
+    ui.label(kind);
     if let Ok(p) = Projector::new(&code) {
         let area = match p.domain() {
             Domain::World => tl!("Area of use: the whole world").to_string(),
@@ -1607,7 +1741,7 @@ mod tests {
         app.run("map.projection", json!({"type": "robinson"})).unwrap();
         app.run("ui.dialog", json!({"name": "coordinateSystem"})).unwrap();
         let mut fonts = false;
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(vec2(1200.0, 900.0)).build_ui_state(
             move |ui, app: &mut RustGisApp| {
                 if !fonts {
                     crate::theme::install_fonts(ui.ctx(), &[], None);
@@ -1654,5 +1788,70 @@ mod tests {
         h.get_by_label("Apply").click();
         h.run_steps(3);
         assert_eq!(h.state().session.map().projection.code(), "robinson +lon_0=150");
+    }
+
+    #[test]
+    fn vn2000_in_coordinate_system_dialog() {
+        let mut app = RustGisApp::with_sample();
+        app.run("ui.dialog", json!({"name": "coordinateSystem"})).unwrap();
+        // A bare "vn2000" names no projection: it is passed on, and refused as ambiguous.
+        app.dialogs.a = "vn2000".into();
+        app.dialogs.text = typed_crs(&app.dialogs.a);
+        assert_eq!(app.dialogs.text, "vn2000");
+        let err = rustgis_engine::map::Projection::from_code(&app.dialogs.text).unwrap_err();
+        assert!(err.contains("ambiguous"), "{err}");
+
+        // Explicit "vn2000tm3" resolves to VN-2000 TM-3 preset
+        app.dialogs.a = "vn2000tm3".into();
+        app.dialogs.text = typed_crs(&app.dialogs.a);
+        assert_eq!(app.dialogs.text, "vn2000tm3");
+        let proj = rustgis_engine::map::Projection::from_code(&app.dialogs.text).unwrap();
+        assert_eq!(proj.label(), "VN-2000 / TM-3 (Vietnam)");
+
+        // Explicit "VN-2000 / UTM zone 48N" resolves to UTM 48N
+        let proj_utm = rustgis_engine::map::Projection::from_code("VN-2000 / UTM zone 48N").unwrap();
+        assert_eq!(proj_utm.label(), "VN-2000 / UTM zone 48N");
+
+        // A province with the vn2000: prefix, in ASCII or Vietnamese.
+        for (name, code) in [
+            ("vn2000:hanoi", "vn2000tm3"),
+            ("vn2000:Hà Nội", "vn2000tm3"),
+            ("VN2000/Đà Nẵng", "vn2000tm3 +lon_0=107.75"),
+            ("vn2000:tphcm", "vn2000tm3 +lon_0=105.75"),
+            ("vn2000:vithanh", "vn2000tm3"),
+            ("vn2000:vitri", "vn2000tm3"),
+        ] {
+            app.dialogs.a = name.into();
+            app.dialogs.text = typed_crs(&app.dialogs.a);
+            let proj_p = rustgis_engine::map::Projection::from_code(&app.dialogs.text).unwrap();
+            assert!(proj_p.label().contains("VN-2000"), "{name}");
+            assert_eq!(proj_p.code(), code, "{name}");
+        }
+        // A bare province name is not a coordinate system: words such as "hue" stay as typed,
+        // as `map.projection` reads them.
+        for name in ["hanoi", "Hà Nội", "hue", "vinh", "tphcm", "vithanh", "vitri", "vietnam"] {
+            assert_eq!(typed_crs(name), name);
+            assert!(rustgis_engine::map::Projection::from_code(name).is_err(), "{name}");
+        }
+        // A prefixed province given to the command is saved as the preset too.
+        app.run("map.projection", json!({"type": "VN2000/Đà Nẵng"})).unwrap();
+        assert_eq!(app.session.map().projection.code(), "vn2000tm3 +lon_0=107.75");
+
+        // Applying VN-2000 TM-3
+        app.run("map.projection", json!({"type": "vn2000tm3"})).unwrap();
+        assert_eq!(app.session.map().projection.code(), "vn2000tm3");
+
+        // Custom meridian for HCMC (105.75)
+        app.run("map.projection", json!({"type": "vn2000tm3 +lon_0=105.75"})).unwrap();
+        assert_eq!(app.session.map().projection.code(), "vn2000tm3 +lon_0=105.75");
+    }
+
+    #[test]
+    fn ui_degree_formatting_preserves_fractions() {
+        assert_eq!(format_degrees(105.0), "105°");
+        assert_eq!(format_degrees(107.0), "107°");
+        assert_eq!(format_degrees(105.75), "105.75°");
+        assert_eq!(format_degrees(108.5), "108.5°");
+        assert_eq!(format_degrees(104.25), "104.25°");
     }
 }

@@ -125,6 +125,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) {
         italic: Some(&mut italic),
         align: Some(&mut align),
         letter_spacing: Some(&mut spacing),
+        font: None,
         select,
     };
     let settled = crate::textform::section(ui, "Text", |ui| crate::textform::show(ui, ("graphic_format", k), &[graphics::TOKENS], fields))
@@ -191,7 +192,7 @@ mod tests {
 
     fn harness(app: RustGisApp) -> egui_kittest::Harness<'static, RustGisApp> {
         let mut fonts = false;
-        egui_kittest::Harness::builder().with_size(egui::vec2(1000.0, 800.0)).build_ui_state(
+        egui_kittest::Harness::builder().with_accessibility_check(false).with_size(egui::vec2(1000.0, 800.0)).build_ui_state(
             move |ui, app: &mut RustGisApp| {
                 if !fonts {
                     crate::theme::install_fonts(ui.ctx(), &[], None);

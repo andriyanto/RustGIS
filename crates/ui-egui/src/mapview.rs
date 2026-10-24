@@ -592,13 +592,9 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         key.tiles = 0;
     } else if fetches_tiles(app.session.map()) {
         key.tiles = rustgis_engine::render::rustgis_tiles::cache::generation();
-        if let Some(old) = app.map.key
-            && old.tiles != key.tiles
-            && (Key { tiles: old.tiles, ..key }) == old
-            && time - app.map.last_render < 0.25
-        {
-            key.tiles = old.tiles;
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        if let Some(held) = held_tiles(key, app.map.tilt_settle.key(), app.map.key, time - app.map.last_render) {
+            key.tiles = held;
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(TILE_REDRAW_GAP));
         }
     }
     if app.map.view_px != key.size {
@@ -1569,7 +1565,7 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
         if let (Some((at, job)), Some(end)) = (shown, end) {
             let t = Tokens::get(ui.ctx());
             let painter =
-                ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, ui.id().with("text_drag"))).with_clip_rect(rect);
+                ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, ui.scope_id().with("text_drag"))).with_clip_rect(rect);
             // Laid out as the map draws it (its style too, #535), in the accent colour.
             let galley = painter.layout_job(job);
             let (pos, r) = place_galley(Align2::CENTER_CENTER, at + (end - origin), &galley);
@@ -2099,8 +2095,8 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
                 crate::i18n::fmt(
                     "Total {total}   ·   Segment {segment}",
                     &[
-                        ("total", &rustgis_engine::geom::format_distance(geodesic_length_m(&pts))),
-                        ("segment", &rustgis_engine::geom::format_distance(seg)),
+                        ("total", &crate::measure_units::distance(geodesic_length_m(&pts), app.ui.measurement_imperial)),
+                        ("segment", &crate::measure_units::distance(seg, app.ui.measurement_imperial)),
                     ],
                 )
             } else {
@@ -2111,8 +2107,8 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
                 crate::i18n::fmt(
                     "Area {area}   ·   Perimeter {perimeter}",
                     &[
-                        ("area", &rustgis_engine::geom::format_area(geodesic_ring_area_m2(&ring))),
-                        ("perimeter", &rustgis_engine::geom::format_distance(geodesic_length_m(&ring))),
+                        ("area", &crate::measure_units::area(geodesic_ring_area_m2(&ring), app.ui.measurement_imperial)),
+                        ("perimeter", &crate::measure_units::distance(geodesic_length_m(&ring), app.ui.measurement_imperial)),
                     ],
                 )
             };
@@ -2169,7 +2165,7 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
     // Facing north the corner stays the map's (identify, select and sketch clicks land there).
     if bearing != 0.0 || pitch != 0.0 {
         let hit = ui
-            .interact(north_arrow_rect(rect), egui::Id::new("map_north_arrow"), Sense::click())
+            .interact(north_arrow_rect(rect), egui::Id::unique("map_north_arrow"), Sense::click())
             .on_hover_text(tl!("Reset north"))
             .on_hover_cursor(egui::CursorIcon::PointingHand);
         if hit.clicked() {
@@ -2192,7 +2188,7 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
         [("zoom_in", "map.zoomIn", "Zoom in"), ("zoom_out", "map.zoomOut", "Zoom out"), ("zoom_full", "map.zoomFull", "Full extent")]
     {
         let r = Rect::from_min_size(pos2(rect.max.x - 44.0, y), vec2(32.0, 32.0));
-        let resp = ui.interact(r, egui::Id::new(("nav", id)), Sense::click());
+        let resp = ui.interact(r, egui::Id::unique(("nav", id)), Sense::click());
         p.rect_filled(r, CornerRadius::same(8), if resp.hovered() { t.hover } else { t.ribbon });
         p.rect_stroke(r, CornerRadius::same(8), Stroke::new(1.0, t.border_strong), egui::StrokeKind::Inside);
         icons::paint(p, r.shrink(7.0), icon, t.icon, t.accent);
@@ -2206,7 +2202,7 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
 
 fn scale_bar(app: &RustGisApp, p: &egui::Painter, rect: Rect, t: &Tokens) {
     let m_per_pt = app.session.map().ground_res();
-    let d = rustgis_engine::geom::nice_distance(m_per_pt * 130.0);
+    let d = crate::measure_units::scale_distance(m_per_pt * 130.0, app.ui.measurement_imperial);
     if d <= 0.0 {
         return;
     }
@@ -2221,7 +2217,13 @@ fn scale_bar(app: &RustGisApp, p: &egui::Painter, rect: Rect, t: &Tokens) {
     }
     p.rect_stroke(Rect::from_min_size(pos2(x0, y0), vec2(len, 5.0)), 0.0, Stroke::new(1.0, t.text), egui::StrokeKind::Middle);
     p.text(pos2(x0, y0 - 3.0), Align2::LEFT_BOTTOM, "0", regular(10.5), t.text);
-    p.text(pos2(x0 + len, y0 - 3.0), Align2::RIGHT_BOTTOM, rustgis_engine::geom::format_distance(d), regular(10.5), t.text);
+    p.text(
+        pos2(x0 + len, y0 - 3.0),
+        Align2::RIGHT_BOTTOM,
+        crate::measure_units::distance(d, app.ui.measurement_imperial),
+        regular(10.5),
+        t.text,
+    );
 }
 
 fn north_arrow_rect(rect: Rect) -> Rect {
@@ -2350,8 +2352,8 @@ fn popup(app: &mut RustGisApp, ui: &mut Ui, rect: Rect) {
     p.circle_stroke(anchor, 6.0, Stroke::new(2.0, Color32::from_rgb(0x00, 0xA8, 0xC0)));
     // The popup is as tall as its rows, up to a limit; the corner grip sets the width and that
     // limit, and both are remembered for the next popup.
-    let limit_id = egui::Id::new("identify_popup_limit");
-    let shown_id = egui::Id::new("identify_popup_shown");
+    let limit_id = egui::Id::unique("identify_popup_limit");
+    let shown_id = egui::Id::unique("identify_popup_shown");
     let space = vec2((rect.width() - 24.0).max(240.0), (rect.height() - 24.0).max(140.0));
     let limit = ui.ctx().data(|d| d.get_temp::<egui::Vec2>(limit_id)).unwrap_or(vec2(310.0, 360.0)).min(space);
     let last_h = ui.ctx().data(|d| d.get_temp::<f32>(shown_id)).unwrap_or(limit.y);
@@ -2364,7 +2366,7 @@ fn popup(app: &mut RustGisApp, ui: &mut Ui, rect: Rect) {
     // Keyed by the feature: egui remembers an area's (and a scroll area's and grid's) size, and
     // the next popup mustn't start from the last one's.
     let key = (&layer, &title, attrs.len());
-    egui::Area::new(egui::Id::new(("identify_popup", key))).fixed_pos(pos).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
+    egui::Area::new(egui::Id::unique(("identify_popup", key))).fixed_pos(pos).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
         let frame = egui::Frame::NONE
             .fill(t.menu)
             .stroke(Stroke::new(1.0, t.border_strong))
@@ -2463,7 +2465,7 @@ fn popup(app: &mut RustGisApp, ui: &mut Ui, rect: Rect) {
         // The corner grip: dragging it sets the width and the height limit.
         let r = frame.response.rect;
         let grip = Rect::from_min_max(r.max - vec2(16.0, 16.0), r.max);
-        let resp = ui.interact(grip, egui::Id::new("identify_popup_grip"), Sense::drag()).on_hover_cursor(egui::CursorIcon::ResizeNwSe);
+        let resp = ui.interact(grip, egui::Id::unique("identify_popup_grip"), Sense::drag()).on_hover_cursor(egui::CursorIcon::ResizeNwSe);
         let color = if resp.hovered() || resp.dragged() { t.text } else { t.text_dim };
         for k in [4.0, 8.0, 12.0] {
             ui.painter()
@@ -2569,7 +2571,7 @@ fn navigator(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t
     let (w, h) = (rect.width() as f64, rect.height() as f64);
     // Each button is an egui widget above the map, so its clicks are its own (not the map's
     // identify, select or sketch) and popups over it get theirs first.
-    let button = |ui: &mut Ui, r: Rect, id: &str| ui.interact(r, ui.id().with(("navigator", id)), Sense::click()).clicked();
+    let button = |ui: &mut Ui, r: Rect, id: &str| ui.interact(r, ui.scope_id().with(("navigator", id)), Sense::click()).clicked();
     for (dir, (dx, dy)) in [("n", (0.0, -1.0)), ("s", (0.0, 1.0)), ("e", (1.0, 0.0)), ("w", (-1.0, 0.0))] {
         let tip = c + vec2(dx, dy) * 28.0;
         let base = c + vec2(dx, dy) * 18.0;
@@ -2607,9 +2609,9 @@ fn view_tabs(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     for (i, n) in names.iter().enumerate() {
         let w = crate::widgets::text_w(ui, n, regular(12.0)) + 46.0 + TAB_CLOSE_W;
         let tr = Rect::from_min_size(pos2(x, r.min.y + 4.0), vec2(w, r.height() - 4.0));
-        let resp = ui.interact(tr, egui::Id::new(("maptab", i)), Sense::click());
+        let resp = ui.interact(tr, egui::Id::unique(("maptab", i)), Sense::click());
         // Painted, so named for screen readers (and tests).
-        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, n));
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, n));
         let is = i == active;
         // A project keeps at least one map (`map.remove` refuses the last).
         let last = names.len() < 2;
@@ -2633,7 +2635,7 @@ fn view_tabs(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             if is { t.text } else { t.text_dim },
         );
         // Over the tab's fill, so painted after it.
-        if tab_close(ui, t, tr, egui::Id::new(("maptab_close", i)), is, !last, tip) {
+        if tab_close(ui, t, tr, egui::Id::unique(("maptab_close", i)), is, !last, tip) {
             close = Some(Deletion::Map(n.clone()));
         }
         if resp.clicked() && !is {
@@ -2654,8 +2656,8 @@ fn view_tabs(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     for (i, n) in layouts.iter().enumerate() {
         let w = crate::widgets::text_w(ui, n, regular(12.0)) + 46.0 + TAB_CLOSE_W;
         let tr = Rect::from_min_size(pos2(x, r.min.y + 4.0), vec2(w, r.height() - 4.0));
-        let resp = ui.interact(tr, egui::Id::new(("layouttab", i)), Sense::click());
-        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, n));
+        let resp = ui.interact(tr, egui::Id::unique(("layouttab", i)), Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, n));
         let is = app.session.active_layout == Some(i) && !app.mb.shown();
         if is {
             ui.painter().rect_filled(tr, CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 }, t.ribbon);
@@ -2682,7 +2684,7 @@ fn view_tabs(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             if is { t.text } else { t.text_dim },
         );
         // Over the tab's fill, so painted after it.
-        if tab_close(ui, t, tr, egui::Id::new(("layouttab_close", i)), is, true, tl!("Delete Layout")) {
+        if tab_close(ui, t, tr, egui::Id::unique(("layouttab_close", i)), is, true, tl!("Delete Layout")) {
             close = Some(Deletion::Layout(n.clone()));
         }
         if resp.clicked() && !is {
@@ -2701,7 +2703,7 @@ fn view_tabs(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         let n = if app.mb.name.trim().is_empty() { tl!("Untitled model").to_string() } else { app.mb.name.trim().to_string() };
         let w = crate::widgets::text_w(ui, &n, regular(12.0)) + 46.0 + TAB_CLOSE_W;
         let tr = Rect::from_min_size(pos2(x, r.min.y + 4.0), vec2(w, r.height() - 4.0));
-        let resp = ui.interact(tr, egui::Id::new("modeltab"), Sense::click());
+        let resp = ui.interact(tr, egui::Id::unique("modeltab"), Sense::click());
         let is = app.mb.shown();
         if is {
             ui.painter().rect_filled(tr, CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 }, t.ribbon);
@@ -2727,7 +2729,7 @@ fn view_tabs(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             if is { semibold(12.0) } else { regular(12.0) },
             if is { t.text } else { t.text_dim },
         );
-        if tab_close(ui, t, tr, egui::Id::new("modeltab_close"), is, true, tl!("Close ModelBuilder")) {
+        if tab_close(ui, t, tr, egui::Id::unique("modeltab_close"), is, true, tl!("Close ModelBuilder")) {
             let _ = app.run("ui.modelBuilder", json!({"close": true}));
         }
         if resp.clicked() && !is {
@@ -2736,7 +2738,7 @@ fn view_tabs(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         x += w + 2.0;
     }
     let pr = Rect::from_min_size(pos2(x + 2.0, r.min.y + 6.0), vec2(22.0, 20.0));
-    let resp = ui.interact(pr, egui::Id::new("maptab_new"), Sense::click());
+    let resp = ui.interact(pr, egui::Id::unique("maptab_new"), Sense::click());
     if resp.hovered() {
         ui.painter().rect_filled(pr, CornerRadius::same(4), t.hover);
     }
@@ -2777,7 +2779,7 @@ pub fn confirm_delete(app: &mut RustGisApp, ctx: &egui::Context) {
     };
     let undo = crate::widgets::shortcut_text(app, "edit.undo");
     let mut decision = None;
-    egui::Modal::new(egui::Id::new("confirm_delete")).show(ctx, |ui| {
+    egui::Modal::new(egui::Id::unique("confirm_delete")).show(ctx, |ui| {
         ui.set_width(360.0);
         ui.label(egui::RichText::new(title).font(semibold(15.0)));
         if !undo.is_empty() {
@@ -2872,6 +2874,75 @@ fn scene_covers(scene: Camera, cam: Camera, w: f64, h: f64) -> bool {
     !e.is_empty() && e.min_x >= held.min_x && e.min_y >= held.min_y && e.max_x <= held.max_x && e.max_y <= held.max_y
 }
 
+/// How long (s) after a frame is shown tiles arriving wait before the map is drawn again.
+const TILE_REDRAW_GAP: f64 = 0.25;
+
+/// The tile cache generation `key` holds at instead of its own, when tiles arrived within
+/// [`TILE_REDRAW_GAP`] of the last frame shown: the newest frame of this view, of the one being
+/// drawn (`drawing`) and the one on screen (`shown`), so the map is drawn at most a few times a
+/// second while they arrive. Generations only grow: a live GPU scene can show newer tiles than
+/// the frame still being drawn, and isn't held back to it.
+///
+/// Holding at the frame on screen while a newer one was being drawn made the two alternate for
+/// good: each, once shown, differed from the key held at meanwhile, which started the other again
+/// (a tiled map in a projection other than Web Mercator, whose frames take longer, was drawn over
+/// and over, keeping a core busy and the app slow).
+fn held_tiles(key: Key, drawing: Option<Key>, shown: Option<Key>, since_render: f64) -> Option<u64> {
+    let same_view = |k: &Key| Key { tiles: k.tiles, ..key } == *k;
+    let newest = [drawing, shown].into_iter().flatten().filter(same_view).max_by_key(|k| k.tiles)?;
+    (newest.tiles != key.tiles && since_render < TILE_REDRAW_GAP).then_some(newest.tiles)
+}
+
+#[cfg(test)]
+mod tile_redraw_tests {
+    use super::{Key, held_tiles};
+
+    fn key(tiles: u64) -> Key {
+        Key { rev: 4, cam: (1, 2, 3, 0, 0), size: [800, 600], draft: false, tiles, sources: 0 }
+    }
+
+    #[test]
+    fn tiles_arriving_are_held_briefly_after_a_frame() {
+        // Shown a moment ago: the new tiles wait; a while ago, they are drawn.
+        assert_eq!(held_tiles(key(28), None, Some(key(0)), 0.1), Some(0));
+        assert_eq!(held_tiles(key(28), None, Some(key(0)), 0.3), None);
+        // Another view isn't held.
+        let moved = Key { cam: (9, 9, 9, 0, 0), ..key(0) };
+        assert_eq!(held_tiles(key(28), None, Some(moved), 0.1), None);
+    }
+
+    #[test]
+    fn a_frame_being_drawn_with_newer_tiles_is_not_drawn_again_with_older_ones() {
+        // The frame drawn with the tiles that arrived is on its way while an older one was just
+        // shown: the key is that frame's, not the older one's.
+        assert_eq!(held_tiles(key(28), Some(key(28)), Some(key(0)), 0.1), None);
+        // A live scene shown with newer tiles than the frame being drawn isn't held back to it.
+        assert_eq!(held_tiles(key(28), Some(key(5)), Some(key(28)), 0.1), None);
+        assert_eq!(held_tiles(key(30), Some(key(5)), Some(key(28)), 0.1), Some(28));
+        // Simulated: the view's frames alternated between generations 0 and 28 for good.
+        let (mut shown, mut drawing, mut since) = (Some(key(0)), Some(key(28)), 0.0);
+        let mut started = 0;
+        for _ in 0..50 {
+            let mut k = key(28);
+            if let Some(t) = held_tiles(k, drawing, shown, since) {
+                k.tiles = t;
+            }
+            // The frame being drawn finishes and is shown; another starts if the key differs.
+            if let Some(d) = drawing.take() {
+                shown = Some(d);
+                since = 0.0;
+            }
+            if shown != Some(k) {
+                drawing = Some(k);
+                started += 1;
+            }
+            since += 0.016;
+        }
+        assert_eq!(started, 0);
+        assert_eq!(shown, Some(key(28)));
+    }
+}
+
 #[cfg(test)]
 mod picture_tests {
     #[test]
@@ -2899,14 +2970,18 @@ mod tests {
         let mut app = RustGisApp::with_sample();
         app.run("map.body", json!({"name": "moon", "basemap": false})).expect("Moon");
         app.run("map.projection", json!({"type": "globe"})).expect("globe");
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(900.0, 550.0)).with_max_steps(10_000).build_ui_state(
-            |ui, app: &mut RustGisApp| {
-                let ctx = ui.ctx().clone();
-                app.logic(&ctx);
-                app.ui(ui);
-            },
-            app,
-        );
+        let mut h = egui_kittest::Harness::builder()
+            .with_accessibility_check(false)
+            .with_size(vec2(900.0, 550.0))
+            .with_max_steps(10_000)
+            .build_ui_state(
+                |ui, app: &mut RustGisApp| {
+                    let ctx = ui.ctx().clone();
+                    app.logic(&ctx);
+                    app.ui(ui);
+                },
+                app,
+            );
         let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while h.state().map.key.is_none() || h.state().map.drawing() {
             assert!(std::time::Instant::now() < end, "exact globe frame did not arrive");
@@ -2924,8 +2999,12 @@ mod tests {
     /// the map is drawn once at it.
     #[test]
     fn a_pane_drag_draws_the_map_once_it_stops() {
-        let mut h =
-            egui_kittest::Harness::builder().with_size(vec2(1200.0, 700.0)).with_step_dt(1.0 / 60.0).with_max_steps(10_000).build_ui_state(
+        let mut h = egui_kittest::Harness::builder()
+            .with_accessibility_check(false)
+            .with_size(vec2(1200.0, 700.0))
+            .with_step_dt(1.0 / 60.0)
+            .with_max_steps(10_000)
+            .build_ui_state(
                 |ui, app: &mut RustGisApp| {
                     let ctx = ui.ctx().clone();
                     app.logic(&ctx);

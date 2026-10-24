@@ -270,6 +270,14 @@ const NEVER: &[&str] = &[
     "edit.undo",
     "edit.redo",
     // Credentials: a plugin never sets where the user's are sent.
+    "connection.new",
+    "connection.edit",
+    "connection.duplicate",
+    "connection.remove",
+    "connection.login",
+    "connection.forgetPassword",
+    "connection.test",
+    "connection.browse",
     "s3.connect",
     "s3.disconnect",
     "earthdata.login",
@@ -303,6 +311,10 @@ const DATABASES: &[&str] = &[
     "pg.tables",
     "pg.addLayer",
     "pg.discardEdits",
+    "zarr.series",
+    "zarr.reduce",
+    "cube.trend",
+    "cube.reduce",
 ];
 
 /// What a command reaches beyond the project when run with some parameters.
@@ -340,6 +352,10 @@ pub fn reaches(spec: &C, params: &Value) -> Option<Reach> {
     }
     if DATABASES.contains(&spec.id) {
         return Some(Reach::Files);
+    }
+    // Georeferencing writes a file only when it is given a `path`; the rest of it stays in the project.
+    if spec.id == "raster.georeference" {
+        return super::items::names_place(params, PLACE_KEYS, 0).then_some(Reach::Files);
     }
     let files = super::items::names_place(params, PLACE_KEYS, 0)
         || PLACE_KEYS.iter().any(|k| spec.params.contains(&format!("\"{k}\"")))
@@ -436,6 +452,7 @@ impl Bridge<'_> {
             features: rows.iter().take(limit).filter_map(|&i| l.dataset.features.get(i).cloned()).collect(),
             source: None,
             crs: None,
+            crs_incomplete: false,
             windowed: false,
         };
         let mut gj = rustgis_data::io::to_geojson(&ds);

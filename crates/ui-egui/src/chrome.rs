@@ -99,7 +99,7 @@ pub fn header(app: &mut RustGisApp, ui: &mut Ui) {
                     pos2(full.min.x - layout.left_pad, full.min.y),
                     pos2(full.max.x + HEADER_PAD, full.max.y + layout.bottom_pad),
                 );
-                let drag = ui.interact(bar, egui::Id::new("header_drag"), Sense::click_and_drag());
+                let drag = ui.interact(bar, egui::Id::unique("header_drag"), Sense::click_and_drag());
                 if drag.double_clicked() {
                     let maximized = ui.ctx().input(|i| i.viewport().maximized).unwrap_or(false);
                     let action = app.ui.titlebar.map_or(DoubleClick::Zoom, |m| m.double_click);
@@ -174,7 +174,7 @@ pub fn header(app: &mut RustGisApp, ui: &mut Ui) {
                     26.0
                 };
                 let sr = Rect::from_min_max(pos2(right - sw, full.center().y - 12.0), pos2(right, full.center().y + 12.0));
-                let resp = ui.interact(sr, egui::Id::new("command_search_box"), Sense::click());
+                let resp = ui.interact(sr, egui::Id::unique("command_search_box"), Sense::click());
                 ui.painter().rect_filled(sr, CornerRadius::same(12), if resp.hovered() { t.hover } else { t.input });
                 ui.painter().rect_stroke(sr, CornerRadius::same(12), Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
                 let compact = sw < 100.0;
@@ -476,14 +476,18 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
     // The search box was typed in until egui took its focus away on Escape: that Escape clears
     // the box, not the tool.
     let typing = ctx.egui_wants_keyboard_input() || crate::searchbox::had_focus(&app.ui.search, ctx.cumulative_pass_nr());
+    // A text field focused, not any widget (a button reached with Tab): it has an undo of its own.
+    let text_field = ctx.text_edit_focused();
     // An element selected in the open layout, for the layout's own keys.
     let element = app.session.active_layout.is_some() && app.layout.selected.is_some();
     let mut run: Vec<(String, Value)> = Vec::new();
     let keymap = &app.ui.keymap;
     ctx.input_mut(|i| {
         for b in keymap.match_order() {
-            // Keys without Ctrl (⌘) type text while a text field has focus.
-            if typing && !b.chord.command {
+            // While a text field has focus, it keeps the keys it acts on: those without Ctrl (⌘),
+            // which type text, and undo and redo, whatever they're bound to (#685), as ModelBuilder
+            // leaves them.
+            if (typing && !b.chord.command) || (text_field && b.chord.is_text_undo()) {
                 continue;
             }
             // Duplicating needs a selected layout element, and not a text field being typed in;
@@ -619,6 +623,7 @@ pub(crate) const UI_COMMANDS: &[(&str, &str, &str)] = &[
     ("ui.addUrl", "Add Data From URL…", "Home › Add"),
     ("ui.addZarr", "Add Zarr Variable…", "Home › Add"),
     ("ui.addService", "Add From Service…", "Home › Add"),
+    ("ui.openSources", "Connections…", "Home › Add Data"),
     ("ui.searchOpenData", "Search Open Data…", "Home › Web Data"),
     ("ui.stac.planet", "Planet Open Data…", "Home › Web Data"),
     ("ui.stac.portolan", "Portolan…", "Home › Web Data"),
@@ -637,6 +642,8 @@ pub(crate) const UI_COMMANDS: &[(&str, &str, &str)] = &[
     ("ui.pane.bookmarks", "Bookmarks Pane", "Home › Navigate › Bookmarks"),
     ("ui.theme", "Toggle Dark Mode", "View"),
     ("ui.map.gpu", "Toggle GPU Rendering", "View"),
+    ("ui.importShapefile", "Import Shapefile with Projection…", "Home › Add"),
+    ("ui.measurementUnits", "Toggle Imperial Measurements", "Home › Inspect › Measure"),
     ("ui.exportMap", "Export Map…", "Publish › Output"),
     ("ui.checkUpdate", "Check for Updates…", "Help › Help"),
 ];
@@ -652,6 +659,7 @@ enum SearchAction {
     Workflow(&'static str),
 }
 
+/// Routes commands requiring user input to their dialogs rather than executing empty params.
 fn search_action(id: &str) -> Option<SearchAction> {
     use crate::RightPane;
     use SearchAction::{Command, Dialog, OpenItem, Pane, SaveItem, Workflow};
@@ -678,6 +686,7 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "layer.addData" | "layer.addPhotos" => Command("ui.addData"),
         "layer.addUrl" => Command("ui.addUrl"),
         "service.add" | "service.import" => Command("ui.addService"),
+        "connection.new" => Command("ui.connection"),
         "layer.addSql" => Pane(RightPane::Sql),
         "layer.addDatabase" => Dialog("addDatabase"),
         "layer.addZarr" => Command("ui.addZarr"),
@@ -688,6 +697,8 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "layer.addEncodedPolyline" => Dialog("addPolyline"),
         "layer.geocode" => Dialog("geocode"),
         "layer.rename" => Dialog("renameLayer"),
+        "layer.defineProjection" => Dialog("defineProjection"),
+        "ui.importShapefile" => Dialog("addShapefile"),
         "layer.definitionQuery" => Dialog("definitionQuery"),
         "layer.symbology" | "raster.symbology" | "layer.color" | "layer.outline" | "layer.lineStrokes" | "layer.ramp" => {
             Pane(RightPane::Symbology)
@@ -805,7 +816,7 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
     let screen = ctx.content_rect();
     let width = (screen.width() - 48.0).clamp(220.0, 520.0);
     let list_h = (screen.height() - 190.0).clamp(120.0, 360.0);
-    let modal = egui::Modal::new(egui::Id::new("command_search")).show(ctx, |ui| {
+    let modal = egui::Modal::new(egui::Id::unique("command_search")).show(ctx, |ui| {
         ui.set_width(width);
         ui.horizontal(|ui| {
             let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
@@ -990,6 +1001,23 @@ pub(crate) fn project_links(ui: &mut egui::Ui) {
     });
 }
 
+/// Links to the licence notices of the software and data RustGIS is built with. The web app
+/// serves its own copy of `THIRD-PARTY-LICENSES.txt`; the desktop packages ship one next to
+/// LICENSE, and link to the current one on GitHub.
+pub(crate) fn licence_links(ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        let notices = if cfg!(target_arch = "wasm32") {
+            "THIRD-PARTY-LICENSES.txt"
+        } else {
+            "https://github.com/opengeos/RustGIS/blob/main/THIRD-PARTY-LICENSES.txt"
+        };
+        ui.add(egui::Hyperlink::from_label_and_url(tl!("Third-party licences"), notices).open_in_new_tab(true));
+        ui.label("·");
+        let attribution = "https://github.com/opengeos/RustGIS/blob/main/ATTRIBUTION.md";
+        ui.add(egui::Hyperlink::from_label_and_url(tl!("Attribution"), attribution).open_in_new_tab(true));
+    });
+}
+
 pub fn about(app: &mut RustGisApp, ctx: &egui::Context) {
     if app.ui.about {
         let logo_tex = app.logo(ctx);
@@ -1025,6 +1053,7 @@ pub fn about(app: &mut RustGisApp, ctx: &egui::Context) {
             );
             let (fonts_from, _) = (rustgis_engine::render::fonts::ui_fonts().source.clone(), ());
             ui.label(egui::RichText::new(crate::i18n::fmt("Interface font: {font}", &[("font", &fonts_from)])).small().weak());
+            licence_links(ui);
         });
         app.ui.about = open;
     }
@@ -1100,7 +1129,7 @@ pub fn notices(app: &mut RustGisApp, ctx: &egui::Context) {
     let mut y = screen.max.y - 40.0;
     for toast in app.map.toasts.iter_mut().rev().take(3) {
         // Keyed by the notice, not the slot, so a selection stays with its text as toasts come and go.
-        let shown = egui::Area::new(egui::Id::new(("toast", toast.id)))
+        let shown = egui::Area::new(egui::Id::unique(("toast", toast.id)))
             .fixed_pos(pos2(screen.max.x - 380.0, y - 44.0))
             .order(egui::Order::Tooltip)
             .show(ctx, |ui| {
@@ -1161,6 +1190,39 @@ mod tests {
         }
     }
 
+    /// With a text field focused, Ctrl/⌘+Z undoes its typing, not the project; with none, the
+    /// project (#685).
+    #[test]
+    fn undo_in_a_text_field_undoes_its_text() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        app.run("labels.style", serde_json::json!({"layer": "Cities", "size": 20})).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(vec2(500.0, 700.0)).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                shortcuts(app, &ctx);
+                crate::analysispane::script_pane(app, ui, &Tokens::light());
+            },
+            app,
+        );
+        h.run();
+        h.get_by_role(egui::accesskit::Role::MultilineTextInput).focus();
+        h.run();
+        h.event(egui::Event::Text("map.zoomFull".into()));
+        h.run();
+        let depth = h.state().session.undo_depth();
+        let undo = egui::Event::Key { key: Key::Z, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND };
+        h.event(undo.clone());
+        h.run();
+        assert_eq!(h.state().session.undo_depth(), depth, "the project untouched");
+        assert_eq!(h.state().workflow.script, "", "the typing undone");
+        h.ctx.memory_mut(|m| m.surrender_focus(egui::Id::unique("script_text")));
+        h.run();
+        h.event(undo);
+        h.run();
+        assert_eq!(h.state().session.undo_depth(), depth - 1, "no field focused: the project");
+    }
+
     #[test]
     fn header_without_a_unified_title_bar_keeps_its_usual_size() {
         let l = header_layout(None);
@@ -1205,6 +1267,37 @@ mod tests {
             let l = header_layout(Some(TitlebarMetrics { left_inset: inset, height, ..TitlebarMetrics::FALLBACK }));
             assert!(l.left_pad.is_finite() && (10.0..=120.0).contains(&l.left_pad), "{l:?}");
             assert!(l.height.is_finite() && (34.0..=80.0).contains(&l.height), "{l:?}");
+        }
+    }
+
+    #[test]
+    fn connections_entry_opens_sources_without_ever_closing_it() {
+        let mut app = RustGisApp::with_sample();
+        app.run("ui.pane.sources", serde_json::Value::Null).unwrap();
+        app.run("ui.pane.sources", serde_json::Value::Null).unwrap();
+        assert_eq!(app.ui.left, None, "the View entry still toggles");
+        app.run("ui.openSources", serde_json::Value::Null).unwrap();
+        assert_eq!(app.ui.left, Some(crate::LeftPane::Sources), "opens from closed");
+        app.run("ui.openSources", serde_json::Value::Null).unwrap();
+        assert_eq!(app.ui.left, Some(crate::LeftPane::Sources), "idempotent when already open");
+        app.ui.left = Some(crate::LeftPane::Catalog);
+        app.run("ui.openSources", serde_json::Value::Null).unwrap();
+        assert_eq!(app.ui.left, Some(crate::LeftPane::Sources), "replaces another left pane");
+        app.run("ui.pane.sources", serde_json::Value::Null).unwrap();
+        assert_eq!(app.ui.left, None, "toggle closes it again");
+    }
+
+    #[test]
+    fn every_new_connection_entry_opens_its_form() {
+        for (kind, _) in crate::connectionui::KINDS {
+            // The menu leaves database kinds out on the web, where `open_new` refuses them.
+            if cfg!(target_arch = "wasm32") && rustgis_engine::connections::DATABASE_KINDS.contains(&kind) {
+                continue;
+            }
+            let mut app = RustGisApp::with_sample();
+            app.run("ui.connection", serde_json::json!({"kind": kind})).unwrap();
+            assert_eq!(app.dialogs.open, Some("newConnection"), "{kind}");
+            assert_eq!(app.ui.connection.kind, kind);
         }
     }
 }

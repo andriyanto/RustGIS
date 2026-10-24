@@ -119,12 +119,18 @@ fn ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
+fn refused_login(e: &postgres::Error) -> bool {
+    // 28000 also covers access-policy and role failures that a password cannot fix.
+    matches!(e.code(), Some(&postgres::error::SqlState::INVALID_PASSWORD))
+        // tokio-postgres exposes no typed discriminator for this client-side config error.
+        // The no-password handshake in the engine regression guards its exact source message.
+        || std::error::Error::source(e).is_some_and(|s| s.to_string() == "password missing")
+}
+
 fn err(e: postgres::Error) -> DataError {
     // The server's own message (a missing table, a failed password) rather than "db error".
-    match e.as_db_error() {
-        Some(db) => DataError::Format(db.message().to_string()),
-        None => DataError::Format(e.to_string()),
-    }
+    let message = e.as_db_error().map(|db| db.message().to_string()).unwrap_or_else(|| e.to_string());
+    if refused_login(&e) { DataError::Login(message) } else { DataError::Format(message) }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -167,11 +173,11 @@ impl Conn {
             let client = guard.as_mut().ok_or_else(|| DataError::Format("not connected".into()))?;
             let r = f(client);
             if !client.is_closed() {
-                return r.map_err(err);
+                return r.map_err(|e| redacted(&self.config, err(e)));
             }
             *guard = None;
             if attempt == 1 || r.is_ok() {
-                return r.map_err(err);
+                return r.map_err(|e| redacted(&self.config, err(e)));
             }
         }
         Err(DataError::Format("not connected".into()))
@@ -196,16 +202,31 @@ impl Conn {
     }
 }
 
+/// Connects, with the password taken out of any error: a server or the client may echo what it was given.
 fn open_client(config: &postgres::Config, tls: &Tls, writable: bool) -> Result<postgres::Client> {
+    connect_client(config, tls, writable).map_err(|e| redacted(config, e))
+}
+
+fn redacted(config: &postgres::Config, error: DataError) -> DataError {
+    match config.get_password().and_then(|p| std::str::from_utf8(p).ok()) {
+        Some(password) => error.redact_secret(password),
+        None => error,
+    }
+}
+
+fn connect_client(config: &postgres::Config, tls: &Tls, writable: bool) -> Result<postgres::Client> {
     let mut client = match tls {
         Tls::Disable => config.connect(postgres::NoTls),
         Tls::Unverified | Tls::Verified(_) => config.connect(tokio_postgres_rustls::MakeRustlsConnect::new(rustls_config(tls)?)),
     }
-    .map_err(|e| match e.as_db_error() {
-        Some(db) => DataError::Format(db.message().to_string()),
-        // The cause ("password authentication failed", "connection refused"), not just "error
-        // connecting to server".
-        None => DataError::Format(std::error::Error::source(&e).map(|s| format!("{e}: {s}")).unwrap_or_else(|| e.to_string())),
+    .map_err(|e| {
+        let message = match e.as_db_error() {
+            Some(db) => db.message().to_string(),
+            // The cause ("password authentication failed", "connection refused"), not just
+            // "error connecting to server".
+            None => std::error::Error::source(&e).map(|s| format!("{e}: {s}")).unwrap_or_else(|| e.to_string()),
+        };
+        if refused_login(&e) { DataError::Login(message) } else { DataError::Format(message) }
     })?;
     let read_only = if writable { "" } else { "SET default_transaction_read_only = on; " };
     client.batch_execute(&format!("{read_only}SET statement_timeout = '{STATEMENT_TIMEOUT}'; SET extra_float_digits = 3;")).map_err(err)?;

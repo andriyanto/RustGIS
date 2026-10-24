@@ -4,6 +4,7 @@
 //! `rustgis_tiles::s3` when the connection has credentials.
 
 use egui::vec2;
+use rustgis_engine::connections::Connection;
 use rustgis_engine::render::rustgis_tiles::{cache, s3};
 use serde_json::{Value, json};
 
@@ -11,23 +12,12 @@ use crate::{RustGisApp, Slot, i18n};
 
 type Answer = Slot<Result<Vec<u8>, String>>;
 
-/// The preference holding remembered connections (never their secrets).
-const SAVED: &str = "s3_connections";
-
-/// A remembered connection: what's needed to connect again, without the secret.
-#[derive(Clone, Debug, Default, PartialEq)]
-struct Saved {
-    name: String,
-    endpoint: String,
-    region: String,
-    /// Where its keys come from ([`SOURCES`]); typed keys are typed again.
-    source: String,
-    profile: String,
-}
+/// The legacy preference of remembered connections, read once by the connections import (never written).
+pub(crate) const SAVED: &str = "s3_connections";
 
 /// Where a connection's keys come from: typed, an AWS profile or the environment (desktop), or
 /// none (public buckets). The profile and the environment are used only when chosen here.
-const SOURCES: [(&str, &str); 4] = [
+pub(crate) const SOURCES: [(&str, &str); 4] = [
     ("keys", "Typed below"),
     ("profile", "An AWS profile"),
     ("environment", "The environment (AWS_ACCESS_KEY_ID…)"),
@@ -37,6 +27,12 @@ const SOURCES: [(&str, &str); 4] = [
 /// The dialog's form, browsing place and requests under way.
 #[derive(Default)]
 pub struct State {
+    /// The saved connection this dialog was opened on, by id (see `connectionui::picked`).
+    pub(crate) connection: Option<String>,
+    /// The saved definition the form was last filled from or kept as: a later edit or removal elsewhere is noticed against it.
+    synced: Option<Connection>,
+    /// What Connect last connected, as Save as Connection keeps it.
+    connected: Option<Value>,
     name: String,
     endpoint: String,
     region: String,
@@ -45,9 +41,6 @@ pub struct State {
     /// Where the keys come from ([`SOURCES`]; empty: typed).
     source: String,
     profile: String,
-    remember: bool,
-    saved: Vec<Saved>,
-    saved_loaded: bool,
     /// The connection browsed (a session connection's name; none: anonymous AWS).
     conn: String,
     bucket: String,
@@ -142,40 +135,73 @@ fn list(st: &mut State) {
     st.listing_job = Some(fetch(&url));
 }
 
-fn load_saved(app: &mut RustGisApp) {
-    if app.ui.s3.saved_loaded {
-        return;
-    }
-    app.ui.s3.saved_loaded = true;
-    let text = app.services.load_pref.as_ref().and_then(|load| load(SAVED)).unwrap_or_default();
-    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-    let s = |c: &Value, k: &str| c.get(k).and_then(Value::as_str).unwrap_or("").chars().take(200).collect::<String>();
-    app.ui.s3.saved = v
-        .as_array()
-        .into_iter()
-        .flatten()
-        .take(32)
-        .map(|c| Saved {
-            name: s(c, "name"),
-            endpoint: s(c, "endpoint"),
-            region: s(c, "region"),
-            source: s(c, "source"),
-            profile: s(c, "profile"),
-        })
-        .filter(|c| !c.name.is_empty())
-        .collect();
+/// Puts a saved connection in the form, without carrying secrets from the previous one.
+pub(crate) fn fill(app: &mut RustGisApp, c: &Connection) {
+    let st = &mut app.ui.s3;
+    st.name = c.name.clone();
+    st.endpoint = c.address.clone();
+    st.region = c.options.get("region").cloned().unwrap_or_default();
+    st.source = c.options.get("credentials").cloned().unwrap_or_else(|| "none".into());
+    st.profile = c.options.get("profile").cloned().unwrap_or_default();
+    st.key.clear();
+    st.secret.clear();
+    st.connected = None;
+    st.error = None;
 }
 
-fn store_saved(app: &RustGisApp) {
-    let v: Vec<Value> = app
-        .ui
-        .s3
-        .saved
-        .iter()
-        .map(|c| json!({"name": c.name, "endpoint": c.endpoint, "region": c.region, "source": c.source, "profile": c.profile}))
-        .collect();
-    if let Some(save) = &app.services.save_pref {
-        save(SAVED, &Value::Array(v).to_string());
+fn pick(app: &mut RustGisApp, c: &Connection) {
+    fill(app, c);
+    app.ui.s3.connection = Some(c.id.clone());
+    if s3::connection(&c.name).is_some() {
+        open_connection(app, &c.name);
+    } else if app.ui.s3.source != "keys" {
+        match app.run("connection.login", json!({"id": c.id})) {
+            Ok(_) => open_connection(app, &c.name),
+            Err(e) => app.ui.s3.error = Some(e),
+        }
+    }
+}
+
+fn connect(app: &mut RustGisApp) {
+    let st = &app.ui.s3;
+    let name = if st.name.trim().is_empty() { "default".to_string() } else { st.name.trim().to_string() };
+    let endpoint = st.endpoint.trim().to_string();
+    let region = st.region.trim().to_string();
+    let profile = if st.profile.trim().is_empty() { "default".to_string() } else { st.profile.trim().to_string() };
+    let mut p = json!({"name": name, "region": region});
+    if !endpoint.is_empty() {
+        p["endpoint"] = json!(endpoint);
+    }
+    match st.source.as_str() {
+        "profile" => p["profile"] = json!(profile),
+        "environment" => p["environment"] = json!(true),
+        "keys" if !st.key.trim().is_empty() || !st.secret.is_empty() => {
+            p["accessKeyId"] = json!(st.key.trim());
+            p["secretAccessKey"] = json!(st.secret.trim());
+        }
+        // Nothing typed, or none chosen: anonymous.
+        _ => {}
+    }
+    match app.run("s3.connect", p) {
+        Ok(v) => {
+            let st = &mut app.ui.s3;
+            // The secret stays with the session's connection, not in the form.
+            st.secret.clear();
+            st.conn = name.clone();
+            st.error = None;
+            st.buckets.clear();
+            let credentials = v["credentials"].as_str().filter(|c| matches!(*c, "keys" | "profile" | "environment")).unwrap_or("none");
+            let mut def = json!({"kind": "s3", "name": name, "address": endpoint,
+                "options": {"region": region, "credentials": credentials}});
+            if credentials == "profile" {
+                def["options"]["profile"] = json!(profile);
+            }
+            st.connected = Some(def);
+        }
+        Err(e) => {
+            app.ui.s3.connected = None;
+            app.ui.s3.error = Some(e);
+        }
     }
 }
 
@@ -192,10 +218,50 @@ pub fn open_connection(app: &mut RustGisApp, name: &str) {
     }
 }
 
+/// Forgets what was listed for the endpoint browsed.
+fn reset_browse(st: &mut State) {
+    st.listing = None;
+    st.listing_job = None;
+    st.buckets.clear();
+    st.buckets_job = None;
+    st.bucket.clear();
+    st.prefix.clear();
+}
+
+/// Keeps the form true to the saved connection it stands for. A connection edited elsewhere
+/// (its endpoint, region or login changed, which also ends its session) is filled in again
+/// and what was listed for the old settings dropped; one removed is let go. The first look at
+/// a connection only records it.
+fn sync(app: &mut RustGisApp) {
+    let list = crate::sourcespane::connections_snapshot(app);
+    let st = &mut app.ui.s3;
+    let Some(id) = st.connection.clone() else {
+        st.synced = None;
+        return;
+    };
+    match list.iter().find(|c| c.id == id && c.kind == "s3") {
+        None => {
+            st.connection = None;
+            st.synced = None;
+            reset_browse(st);
+        }
+        Some(c) => match st.synced.as_ref().filter(|s| s.id == c.id) {
+            None => st.synced = Some(c.clone()),
+            Some(s) if (s.name.as_str(), s.address.as_str(), &s.options) != (c.name.as_str(), c.address.as_str(), &c.options) => {
+                let c = c.clone();
+                fill(app, &c);
+                reset_browse(&mut app.ui.s3);
+                app.ui.s3.synced = Some(c);
+            }
+            Some(_) => {}
+        },
+    }
+}
+
 /// The dialog: a connection, then a bucket browsed a level at a time.
 pub fn dialog(app: &mut RustGisApp, ui: &mut egui::Ui) {
-    load_saved(app);
-    ui.label(egui::RichText::new(tl!("Amazon S3, or an S3-compatible service (MinIO, Cloudflare R2, Wasabi…) by its endpoint. Keys are kept until RustGIS closes; a remembered connection keeps its name, endpoint and region, never its secret.")).weak());
+    sync(app);
+    ui.label(egui::RichText::new(tl!("Amazon S3, or an S3-compatible service (MinIO, Cloudflare R2, Wasabi…) by its endpoint. Keys are kept until RustGIS closes; a saved connection keeps its name, endpoint and region, never its secret.")).weak());
     egui::CollapsingHeader::new(tl!("Connection")).default_open(s3::connections().is_empty()).show(ui, |ui| connection_form(app, ui));
     ui.separator();
     browse(app, ui);
@@ -205,22 +271,14 @@ pub fn dialog(app: &mut RustGisApp, ui: &mut egui::Ui) {
 }
 
 fn connection_form(app: &mut RustGisApp, ui: &mut egui::Ui) {
-    let saved = app.ui.s3.saved.clone();
-    if !saved.is_empty() {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new(tl!("Remembered:")).small().weak());
-            for c in &saved {
-                if ui.small_button(&c.name).on_hover_text(if c.endpoint.is_empty() { "AWS" } else { c.endpoint.as_str() }).clicked() {
-                    let st = &mut app.ui.s3;
-                    st.name = c.name.clone();
-                    st.endpoint = c.endpoint.clone();
-                    st.region = c.region.clone();
-                    st.source = c.source.clone();
-                    st.profile = c.profile.clone();
-                    st.remember = true;
-                }
-            }
-        });
+    let list = crate::sourcespane::connections_snapshot(app);
+    let st = &app.ui.s3;
+    // A blank name connects as "default" (see `connect`), so it is that connection's name here too.
+    let shown_name = if st.name.trim().is_empty() { "default" } else { st.name.trim() };
+    let current = list.iter().find(|c| c.kind == "s3" && Some(c.id.as_str()) == st.connection.as_deref() && c.name == shown_name);
+    if let Some(c) = crate::connectionui::picker(ui, "s3_saved", &list, &["s3"], current) {
+        pick(app, &c);
+        return;
     }
     let st = &mut app.ui.s3;
     if !SOURCES.iter().any(|(c, _)| *c == st.source) {
@@ -261,45 +319,22 @@ fn connection_form(app: &mut RustGisApp, ui: &mut egui::Ui) {
         ui.add_enabled(typed, egui::TextEdit::singleline(&mut st.secret).password(true).desired_width(300.0));
         ui.end_row();
     });
-    ui.checkbox(&mut st.remember, tl!("Remember (without the secret)"));
     if ui.button(tl!("Connect")).clicked() {
-        let name = if st.name.trim().is_empty() { "default".to_string() } else { st.name.trim().to_string() };
-        let mut p = json!({"name": name, "region": st.region.trim()});
-        if !st.endpoint.trim().is_empty() {
-            p["endpoint"] = json!(st.endpoint.trim());
-        }
-        match st.source.as_str() {
-            "profile" => p["profile"] = json!(if st.profile.trim().is_empty() { "default" } else { st.profile.trim() }),
-            "environment" => p["environment"] = json!(true),
-            "keys" if !st.key.trim().is_empty() || !st.secret.is_empty() => {
-                p["accessKeyId"] = json!(st.key.trim());
-                p["secretAccessKey"] = json!(st.secret.trim());
+        connect(app);
+    }
+    let st = &app.ui.s3;
+    if let Some(def) = &st.connected
+        && def["name"].as_str() == Some(st.conn.as_str())
+        && s3::connection(&st.conn).is_some()
+        && current.is_none()
+    {
+        if list.iter().any(|c| c.name.eq_ignore_ascii_case(&st.conn)) {
+            ui.label(egui::RichText::new(tl!("Rename it to save it: a connection has this name")).small().weak());
+        } else if crate::connectionui::keep_button(ui) {
+            match crate::connectionui::keep(app, def.clone()) {
+                Ok(id) => app.ui.s3.connection = Some(id),
+                Err(e) => app.ui.s3.error = Some(e),
             }
-            // Nothing typed, or none chosen: anonymous.
-            _ => {}
-        }
-        let remember = st.remember.then(|| Saved {
-            name: name.clone(),
-            endpoint: st.endpoint.trim().to_string(),
-            region: st.region.trim().to_string(),
-            source: st.source.clone(),
-            profile: st.profile.trim().to_string(),
-        });
-        match app.run("s3.connect", p) {
-            Ok(_) => {
-                let st = &mut app.ui.s3;
-                // The secret stays with the session's connection, not in the form.
-                st.secret.clear();
-                st.conn = name;
-                st.error = None;
-                st.buckets.clear();
-                if let Some(r) = remember {
-                    st.saved.retain(|c| c.name != r.name);
-                    st.saved.insert(0, r);
-                    store_saved(app);
-                }
-            }
-            Err(e) => app.ui.s3.error = Some(e),
         }
     }
 }
@@ -410,5 +445,104 @@ fn size_text(n: u64) -> String {
         n if n >= 1 << 20 => format!("{:.1} MB", n as f64 / f64::from(1u32 << 20)),
         n if n >= 1 << 10 => format!("{:.0} KB", n as f64 / 1024.0),
         n => format!("{n} B"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anonymous_connection_can_be_kept_and_picked_after_disconnect() {
+        let mut app = RustGisApp::with_sample();
+        app.ui.s3.name = "keep-s3-test".into();
+        app.ui.s3.endpoint = "https://s3.example.com".into();
+        app.ui.s3.region = "eu-west-1".into();
+        app.ui.s3.source = "none".into();
+        connect(&mut app);
+        assert_eq!(app.ui.s3.error, None);
+        let def = app.ui.s3.connected.clone().unwrap();
+        assert_eq!(
+            def,
+            json!({"kind":"s3","name":"keep-s3-test","address":"https://s3.example.com",
+            "options":{"region":"eu-west-1","credentials":"none"}})
+        );
+        assert!(app.session.connections.connections.is_empty(), "Connect alone must not save");
+        let id = crate::connectionui::keep(&mut app, def).unwrap();
+        let c = app.session.connections.find(&id).unwrap().clone();
+        assert_eq!(c.options.get("credentials").map(String::as_str), Some("none"));
+        s3::disconnect("keep-s3-test");
+        pick(&mut app, &c);
+        assert!(s3::connection("keep-s3-test").is_some());
+        assert_eq!(app.ui.s3.conn, "keep-s3-test");
+        assert_eq!(app.ui.s3.connection.as_deref(), Some(c.id.as_str()));
+        s3::disconnect("keep-s3-test");
+    }
+
+    #[test]
+    fn picking_typed_keys_clears_previous_secrets_and_waits_for_connect() {
+        let mut app = RustGisApp::with_sample();
+        let v = app
+            .run(
+                "connection.new",
+                json!({"kind":"s3","name":"pick-typed-s3-test","address":"",
+            "options":{"credentials":"keys"}}),
+            )
+            .unwrap();
+        let c = app.session.connections.find(v["id"].as_str().unwrap()).unwrap().clone();
+        app.ui.s3.key = "previous-key".into();
+        app.ui.s3.secret = "previous-secret".into();
+        app.ui.s3.connected = Some(json!({"name":"previous"}));
+        pick(&mut app, &c);
+        assert!(s3::connection(&c.name).is_none());
+        assert!(app.ui.s3.key.is_empty());
+        assert!(app.ui.s3.secret.is_empty());
+        assert!(app.ui.s3.connected.is_none());
+        assert_eq!(app.ui.s3.name, c.name);
+        assert_eq!(app.ui.s3.connection.as_deref(), Some(c.id.as_str()));
+        app.ui.s3.key = "test-access".into();
+        app.ui.s3.secret = "test-secret".into();
+        connect(&mut app);
+        assert_eq!(app.ui.s3.error, None);
+        assert!(app.ui.s3.secret.is_empty());
+        assert_eq!(app.ui.s3.connected.as_ref().unwrap()["options"]["credentials"], "keys");
+        assert_eq!(s3::connection(&c.name).unwrap().name, c.name);
+        s3::disconnect(&c.name);
+    }
+
+    #[test]
+    fn editing_or_removing_the_picked_connection_refills_the_form_and_drops_its_listing() {
+        let mut app = RustGisApp::with_sample();
+        let v = app
+            .run(
+                "connection.new",
+                json!({"kind":"s3","name":"edited-s3-test","address":"https://old.example.com",
+            "options":{"region":"eu-west-1","credentials":"none"}}),
+            )
+            .unwrap();
+        let id = v["id"].as_str().unwrap().to_string();
+        let c = app.session.connections.find(&id).unwrap().clone();
+        pick(&mut app, &c);
+        sync(&mut app);
+        app.ui.s3.bucket = "old-bucket".into();
+        app.ui.s3.listing = Some((vec!["old/".into()], Vec::new(), false));
+        // Unchanged: left as it is.
+        sync(&mut app);
+        assert_eq!(app.ui.s3.bucket, "old-bucket");
+
+        let edit = json!({"id": id, "address": "https://new.example.com", "options": {"region":"us-west-2","credentials":"none"}});
+        app.run("connection.edit", edit).unwrap();
+        sync(&mut app);
+        assert_eq!(app.ui.s3.endpoint, "https://new.example.com");
+        assert_eq!(app.ui.s3.region, "us-west-2");
+        assert!(app.ui.s3.listing.is_none() && app.ui.s3.bucket.is_empty(), "nothing listed for the old endpoint is kept");
+        assert_eq!(app.ui.s3.connection.as_deref(), Some(id.as_str()));
+
+        app.ui.s3.bucket = "other".into();
+        app.run("connection.remove", json!({"id": id})).unwrap();
+        sync(&mut app);
+        assert_eq!(app.ui.s3.connection, None);
+        assert!(app.ui.s3.bucket.is_empty());
+        s3::disconnect("edited-s3-test");
     }
 }

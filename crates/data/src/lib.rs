@@ -4,8 +4,10 @@
 //! bad features are skipped and counted in [`ReadReport`].
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod dbf;
 pub mod dirs;
 pub mod dxf;
+pub mod filegdb;
 pub mod geometry;
 pub mod georss;
 pub mod gml;
@@ -22,6 +24,7 @@ pub mod osm;
 pub mod photo;
 pub mod query;
 pub mod raster;
+pub mod secrets;
 pub mod sheets;
 pub mod source;
 pub mod sqlite;
@@ -44,11 +47,95 @@ pub enum DataError {
     Io(#[from] std::io::Error),
     #[error("{0}")]
     Format(String),
+    /// The server refused the login: no password, or a wrong one.
+    #[error("{0}")]
+    Login(String),
     #[error("unsupported file type: {0}")]
     Unsupported(String),
+    /// A Zarr slice none of whose chunks is there (the array named): a step never written,
+    /// which Zarr reads as its fill value, told apart from a slice that can't be read.
+    #[error("{0}: none of the slice's chunks could be read")]
+    NoChunks(String),
 }
 
 pub type Result<T> = std::result::Result<T, DataError>;
+
+/// Replaces `secret` in `message` with asterisks; the text itself when it holds none.
+fn without_secret(message: String, secret: &str) -> String {
+    if message.contains(secret) { message.replace(secret, "********") } else { message }
+}
+
+/// Whether an I/O error's message holds `secret`. Only one carrying text from elsewhere (a
+/// driver's, a server's) can: the system's own errors are fixed text and are not even formatted,
+/// so the common case allocates nothing.
+fn io_mentions(e: &std::io::Error, secret: &str) -> bool {
+    e.get_ref().is_some() && e.to_string().contains(secret)
+}
+
+impl DataError {
+    /// The error with `secret` (a password the driver sent) taken out of its message, whatever a
+    /// server or driver echoes, keeping the kind: a refused login stays [`DataError::Login`].
+    /// An empty secret leaves the error as it is, and so does text without it (nothing is copied).
+    pub fn redact_secret(self, secret: &str) -> Self {
+        if secret.is_empty() {
+            return self;
+        }
+        match self {
+            DataError::Format(m) => DataError::Format(without_secret(m, secret)),
+            DataError::Login(m) => DataError::Login(without_secret(m, secret)),
+            DataError::Unsupported(m) => DataError::Unsupported(without_secret(m, secret)),
+            DataError::NoChunks(m) => DataError::NoChunks(without_secret(m, secret)),
+            DataError::Io(e) if io_mentions(&e, secret) => {
+                DataError::Io(std::io::Error::new(e.kind(), without_secret(e.to_string(), secret)))
+            }
+            DataError::Io(e) => DataError::Io(e),
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod secret_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn remembered_database_redaction_preserves_classification_and_owned_text() {
+        let message = String::from("no credential here");
+        let pointer = message.as_ptr();
+        let DataError::Login(unchanged) = DataError::Login(message).redact_secret("sentinel") else { panic!("lost Login") };
+        assert_eq!(unchanged.as_ptr(), pointer);
+        let e = DataError::Login("server echoed sentinel twice sentinel".into()).redact_secret("sentinel");
+        assert!(matches!(e, DataError::Login(_)));
+        assert_eq!(e.to_string(), "server echoed ******** twice ********");
+        let e = DataError::Format("sentinel".into()).redact_secret("sentinel");
+        assert!(matches!(e, DataError::Format(_)));
+        assert_eq!(DataError::Login("unchanged".into()).redact_secret("").to_string(), "unchanged");
+    }
+
+    #[derive(Debug)]
+    struct Pieces;
+    impl std::fmt::Display for Pieces {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("error: se")?;
+            f.write_str("nti")?;
+            f.write_str("nel echoed")
+        }
+    }
+    impl std::error::Error for Pieces {}
+
+    #[test]
+    fn remembered_database_redaction_handles_fragmented_io_and_preserves_kind() {
+        let e = DataError::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, Pieces)).redact_secret("sentinel");
+        let DataError::Io(e) = e else { panic!("lost Io") };
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(e.to_string(), "error: ******** echoed");
+        let long = "x".repeat(300);
+        let e = DataError::Io(std::io::Error::other(format!("before {long} after"))).redact_secret(&long);
+        assert_eq!(e.to_string(), "i/o: before ******** after");
+        let e = DataError::Io(std::io::Error::other("unchanged")).redact_secret(&long);
+        assert_eq!(e.to_string(), "i/o: unchanged");
+    }
+}
 
 /// One row: an optional geometry and one value per field.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -68,6 +155,13 @@ impl Features {
     /// Whether two are the same rows in memory (one cloned from the other, neither changed since).
     pub fn shares(&self, other: &Features) -> bool {
         std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// A non-owning allocation identity for derived caches. Mutable access dissociates weak
+    /// references through `Arc::make_mut`, even without another strong owner, so an identity
+    /// stops matching after any row, geometry or attribute edit. It does not retain the rows.
+    pub fn allocation_key(&self) -> std::sync::Weak<Vec<Feature>> {
+        std::sync::Arc::downgrade(&self.0)
     }
 
     /// The rows, taking them out of the share (copying them only when another copy holds them).
@@ -163,6 +257,10 @@ pub struct Dataset {
     /// always longitude/latitude; this is what an export writes by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crs: Option<raster::Crs>,
+    /// Import lost geometry while interpreting source coordinates. Defining a projection cannot
+    /// recover it; import the original file with a CRS override instead. Kept across project saves.
+    #[serde(default)]
+    pub crs_incomplete: bool,
     /// The features are a window onto a source read in place (the part of a large file in view),
     /// so they aren't saved: the source is read again instead.
     #[serde(skip)]
@@ -170,9 +268,10 @@ pub struct Dataset {
 }
 
 impl Serialize for Dataset {
+    /// Saves CRS recovery state with the dataset, but omits disposable streamed rows.
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("Dataset", 6)?;
+        let mut st = s.serialize_struct("Dataset", 7)?;
         st.serialize_field("name", &self.name)?;
         st.serialize_field("geometry_type", &self.geometry_type)?;
         st.serialize_field("fields", &self.fields)?;
@@ -183,6 +282,11 @@ impl Serialize for Dataset {
             st.serialize_field("crs", crs)?;
         } else {
             st.skip_field("crs")?;
+        }
+        if self.crs_incomplete {
+            st.serialize_field("crs_incomplete", &true)?;
+        } else {
+            st.skip_field("crs_incomplete")?;
         }
         st.end()
     }
@@ -196,8 +300,18 @@ pub struct ReadReport {
 }
 
 impl Dataset {
+    /// Creates an empty, complete dataset whose coordinates are assumed to be WGS 84.
     pub fn new(name: impl Into<String>, geometry_type: GeometryType, fields: Vec<Field>) -> Self {
-        Dataset { name: name.into(), geometry_type, fields, features: Features::default(), source: None, crs: None, windowed: false }
+        Dataset {
+            name: name.into(),
+            geometry_type,
+            fields,
+            features: Features::default(),
+            source: None,
+            crs: None,
+            crs_incomplete: false,
+            windowed: false,
+        }
     }
 
     /// Index of a field by case-insensitive name.

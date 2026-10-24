@@ -305,6 +305,52 @@ impl TextAlign {
     }
 }
 
+/// The family a text element is drawn in (#517): a generic one, not a file, so a project opens
+/// anywhere and each machine draws it in a face it has.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FontFamily {
+    /// The interface's sans-serif. Saved as the other layout enums are (`Sans`, as `TextAlign`
+    /// saves `Center`); the command's lowercase names are read too, so a layout written by hand
+    /// with `"font": "sans"` imports.
+    #[default]
+    #[serde(alias = "sans", alias = "sans-serif")]
+    Sans,
+    /// An installed serif (Georgia, Times, Noto Serif…); the sans where there is none.
+    #[serde(alias = "serif")]
+    Serif,
+}
+
+impl FontFamily {
+    pub const ALL: [FontFamily; 2] = [FontFamily::Sans, FontFamily::Serif];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            FontFamily::Sans => "sans",
+            FontFamily::Serif => "serif",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FontFamily::Sans => "Sans-serif",
+            FontFamily::Serif => "Serif",
+        }
+    }
+
+    /// `sans` or `serif` (`sans-serif` too), in any case.
+    pub fn from_name(s: &str) -> Option<FontFamily> {
+        let s = s.trim();
+        FontFamily::ALL
+            .into_iter()
+            .find(|v| v.code().eq_ignore_ascii_case(s))
+            .or(s.eq_ignore_ascii_case("sans-serif").then_some(FontFamily::Sans))
+    }
+}
+
+fn is_sans(f: &FontFamily) -> bool {
+    *f == FontFamily::Sans
+}
+
 /// The most letter spacing a text element takes, either way (points).
 pub const MAX_LETTER_SPACING: f64 = 50.0;
 pub const MIN_LETTER_SPACING: f64 = -5.0;
@@ -757,6 +803,9 @@ pub enum ElementKind {
         /// Space added between letters, in points (spaced-out ocean names); negative tightens.
         #[serde(default, skip_serializing_if = "is_zero")]
         letter_spacing: f64,
+        /// Sans-serif or serif; left out when sans, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "is_sans")]
+        font: FontFamily,
     },
     Picture {
         /// Base64 PNG or JPEG.
@@ -780,7 +829,14 @@ pub enum ElementKind {
     },
     /// A rectangle drawn on the page (a neatline or a backdrop). `width` is the outline's, in
     /// points (0: none).
-    Rectangle { fill: Rgba, outline: Rgba, width: f64 },
+    Rectangle {
+        fill: Rgba,
+        outline: Rgba,
+        width: f64,
+        /// Its corners rounded by this much, in millimetres (0: square corners).
+        #[serde(default, skip_serializing_if = "is_zero")]
+        radius: f64,
+    },
     /// An ellipse filling the element's box: a circle in a square one.
     Ellipse { fill: Rgba, outline: Rgba, width: f64 },
     /// A straight line across the element's box, `width` points wide.
@@ -802,7 +858,16 @@ fn rows() -> usize {
 impl ElementKind {
     /// A text element in the plain style: upright, left-aligned, normally spaced.
     pub fn text(text: impl Into<String>, size: f64, color: Rgba, bold: bool) -> ElementKind {
-        ElementKind::Text { text: text.into(), size, color, bold, italic: false, align: TextAlign::Left, letter_spacing: 0.0 }
+        ElementKind::Text {
+            text: text.into(),
+            size,
+            color,
+            bold,
+            italic: false,
+            align: TextAlign::Left,
+            letter_spacing: 0.0,
+            font: FontFamily::Sans,
+        }
     }
 
     /// A north arrow for `frame`, in the default style.
@@ -937,13 +1002,27 @@ pub struct Layout {
     pub series: Option<MapSeries>,
     #[serde(default, skip_serializing_if = "Guides::is_empty")]
     pub guides: Guides,
+    /// Numbers its surrounds print (graticule, scale bar and colorbar labels, `{scale}`) take a
+    /// decimal comma and a point between thousands (`0,05`, `1:6.300.000`), as maps in Portuguese,
+    /// Spanish, French or German do; off, the other way round.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub decimal_comma: bool,
     #[serde(default)]
     next_id: u32,
 }
 
 impl Layout {
     pub fn new(name: impl Into<String>, width: f64, height: f64) -> Self {
-        Layout { name: name.into(), width, height, elements: Vec::new(), series: None, guides: Guides::default(), next_id: 1 }
+        Layout {
+            name: name.into(),
+            width,
+            height,
+            elements: Vec::new(),
+            series: None,
+            guides: Guides::default(),
+            decimal_comma: false,
+            next_id: 1,
+        }
     }
 
     /// Adds an element and returns its id.
@@ -1340,7 +1419,7 @@ mod tests {
         let a = big.add(
             "a",
             (0.0, 0.0, 1.0, 1.0),
-            ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 1.0 },
+            ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 1.0, radius: 0.0 },
         );
         assert!(a != big.elements[0].id && a <= MAX_ID + 1);
     }
@@ -1348,7 +1427,7 @@ mod tests {
     #[test]
     fn hairline_rectangles_keep_their_height() {
         let mut l = Layout::new("Layout", 210.0, 297.0);
-        let rule = ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 0.0 };
+        let rule = ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 0.0, radius: 0.0 };
         let id = l.add("Rule", (14.0, 33.0, 182.0, 0.15), rule.clone());
         assert_eq!(l.element(id).map(|e| e.h), Some(0.15));
         // A zero height becomes the thinnest element, not a 1 mm box.

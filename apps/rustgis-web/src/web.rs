@@ -105,6 +105,10 @@ pub fn start() {
         if !embedded && let Err(e) = guard_unload(dirty.clone()) {
             log::error!("no unsaved-changes guard: {e}");
         }
+        let taken: TakenKeys = TakenKeys::default();
+        if let Err(e) = keep_app_shortcuts(taken.clone()) {
+            log::error!("the browser keeps its own shortcuts: {e}");
+        }
         let mut options = eframe::WebOptions::default();
         if query().contains("webgl")
             && let eframe::egui_wgpu::WgpuSetup::CreateNew(create) = &mut options.wgpu_options.wgpu_setup
@@ -246,7 +250,7 @@ pub fn start() {
                     } else {
                         None
                     };
-                    Ok(Box::new(WebShell { app, inbox, notes, dirty, embed }))
+                    Ok(Box::new(WebShell { app, inbox, notes, dirty, embed, taken, taken_print: None }))
                 }),
             )
             .await;
@@ -304,7 +308,15 @@ struct WebShell {
     notes: Notes,
     dirty: Rc<Cell<bool>>,
     embed: Option<Embed>,
+    /// The app's Ctrl (⌘) shortcuts, kept current for [`keep_app_shortcuts`].
+    taken: TakenKeys,
+    /// [`RustGisApp::shortcuts_fingerprint`] when `taken` was last filled.
+    taken_print: Option<u64>,
 }
+
+/// The app's Ctrl (⌘) shortcuts as (Alt, Shift, key): [`RustGisApp::command_keys`], shared with
+/// the page's key listener.
+type TakenKeys = Rc<RefCell<Vec<(bool, bool, egui::Key)>>>;
 
 /// The link to the page that embeds the app (`?embed`; see `embed.rs`).
 struct Embed {
@@ -433,6 +445,13 @@ impl eframe::App for WebShell {
         }
         self.app.logic(ctx);
         self.dirty.set(self.app.session.dirty);
+        // The shortcuts can be changed in the app: the key listener follows, rebuilt only when
+        // the keymap changed.
+        let print = self.app.shortcuts_fingerprint();
+        if self.taken_print != Some(print) {
+            self.taken_print = Some(print);
+            *self.taken.borrow_mut() = self.app.command_keys();
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -796,6 +815,8 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
     Services {
         load_pref: Some(load_pref),
         save_pref: Some(save_pref),
+        // No keychain in the browser: script on the page could read anything stored (#754).
+        secrets: None,
         fetch_font: Some(Box::new(move |url: &str| {
             let (url, inbox, ctx) = (url.to_string(), font_sink.clone(), font_ctx.clone());
             wasm_bindgen_futures::spawn_local(async move {
@@ -823,12 +844,15 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
             let tool_exts = purpose.strip_prefix(rustgis_ui_egui::TOOL_FILE_PURPOSE);
             let mark = match (purpose, tool_exts) {
                 ("text", _) => rustgis_ui_egui::DELIMITED_PICK,
+                ("shapefile", _) => rustgis_ui_egui::SHAPEFILE_PICK,
                 (_, Some(_)) => rustgis_ui_egui::TOOL_FILE_PICK,
                 _ => "",
             };
             let dialog = if let Some(exts) = tool_exts {
                 let exts: Vec<&str> = exts.split(',').filter(|e| !e.is_empty()).collect();
                 if exts.is_empty() { rfd::AsyncFileDialog::new() } else { rfd::AsyncFileDialog::new().add_filter(exts.join(", "), &exts) }
+            } else if purpose == "shapefile" {
+                rfd::AsyncFileDialog::new().add_filter("Shapefile", &["shp", "dbf", "shx", "prj", "cpg", "zip"])
             } else if purpose == "project" {
                 rfd::AsyncFileDialog::new().add_filter("RustGIS project", &["rgis", "rgisx", "rgispkg"])
             } else if purpose == "item" {
@@ -863,7 +887,7 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
                 rfd::AsyncFileDialog::new().add_filter("Vector and raster data", DATA_EXTS)
             };
             // Data may come several files at once (photos gather in one layer).
-            let many = purpose == "data";
+            let many = matches!(purpose, "data" | "shapefile");
             wasm_bindgen_futures::spawn_local(async move {
                 let files: Vec<rfd::FileHandle> =
                     if many { dialog.pick_files().await.unwrap_or_default() } else { dialog.pick_file().await.into_iter().collect() };
@@ -923,6 +947,29 @@ fn download(name: &str, bytes: &[u8]) -> Result<(), String> {
     });
     let window = web_sys::window().ok_or("no window")?;
     window.set_timeout_with_callback_and_timeout_and_arguments_0(revoke.unchecked_ref(), 10_000).map_err(err)?;
+    Ok(())
+}
+
+/// Keeps the browser from acting on the app's Ctrl (⌘) shortcuts too: ⌘D duplicating a layout
+/// element mustn't bookmark the page, ⌘Y (redo) open its history, or ⌘= (zoom in) zoom it. eframe
+/// stops only ⌘, ⌘O, ⌘P and ⌘S. Seen first (the capture phase), the default is prevented but the
+/// key still reaches egui. Browsers keep a few for themselves whatever a page does (⌘T, ⌘N, ⌘W).
+fn keep_app_shortcuts(taken: TakenKeys) -> Result<(), String> {
+    let window = web_sys::window().ok_or("no window")?;
+    let on_key = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
+        // AltGr reports as Ctrl+Alt on Windows: it types a character, it isn't a shortcut.
+        if e.get_modifier_state("AltGraph") {
+            return;
+        }
+        // As eframe reads it, Ctrl or ⌘ is egui's command on every platform, so the app's
+        // shortcut runs on either and the browser's is kept from both.
+        let command = e.ctrl_key() || e.meta_key();
+        if RustGisApp::takes_browser_key(&taken.borrow(), &e.key(), &e.code(), command, e.alt_key(), e.shift_key()) {
+            e.prevent_default();
+        }
+    });
+    window.add_event_listener_with_callback_and_bool("keydown", on_key.as_ref().unchecked_ref(), true).map_err(|e| format!("{e:?}"))?;
+    on_key.forget();
     Ok(())
 }
 

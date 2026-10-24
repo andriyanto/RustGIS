@@ -21,6 +21,7 @@ pub mod symbology;
 pub mod tiles;
 pub mod time;
 pub mod view;
+mod view_memory;
 pub mod world;
 
 pub use camera::Camera;
@@ -28,7 +29,7 @@ pub use color::{Ramp, RampGroup, Rgba};
 pub use globe::{Globe, Projection};
 pub use raster::{RasterDefaults, RasterLayer, RasterRenderer, RasterStyle, Resampling, Stretch};
 pub use symbology::{
-    ClassMethod, LabelClass, LabelMatcher, LabelPlacement, Labeling, LineCap, LineJoin, LineStroke, Marker, Renderer, Symbol,
+    ClassMethod, LabelClass, LabelKey, LabelMatcher, LabelPlacement, Labeling, LineCap, LineJoin, LineStroke, Marker, Renderer, Symbol,
 };
 pub use tiles::{TileKind, TileLayer};
 
@@ -143,6 +144,16 @@ pub struct Layer {
     /// the renderer's stroke alone).
     #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "symbology::de_strokes")]
     pub line_strokes: Vec<symbology::LineStroke>,
+    /// Draws the stacked strokes in levels (symbol levels): every feature's strokes of one
+    /// [`LineStroke::level`] before any of the next, so road casings join under the cores
+    /// instead of cutting across them where lines meet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stroke_levels: bool,
+    /// The scale (1:N) its symbol and label sizes are set for: drawn at another scale they grow
+    /// and shrink with the map, as on paper (QGIS's reference scale). `None`: they keep their
+    /// size on screen.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_reference_scale")]
+    pub reference_scale: Option<f64>,
     /// Layers with a higher priority draw above lower ones, whatever their order (the scene's
     /// depth priority).
     #[serde(default)]
@@ -178,6 +189,9 @@ pub struct Layer {
     /// The projection the cache is in.
     #[serde(skip)]
     projected_for: String,
+    /// Allocation identities and byte totals, shared with render snapshots without retaining rows.
+    #[serde(skip)]
+    view_memory: view_memory::Cache,
     /// Bumped whenever geometry changes so caches rebuild.
     #[serde(default)]
     pub geometry_rev: u64,
@@ -188,6 +202,14 @@ fn yes() -> bool {
 }
 
 impl Layer {
+    /// The dataset, streamed, raster and time-following Zarr addresses used to read this layer
+    /// again, in that order. Local paths are included; database origins stay password-free.
+    pub fn addresses_mut(&mut self) -> impl Iterator<Item = &mut String> {
+        self.dataset.source.iter_mut().chain(self.source.iter_mut().filter_map(|source| source.path.as_mut())).chain(
+            self.raster.iter_mut().flat_map(|raster| raster.path.iter_mut().chain(raster.time_zarr.iter_mut().map(|zarr| &mut zarr.store))),
+        )
+    }
+
     pub fn new(id: u32, dataset: Dataset) -> Self {
         let renderer = Renderer::Single(Symbol::default_for(dataset.geometry_type, id));
         Layer {
@@ -212,6 +234,8 @@ impl Layer {
             aggregation: None,
             extrusion: None,
             line_strokes: Vec::new(),
+            stroke_levels: false,
+            reference_scale: None,
             priority: 0,
             design: design::Design::default(),
             raster: None,
@@ -224,6 +248,7 @@ impl Layer {
             projected_rev: u64::MAX,
             projected_for: String::new(),
             geometry_rev: 0,
+            view_memory: Default::default(),
         }
     }
 
@@ -297,6 +322,7 @@ impl Layer {
             self.dataset.fields = info.fields.clone();
         }
         let Some(src) = &mut self.source else { return false };
+        src.window_fields = Some(self.dataset.fields.len());
         // A failed read leaves nothing drawn for it (its error shows in Layers), not the
         // previous view's features.
         match src.poll(block) {
@@ -320,12 +346,20 @@ impl Layer {
 
     /// Replaces a streamed layer's features, keeping the selection (by feature id).
     fn install(&mut self, features: Vec<rustgis_data::Feature>) {
-        let ids: std::collections::HashSet<u64> =
+        let mut ids: std::collections::HashSet<u64> =
             self.selection.iter().filter_map(|r| self.dataset.features.get(*r)).map(|f| f.id).collect();
+        if let Some(src) = &mut self.source {
+            ids.extend(std::mem::take(&mut src.saved_selection));
+        }
         let fields = self.dataset.fields.len();
+        self.clear_cache();
         self.dataset.features = features.into();
+        let mut padded = false;
         for f in &mut self.dataset.features {
-            f.attrs.resize(fields, rustgis_data::Value::Null);
+            if f.attrs.len() != fields {
+                f.attrs.resize(fields, rustgis_data::Value::Null);
+                padded = true;
+            }
         }
         self.dataset.windowed = true;
         if let Some(src) = &mut self.source {
@@ -337,6 +371,23 @@ impl Layer {
             self.dataset.features.iter().enumerate().filter(|(_, f)| ids.contains(&f.id)).map(|(i, _)| i).collect()
         };
         self.touch_geometry();
+        if let Some(cache) = self.source.as_mut().and_then(|s| s.ready_cache.take()) {
+            self.projected = cache.projected;
+            self.projected_extents = cache.extents;
+            self.projected_vertices = cache.vertices;
+            self.projected_for = cache.key;
+            self.projected_rev = self.geometry_rev;
+            let feature_bytes =
+                if padded { rustgis_data::source::memory::features_bytes(&self.dataset.features) } else { cache.feature_bytes };
+            self.view_memory.seed(&self.dataset.features, &self.projected, feature_bytes, cache.projected_bytes);
+        }
+    }
+
+    /// Allocated row, projected-geometry, extent and optional display storage for this layer.
+    /// Snapshots report the same shared allocations; totals are memoized until mutable access
+    /// changes an allocation identity, including edits through the public dataset API.
+    pub fn view_cache_bytes(&self) -> usize {
+        self.view_memory.total(&self.dataset.features, &self.projected, &self.projected_extents, &self.thinned)
     }
 
     /// Every feature of a streamed layer's source (up to the read limit), for tools and for
@@ -346,6 +397,15 @@ impl Layer {
         let mut copy = src.clone();
         if !copy.is_open() {
             copy.open()?;
+            // A source by its web address may still be opening in the background (the view or the
+            // project started it): wait for it, as an export does, rather than read nothing.
+            copy.wait_open(std::time::Duration::from_secs(30));
+            if !copy.is_open() {
+                return Err(copy
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "the layer's source is still opening: try again once it has opened".into()));
+            }
         }
         let (mut ds, _) = copy.read_all()?;
         // A sample isn't all of them: refuse rather than run a tool on part of the data.
@@ -369,6 +429,45 @@ impl Layer {
     /// The symbol a row draws with.
     pub fn symbol(&self, row: usize) -> Symbol {
         if self.graphics { graphics::symbol(&self.dataset, row) } else { self.renderer.symbol_for(&self.dataset, row) }
+    }
+
+    /// The stacked strokes a line feature row is drawn with: its class's own
+    /// ([`Renderer::strokes_for`]), else the layer's `line_strokes`; none (the single stroke) for
+    /// a graphics layer.
+    pub fn strokes(&self, row: usize) -> &[LineStroke] {
+        if self.graphics {
+            return &[];
+        }
+        // Most layers have no class with strokes of its own: no need to class the feature.
+        if !self.renderer.has_class_strokes() {
+            return &self.line_strokes;
+        }
+        self.renderer.strokes_for(&self.dataset, row).unwrap_or(&self.line_strokes)
+    }
+
+    /// A row's symbol and stacked strokes ([`Layer::symbol`], [`Layer::strokes`]), the feature
+    /// classed once for both.
+    pub fn style(&self, row: usize) -> (Symbol, &[LineStroke]) {
+        if self.graphics || !self.renderer.has_class_strokes() {
+            return (self.symbol(row), self.strokes(row));
+        }
+        let (symbol, strokes) = self.renderer.style_for(&self.dataset, row);
+        (symbol, strokes.unwrap_or(&self.line_strokes))
+    }
+
+    /// How much its symbol and label sizes are multiplied by at the map scale 1:`scale`: its
+    /// reference scale over that ([`Layer::reference_scale`]), kept within [`SIZE_FACTORS`]; 1
+    /// without one.
+    pub fn size_factor(&self, scale: f64) -> f32 {
+        match self.reference_scale {
+            Some(r) if scale.is_finite() && scale > 0.0 => (r / scale).clamp(SIZE_FACTORS.0, SIZE_FACTORS.1) as f32,
+            _ => 1.0,
+        }
+    }
+
+    /// Whether some feature may be drawn with stacked strokes ([`Layer::strokes`]).
+    pub fn has_strokes(&self) -> bool {
+        !self.graphics && (!self.line_strokes.is_empty() || self.renderer.has_class_strokes())
     }
 
     pub fn is_raster(&self) -> bool {
@@ -411,6 +510,10 @@ impl Layer {
     /// geometry itself for a small layer. Read it back with [`Layer::thinned_cache`].
     pub fn thinned_in(&mut self, flat: &projection::Flat, key: &str, tol: f64) -> &[Option<Geometry>] {
         self.projected_in(flat, key);
+        let budget = self.source.as_ref().map_or(lod::CACHE_BYTES, |s| {
+            let base = self.view_memory.base(&self.dataset.features, &self.projected, &self.projected_extents);
+            s.budget().saturating_sub(base).min(lod::CACHE_BYTES)
+        });
         let Some(level) = lod::level(tol).filter(|_| self.projected_vertices > lod::THIN_ABOVE) else { return &self.projected };
         let levels = std::sync::Arc::make_mut(&mut self.thinned);
         match levels.iter().position(|(l, _)| *l == level) {
@@ -420,13 +523,24 @@ impl Layer {
             }
             None => {
                 let t = lod::tolerance(level);
-                let copy: Vec<Option<Geometry>> = self.projected.iter().map(|g| g.as_ref().map(|g| lod::thin(g, t))).collect();
+                let copy = lod::thin_budgeted(&self.projected, t, budget);
                 // The saving counts against every vertex the copy holds, points included.
                 let all: usize = self.projected.iter().flatten().map(lod::vertices).sum();
-                let kept: usize = copy.iter().flatten().map(lod::vertices).sum();
-                let worth = (kept as f64) <= all as f64 * (1.0 - lod::MIN_SAVING);
-                levels.insert(0, (level, worth.then(|| std::sync::Arc::new(copy))));
+                let copy = copy.filter(|c| {
+                    let kept: usize = c.iter().flatten().map(lod::vertices).sum();
+                    (kept as f64) <= all as f64 * (1.0 - lod::MIN_SAVING)
+                });
+                levels.insert(0, (level, copy.map(std::sync::Arc::new)));
                 levels.truncate(lod::LEVELS_KEPT);
+                let mut bytes = 0usize;
+                levels.retain(|(_, copy)| {
+                    let extra = copy.as_ref().map_or(0, |c| lod::cache_bytes(c));
+                    if bytes.saturating_add(extra) > budget {
+                        return false;
+                    }
+                    bytes += extra;
+                    true
+                });
             }
         }
         self.thinned_cache(tol)
@@ -469,7 +583,13 @@ impl Layer {
     pub fn adopt_cache(&mut self, other: &Layer) -> bool {
         let fits = other.dataset.features.shares(&self.dataset.features)
             && other.geometry_rev == self.geometry_rev
-            && other.is_cached(&other.projected_for);
+            && other.is_cached(&other.projected_for)
+            && self.source.as_ref().is_none_or(|source| {
+                !source.is_pending()
+                    && other.source.as_ref().is_some_and(|old| {
+                        old.budget() <= source.budget() && old.projection == source.projection && old.full_read == source.full_read
+                    })
+            });
         if fits {
             self.projected = other.projected.clone();
             self.projected_extents = other.projected_extents.clone();
@@ -706,10 +826,10 @@ pub struct Map {
     /// Map-wide label display switches.
     #[serde(default)]
     pub label_display: LabelDisplay,
-    /// The features labelled when labels were locked, as (layer id, row): only they are labelled
-    /// while the lock holds, wherever the map moves. Filled by the renderer.
+    /// The labels placed when labels were locked: only they are drawn while the lock holds,
+    /// wherever the map moves. Filled by the renderer.
     #[serde(skip)]
-    pub label_lock: Option<Vec<(u32, usize)>>,
+    pub label_lock: Option<Vec<LabelKey>>,
     /// Relationships, snapping, topology rules and edit settings.
     #[serde(default)]
     pub editing: design::MapEditing,
@@ -827,6 +947,35 @@ impl Map {
             body: earth(),
             next_layer_id: 1,
         }
+    }
+
+    /// Every address the map keeps to read its data again (service groups and their layers'
+    /// sources, tile layers and their dated addresses, terrain tiles, layers' dataset, streamed and
+    /// raster sources, time-following Zarr stores). Local paths come too: callers judge each one.
+    pub fn addresses_mut(&mut self) -> Vec<&mut String> {
+        let mut addresses = Vec::new();
+        for group in &mut self.service_groups {
+            addresses.push(&mut group.url);
+            for child in &mut group.children {
+                addresses.push(&mut child.source_url);
+            }
+        }
+        for tile in &mut self.tiles {
+            addresses.push(&mut tile.url);
+            if let Some(url) = &mut tile.time_url {
+                addresses.push(url);
+            }
+            for (_, url) in &mut tile.time_urls {
+                addresses.push(url);
+            }
+        }
+        if let Some(view::Terrain { source: view::TerrainSource::Tiles { url, .. }, .. }) = &mut self.view.terrain {
+            addresses.push(url);
+        }
+        for layer in &mut self.layers {
+            addresses.extend(layer.addresses_mut());
+        }
+        addresses
     }
 
     /// A nonzero id no layer, service group or layer group has: past the highest in use, or (when ids reach
@@ -1184,6 +1333,38 @@ impl Map {
     pub fn sync_sources(&mut self, view: &Extent, scale: f64, block: bool) -> bool {
         let mut pending = false;
         let held = self.held_by_group(scale);
+        // Hidden resident layers share the budget too; toggling visibility cannot multiply it.
+        let sources = self.layers.iter().filter(|l| l.source.is_some()).count().max(1);
+        let bytes = source::VIEW_BYTES / sources;
+        for layer in &mut self.layers {
+            if let Some(src) = &mut layer.source {
+                let changed = src.projection.as_ref().is_some_and(|p| p != &self.projection);
+                let mode_changed = src.full_read != block;
+                let budget_changed = src.byte_budget != bytes;
+                src.projection = Some(self.projection.clone());
+                src.byte_budget = bytes;
+                src.full_read = block;
+                if changed || mode_changed || budget_changed {
+                    let selected = std::mem::take(&mut src.saved_selection);
+                    src.reset();
+                    src.saved_selection = selected;
+                }
+                if changed || (!block && layer.view_cache_bytes() > bytes) {
+                    // Preserve ids while discarding a window that no longer fits. The next
+                    // installed window resolves the selection against its authoritative ids.
+                    let mut selected: Vec<_> =
+                        layer.selection.iter().filter_map(|r| layer.dataset.features.get(*r)).map(|f| f.id).collect();
+                    if let Some(src) = &mut layer.source {
+                        selected.append(&mut src.saved_selection);
+                        src.reset();
+                    }
+                    layer.install(Vec::new());
+                    if let Some(src) = &mut layer.source {
+                        src.saved_selection = selected;
+                    }
+                }
+            }
+        }
         for l in self.layers.iter_mut().filter(|l| l.is_streamed() && l.visible && l.in_scale_range(scale) && !held.contains(&l.id)) {
             pending |= l.sync_source(view, block);
         }
@@ -1212,6 +1393,17 @@ impl Map {
     pub fn adopt_caches(&mut self, other: &Map) {
         for l in &mut self.layers {
             if let Some(o) = other.layer(l.id) {
+                // Complete rendering uses temporary chunk layers, so a failed worker need not
+                // have a projected cache to adopt. Transfer its diagnostic only for the same
+                // source and unchanged owning rows; stale workers must not overwrite edits.
+                if l.dataset.features.shares(&o.dataset.features)
+                    && l.geometry_rev == o.geometry_rev
+                    && let (Some(own), Some(drawn)) = (&mut l.source, &o.source)
+                    && let (Some(a), Some(b)) = (own.chunk_source(), drawn.chunk_source())
+                    && std::sync::Arc::ptr_eq(&a, &b)
+                {
+                    own.error.clone_from(&drawn.error);
+                }
                 l.adopt_cache(o);
             }
         }
@@ -1427,6 +1619,20 @@ impl Map {
     }
 }
 
+/// The reference scales a layer takes (1:N), as [`Layer::reference_scale`].
+pub const REFERENCE_SCALES: (f64, f64) = (1.0, 1e9);
+
+/// The most a reference scale shrinks or grows a layer's sizes ([`Layer::size_factor`]): zoomed
+/// far in, its lines would otherwise be drawn thousands of pixels wide.
+pub const SIZE_FACTORS: (f64, f64) = (0.01, 32.0);
+
+/// Reads a layer's reference scale as `layer.referenceScale` would leave it: one out of
+/// [`REFERENCE_SCALES`] (or not a number) is none. A project file is hostile input.
+fn de_reference_scale<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+    let v: Option<f64> = Option::deserialize(d)?;
+    Ok(v.filter(|r| (REFERENCE_SCALES.0..=REFERENCE_SCALES.1).contains(r)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1451,6 +1657,75 @@ mod tests {
         assert!(
             back.line_strokes.iter().all(|st| st.width == Some(symbology::MAX_STROKE_WIDTH) && st.offset == -symbology::MAX_STROKE_OFFSET)
         );
+    }
+
+    #[test]
+    fn a_reference_scale_scales_sizes_with_the_map_and_hostile_ones_are_dropped() {
+        let mut l = Layer::new(1, Dataset::new("lines", GeometryType::Polyline, vec![]));
+        assert_eq!(l.size_factor(10_000.0), 1.0, "none: sizes stay as set");
+        l.reference_scale = Some(25_000.0);
+        assert_eq!(l.size_factor(25_000.0), 1.0);
+        assert_eq!(l.size_factor(12_500.0), 2.0, "zoomed in twice: twice the size");
+        assert_eq!(l.size_factor(100_000.0), 0.25);
+        assert_eq!(l.size_factor(1.0), SIZE_FACTORS.1 as f32, "zoomed far in: kept in bounds");
+        assert_eq!(l.size_factor(1e12), SIZE_FACTORS.0 as f32);
+        for bad in [0.0, -5.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(l.size_factor(bad), 1.0, "scale {bad}");
+        }
+        // Saved and read back; a crafted project's out of range ones are none.
+        let text = serde_json::to_string(&l).unwrap();
+        assert_eq!(serde_json::from_str::<Layer>(&text).unwrap().reference_scale, Some(25_000.0));
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        for bad in [serde_json::json!(0.0), serde_json::json!(-1.0), serde_json::json!(1e300), serde_json::Value::Null] {
+            v["reference_scale"] = bad.clone();
+            assert_eq!(serde_json::from_value::<Layer>(v.clone()).unwrap().reference_scale, None, "{bad}");
+        }
+        // Without a reference scale nothing is written.
+        l.reference_scale = None;
+        assert!(!serde_json::to_string(&l).unwrap().contains("reference_scale"));
+    }
+
+    #[test]
+    fn hostile_class_strokes_in_a_project_are_brought_into_range() {
+        // The same for a class's own strokes, Unique Values' (and <all other values>') and
+        // Graduated Colors'; a class listed with none is dropped.
+        let wild = vec![symbology::LineStroke { width: Some(f32::MAX), offset: 1e30, ..Default::default() }; 5000];
+        let tame = |v: &[symbology::LineStroke]| {
+            v.len() == symbology::MAX_STROKES
+                && v.iter().all(|st| st.width == Some(symbology::MAX_STROKE_WIDTH) && st.offset == symbology::MAX_STROKE_OFFSET)
+        };
+        let s = Symbol::default_for(GeometryType::Polyline, 0);
+        let mut l = Layer::new(1, Dataset::new("lines", GeometryType::Polyline, vec![]));
+        l.renderer = Renderer::Unique {
+            field: "k".into(),
+            classes: vec![("a".into(), s), ("b".into(), s)],
+            other: s,
+            ramp: Ramp::Ember,
+            class_labels: Default::default(),
+            other_label: None,
+            class_strokes: [("a".to_string(), wild.clone()), ("b".to_string(), Vec::new())].into_iter().collect(),
+            other_strokes: wild.clone(),
+        };
+        let back: Layer = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        let Renderer::Unique { class_strokes, other_strokes, .. } = &back.renderer else { panic!("unique renderer expected") };
+        assert!(tame(&class_strokes["a"]) && !class_strokes.contains_key("b") && tame(other_strokes));
+        l.renderer = Renderer::Graduated {
+            field: "k".into(),
+            breaks: vec![1.0],
+            symbols: vec![s],
+            ramp: Ramp::Ember,
+            method: ClassMethod::NaturalBreaks,
+            min: 0.0,
+            class_labels: Default::default(),
+            class_strokes: [(0, wild)].into_iter().collect(),
+        };
+        let back: Layer = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        let Renderer::Graduated { class_strokes, .. } = &back.renderer else { panic!("graduated renderer expected") };
+        assert!(tame(&class_strokes[&0]));
+        // A project from before per-class strokes reads with none.
+        let old = r#"{"Unique":{"field":"k","classes":[],"other":{"fill":[0,0,0,255],"stroke":[0,0,0,255],"stroke_width":1,"size":0,"marker":"Circle"},"ramp":"Ember"}}"#;
+        let r: Renderer = serde_json::from_str(old).unwrap();
+        assert!(!r.has_class_strokes());
     }
 
     /// A layer of one long line along the equator with `n` vertices.
@@ -1659,6 +1934,8 @@ mod tests {
             ramp: Ramp::Ember,
             class_labels: Default::default(),
             other_label: None,
+            class_strokes: Default::default(),
+            other_strokes: Vec::new(),
         };
         let labels = |l: &Layer, scale| l.shown_legend(scale).map(|v| v.into_iter().map(|e| e.label).collect::<Vec<_>>());
         assert_eq!(labels(l, 1e6), Some(vec!["1".to_string(), "2".to_string()]), "no 9, no <all other values>");

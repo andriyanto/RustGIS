@@ -149,6 +149,114 @@ fn file_access_needs_approval() {
 }
 
 #[test]
+fn connection_management_requires_fresh_approval_but_can_run_in_app() {
+    let mut s = Session::new(Project::default());
+    let mut a = Agent::new(cfg("openai"), &s);
+    assert!(matches!(a.ask("save a connection", &s), Step::Send(_)));
+    let args = json!({"command":"connection.new","params":{"kind":"s3","name":"Approved connection"}});
+    assert_eq!(a.receive(a.generation(), ok(call("first", "run_command", args.clone())), &mut s), Step::Confirm);
+    assert!(s.connections.find("Approved connection").is_none());
+    assert!(!a.pending(&s).unwrap().2, "reserved commands cannot be allowed for the whole conversation");
+    assert!(matches!(a.decide(true, true, &mut s), Step::Send(_)));
+    assert_eq!(s.connections.find("Approved connection").unwrap().kind, "s3");
+    assert_eq!(a.receive(a.generation(), ok(call("again", "run_command", args)), &mut s), Step::Confirm);
+    assert!(matches!(a.decide(false, false, &mut s), Step::Send(_)));
+    assert_eq!(s.connections.connections.len(), 1, "declining a repeat must leave the approved connection unchanged");
+}
+
+#[test]
+fn connection_commands_require_fresh_approval_before_login_or_scripts() {
+    use rustgis_engine::render::rustgis_tiles::s3;
+
+    for command in ["connection.browse", "connection.test", "connection.login"] {
+        for scripted in [false, true] {
+            let mut s = Session::new(Project::default());
+            let name = format!("assistant-approval-{command}-{scripted}");
+            let c = s
+                .run(
+                    "connection.new",
+                    &json!({"kind": "s3", "name": name,
+                "options": {"credentials": "none", "buckets": "approval-bucket"}}),
+                )
+                .unwrap();
+            // Probes need no network, but browse/test still log in before returning the fetch address.
+            let params = json!({"id": c["id"], "probe": true});
+            let (tool, args) = if scripted {
+                ("run", json!({"script": format!("map.rename {{\"name\":\"Approved map\"}}\n{command} {params}")}))
+            } else {
+                ("run_command", json!({"command": command, "params": params}))
+            };
+            let mut a = Agent::new(cfg("openai"), &s);
+            assert!(matches!(a.ask("use this connection", &s), Step::Send(_)));
+            let map_name = s.map().name.clone();
+            assert_eq!(a.receive(a.generation(), ok(call("first", tool, args.clone())), &mut s), Step::Confirm, "{command}/{tool}");
+            assert!(s3::connection(&name).is_none(), "a pending call must not log in");
+            assert_eq!(s.map().name, map_name, "a script's earlier lines must wait too");
+            assert!(!a.pending(&s).unwrap().2, "connection operations cannot be allowed for the whole conversation");
+            assert!(matches!(a.decide(false, false, &mut s), Step::Send(_)));
+            assert!(s3::connection(&name).is_none(), "a declined call must not log in");
+            assert_eq!(s.map().name, map_name, "declining must leave every script line unexecuted");
+
+            assert_eq!(a.receive(a.generation(), ok(call("allowed", tool, args.clone())), &mut s), Step::Confirm);
+            assert!(matches!(a.decide(true, true, &mut s), Step::Send(_)));
+            assert!(s3::connection(&name).is_some(), "a once-approved call must execute");
+            if scripted {
+                assert_eq!(s.map().name, "Approved map");
+            }
+            s3::disconnect(&name);
+            assert_eq!(
+                a.receive(a.generation(), ok(call("again", tool, args)), &mut s),
+                Step::Confirm,
+                "asking to remember an approval must not bypass the next confirmation"
+            );
+            assert!(s3::connection(&name).is_none());
+            assert!(matches!(a.decide(false, false, &mut s), Step::Send(_)));
+            assert!(s3::connection(&name).is_none(), "declining a repeat must leave it disconnected");
+        }
+    }
+}
+
+#[test]
+fn remembered_database_forget_requires_fresh_direct_and_script_approval() {
+    use rustgis_engine::data::secrets::{MemorySecrets, SecretStore};
+    use std::sync::Arc;
+    for scripted in [false, true] {
+        let store = Arc::new(MemorySecrets::new());
+        let mut s = Session::new(Project::default());
+        s.database_logins.set_store(Some(store.clone()));
+        s.run(
+            "connection.new",
+            &json!({"kind":"postgres","name":"Private database","address":"postgres:host=127.0.0.1 port=1 user=approval"}),
+        )
+        .unwrap();
+        s.run("connection.login", &json!({"id":"c1","password":"forgotten-sentinel","remember":true})).unwrap();
+        let args = if scripted {
+            json!({"script":"map.rename {\"name\":\"Approved map\"}\nconnection.forgetPassword {\"id\":\"c1\"}"})
+        } else {
+            json!({"command":"connection.forgetPassword","params":{"id":"c1"}})
+        };
+        let tool = if scripted { "run" } else { "run_command" };
+        let mut a = Agent::new(cfg("openai"), &s);
+        assert!(matches!(a.ask("forget this database's saved password", &s), Step::Send(_)));
+        let name = s.map().name.clone();
+        assert_eq!(a.receive(a.generation(), ok(call("forget", tool, args.clone())), &mut s), Step::Confirm);
+        assert!(!a.pending(&s).unwrap().2);
+        assert!(store.load("connection/c1").unwrap().is_some());
+        assert_eq!(s.map().name, name);
+        a.decide(false, false, &mut s);
+        assert!(store.load("connection/c1").unwrap().is_some());
+        assert_eq!(a.receive(a.generation(), ok(call("allow", tool, args.clone())), &mut s), Step::Confirm);
+        let sent = a.decide(true, true, &mut s);
+        assert!(matches!(sent, Step::Send(_)));
+        assert!(!format!("{sent:?}").contains("forgotten-sentinel"));
+        assert_eq!(store.load("connection/c1").unwrap(), None);
+        assert!(!s.connections.find("c1").unwrap().remembered);
+        assert!(s.database_logins.has_session_password("c1"));
+        assert_eq!(a.receive(a.generation(), ok(call("again", tool, args)), &mut s), Step::Confirm);
+    }
+}
+
+#[test]
 fn gate_rules() {
     let s = sample();
     let g = |name: &str, args: Value| tools::gate(&s, &ToolCall { id: "x".into(), name: name.into(), args });
@@ -168,6 +276,14 @@ fn gate_rules() {
     assert!(g("list_layers", json!({})).is_none());
     assert!(g("run_command", json!({"command": "info.fileLayers", "params": {"path": "/etc/passwd"}})).is_some());
     assert!(g("run_command", json!({"command": "info.fileColumns", "params": {"path": "/etc/passwd"}})).is_some());
+    // Georeferencing is a file command only when it writes a file.
+    let extent = json!({"layer": "r", "extent": [10.0, 45.0, 10.04, 45.04]});
+    assert!(g("run_command", json!({"command": "raster.georeference", "params": extent})).is_none());
+    let pts = json!({"layer": "r", "points": [[0, 0, 1, 1], [1, 0, 2, 1], [0, 1, 1, 2]], "transform": "affine", "crs": 32613});
+    assert!(g("run_command", json!({"command": "raster.georeference", "params": pts})).is_none());
+    let mut file = pts.clone();
+    file["path"] = json!("/tmp/x.tif");
+    assert!(g("run_command", json!({"command": "raster.georeference", "params": file})).is_some());
 }
 
 /// What a command says beside its result reaches the model (issue #85).

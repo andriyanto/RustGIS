@@ -5,7 +5,8 @@
 //! The script is JSON lines: `{"cmd": id, "params": {...}}` runs a command (ui.* included),
 //! `{"shot": "/abs/out.png"}` saves the window, `{"steps": n}` runs frames, `{"sleep": ms}` runs frames
 //! for that long, `{"click": label}` clicks the first widget whose label contains the text (with
-//! `"exact": true`, whose whole label is the text), `{"type": text}` types into the focused box,
+//! `"exact": true`, whose whole label is the text), `{"combo": text}` opens the combo box showing
+//! that text, `{"type": text}` types into the focused box,
 //! `{"key": "Enter"}` presses a key (egui's key names), `{"dark": true}` switches theme,
 //! `{"drag": [x, y, dx, dy]}` presses the pointer at (x, y) and moves it by (dx, dy), holding
 //! it (shots then catch the map mid-drag; `{"release": true}` lets go; `"button": "secondary"`; `"ctrl": true` holds Ctrl
@@ -48,6 +49,7 @@ fn main() {
     };
     app.set_render_state(Some(rs.clone()));
     let mut harness = egui_kittest::Harness::builder()
+        .with_accessibility_check(false)
         .with_size(egui::vec2(w, h))
         .with_pixels_per_point(2.0)
         .with_max_steps(10_000)
@@ -154,6 +156,15 @@ fn main() {
             for _ in 0..3 {
                 harness.step();
             }
+        } else if let Some(shown) = l.get("combo").and_then(|v| v.as_str()) {
+            // A combo box has no label of its own: it is found by what it shows.
+            match harness.query_all_by_role(egui::accesskit::Role::ComboBox).find(|n| n.value().as_deref() == Some(shown)) {
+                Some(node) => node.click(),
+                None => eprintln!("no combo box showing '{shown}'"),
+            }
+            for _ in 0..3 {
+                harness.step();
+            }
         } else if let Some(d) = l.get("drag").and_then(|v| v.as_array()) {
             let n: Vec<f32> = d.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect();
             let [x, y, dx, dy] = n[..] else {
@@ -218,6 +229,7 @@ fn main() {
                 delta: egui::vec2(0.0, dy),
                 phase: egui::TouchPhase::Move,
                 modifiers: egui::Modifiers::NONE,
+                source: egui::MouseWheelSource::Wheel,
             });
             harness.step();
         } else if l.get("release").is_some() {

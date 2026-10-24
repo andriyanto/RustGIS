@@ -215,6 +215,7 @@ pub struct Conn {
 fn err(e: mysql::Error) -> DataError {
     // The server's own message (a missing table, a refused password) rather than its code.
     match e {
+        mysql::Error::MySqlError(m) if matches!(m.code, 1045 | 1698) => DataError::Login(m.message),
         mysql::Error::MySqlError(m) => DataError::Format(m.message),
         e => DataError::Format(e.to_string()),
     }
@@ -269,7 +270,7 @@ impl Conn {
                     if broken(&e) {
                         *guard = None;
                     }
-                    return Err(err(e));
+                    return Err(err(e).redact_secret(self.password.as_deref().unwrap_or("")));
                 }
             }
         }
@@ -281,6 +282,10 @@ impl Conn {
 /// offers none, said in the second value), and sets the session read only with a statement
 /// timeout.
 fn open_client(config: &Config, password: Option<&str>) -> Result<((mysql::Conn, Server), bool)> {
+    connect_client(config, password).map_err(|e| e.redact_secret(password.unwrap_or("")))
+}
+
+fn connect_client(config: &Config, password: Option<&str>) -> Result<((mysql::Conn, Server), bool)> {
     super::tls_provider();
     let base = mysql::OptsBuilder::new()
         .ip_or_hostname(Some(config.host.clone()))
@@ -1025,6 +1030,18 @@ impl FeatureSource for MysqlSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refused_login_is_not_a_missing_table() {
+        for code in [1045, 1698, 1146] {
+            let e = err(mysql::Error::MySqlError(mysql::MySqlError { state: "28000".into(), message: "Access denied".into(), code }));
+            if code == 1146 {
+                assert!(matches!(e, DataError::Format(_)));
+            } else {
+                assert!(matches!(e, DataError::Login(_)));
+            }
+        }
+    }
 
     #[test]
     fn addresses_take_client_defaults_and_modes() {

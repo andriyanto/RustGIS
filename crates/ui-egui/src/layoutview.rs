@@ -93,6 +93,10 @@ pub struct LayoutView {
     /// Where the primary button last went down: egui forgets it on release, and a click is
     /// judged by where it started.
     pressed: Option<Pos2>,
+    /// The map of a frame being panned, with [`PAN_OVERSCAN`] of map past each side: drawn once
+    /// as the pan starts and slid under the pointer, so the map comes into view as it moves; None
+    /// when it couldn't be drawn (it isn't tried again for that pan).
+    pan_preview: Option<(u32, Option<egui::TextureHandle>)>,
     /// The arrow-key nudges so far: how many runs of them there have been, and the last one's
     /// layout, element and time (seconds), for [`LayoutView::nudge_key`].
     nudges: u64,
@@ -129,6 +133,38 @@ pub(crate) fn follow_project(app: &mut RustGisApp) {
         app.layout.typing.clear();
     }
     app.layout.project = Some(opened);
+}
+
+/// How much map a pan's preview draws past each side of the frame, in frame widths and heights.
+const PAN_OVERSCAN: f64 = 1.0;
+/// Most pixels a pan's preview is drawn with: it's drawn on the spot as the pan starts.
+const PAN_PREVIEW_PIXELS: f64 = 6_000_000.0;
+/// Longest side, in pixels, a pan's preview is drawn with, within what the GPU takes.
+const PAN_PREVIEW_SIDE: f64 = 8192.0;
+
+/// A map frame's map with [`PAN_OVERSCAN`] past each side, at the screen's resolution (or less,
+/// within [`PAN_PREVIEW_PIXELS`] and [`PAN_PREVIEW_SIDE`]), for a pan's preview. It doesn't wait
+/// for tiles still on their way, as it's drawn while the pointer moves.
+fn pan_preview(app: &mut RustGisApp, ctx: &egui::Context, layout: &Layout, id: u32, s: f32) -> Option<egui::TextureHandle> {
+    let e = layout.element(id)?;
+    let ElementKind::MapFrame { map, center, scale, bearing, pitch, .. } = &e.kind else { return None };
+    // A tilted view's perspective follows the drawing's height, so a taller drawing wouldn't match
+    // the frame: a pitched frame slides the page as before.
+    if *pitch != 0.0 {
+        return None;
+    }
+    let m = app.session.project.maps.iter_mut().find(|m| m.name.eq_ignore_ascii_case(map))?;
+    let cam = frame_camera(m, *center, *scale, *bearing, *pitch);
+    let k = 1.0 + 2.0 * PAN_OVERSCAN;
+    let (w, h) = (e.w * PT_PER_MM * k, e.h * PT_PER_MM * k);
+    let screen = f64::from(s) / PT_PER_MM * f64::from(ctx.pixels_per_point());
+    // Within the pixel budget, and within the longest side the GPU takes for a texture (a long,
+    // thin frame could pass the first and not the second).
+    let side = (ctx.input(|i| i.max_texture_side) as f64).min(PAN_PREVIEW_SIDE);
+    let ppp = screen.min((PAN_PREVIEW_PIXELS / (w * h).max(1.0)).sqrt()).min(side / w.max(h).max(1.0)).max(0.01);
+    let pm = rustgis_engine::render::layout::frame_map_preview(m, cam, w, h, ppp)?;
+    let img = egui::ColorImage::from_rgba_premultiplied([pm.width() as usize, pm.height() as usize], pm.data());
+    Some(ctx.load_texture("layout_pan_preview", img, egui::TextureOptions::LINEAR))
 }
 
 /// Seconds after the wheel stops before a map frame's zoom is applied.
@@ -520,7 +556,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
     // A stable id: dragging an element selects it and opens the Format pane beside the page,
     // and an automatic id would change with it, losing the drag before it is dropped (#325).
     ui.advance_cursor_after_rect(area);
-    let resp = ui.interact(area, ui.id().with("layout_page"), Sense::click_and_drag());
+    let resp = ui.interact(area, ui.scope_id().with("layout_page"), Sense::click_and_drag());
     let painter = ui.painter_at(area);
     painter.rect_filled(area, 0.0, if t.dark { Color32::from_gray(38) } else { Color32::from_rgb(0xD9, 0xDD, 0xE3) });
     let (page, s) = page_rect(&app.layout, area, &layout);
@@ -549,6 +585,16 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
             app.layout.key = Some(key);
         }
     }
+    // A pan's preview is drawn as the pan starts, and let go when it ends.
+    match app.layout.drag {
+        Some(Drag::PanFrame(id, _)) if app.layout.pan_preview.as_ref().is_none_or(|(p, _)| *p != id) => {
+            let ctx = ui.ctx().clone();
+            let map = pan_preview(app, &ctx, &layout, id, s);
+            app.layout.pan_preview = Some((id, map));
+        }
+        Some(Drag::PanFrame(..)) => {}
+        _ => app.layout.pan_preview = None,
+    }
     // Shadow, page, elements.
     painter.rect_filled(page.translate(vec2(3.0, 4.0)), 2.0, Color32::from_black_alpha(50));
     painter.rect_filled(page, 0.0, Color32::WHITE);
@@ -576,7 +622,19 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
             let uv = Rect::from_min_max(src((e.x, e.y)), src((e.x + e.w, e.y + e.h)));
             let clip = painter.with_clip_rect(frame);
             clip.rect_filled(frame, 0.0, Color32::WHITE);
-            clip.image(tex.id(), frame, uv, Color32::WHITE);
+            match &app.layout.pan_preview {
+                // A pan: the frame's map with the overscan around it, moved with the pointer, so
+                // what comes into view is map, not the page beside the frame.
+                Some((pid, Some(map))) if *pid == id && k == 1.0 => {
+                    let o = PAN_OVERSCAN as f32;
+                    let around = Rect::from_min_max(frame.min - frame.size() * o, frame.max + frame.size() * o);
+                    let full = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                    clip.image(map.id(), around.translate(vec2(dx as f32, dy as f32) * s), full, Color32::WHITE);
+                }
+                _ => {
+                    clip.image(tex.id(), frame, uv, Color32::WHITE);
+                }
+            }
         }
     }
     let accent = t.accent;
@@ -1119,7 +1177,7 @@ fn grid_properties(app: &mut RustGisApp, ui: &mut Ui, grid: Option<&Grid>, id: u
     }
     let Some(g) = grid else { return };
     // Each number kept across a drag until it is let go (#607).
-    let key = |field: &str| egui::Id::new(("grid_drag", id, field));
+    let key = |field: &str| egui::Id::unique(("grid_drag", id, field));
     egui::Grid::new(("grid_props", id)).num_columns(2).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
         ui.label(tl!("Interval"));
         let mut step = g.step;
@@ -1262,7 +1320,7 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
     let Some(e) = app.layout.selected.and_then(|id| layout.element(id)).cloned() else { return };
     let id = e.id;
     // Each number kept across a drag until it is let go (#607): one key per layout, element and field.
-    let drag_key = |field: &str| egui::Id::new(("layout_drag", li, id, field));
+    let drag_key = |field: &str| egui::Id::unique(("layout_drag", li, id, field));
     let update = |app: &mut RustGisApp, p: Value| {
         let mut p = p;
         p["layout"] = json!(li);
@@ -1478,7 +1536,7 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         }
                         ui.end_row();
                     }
-                    ElementKind::Rectangle { fill, outline, width } | ElementKind::Ellipse { fill, outline, width } => {
+                    ElementKind::Rectangle { fill, outline, width, .. } | ElementKind::Ellipse { fill, outline, width } => {
                         // A fill with no opacity leaves only the outline; an outline 0 wide, only the fill.
                         for (label, key, current) in [("Fill", "fill", *fill), ("Outline", "outline", *outline)] {
                             ui.label(tl!(label));
@@ -1538,11 +1596,11 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
         );
     });
     // A layout's text: the form a text graphic has too (#516, #535), with the page's dynamic text.
-    if let ElementKind::Text { text, size, color, bold, italic, align, letter_spacing } = &e.kind {
+    if let ElementKind::Text { text, size, color, bold, italic, align, letter_spacing, font } = &e.kind {
         let key = (li, id, "text");
         let mut buf = app.layout.typing.remove(&key).unwrap_or_else(|| text.clone());
         let (mut sz, mut c, mut bb) = (*size, crate::theme::c32(*color), *bold);
-        let (mut it, mut al, mut ls) = (*italic, *align, *letter_spacing);
+        let (mut it, mut al, mut ls, mut fam) = (*italic, *align, *letter_spacing, *font);
         let tokens = [rustgis_engine::map::graphics::TOKENS, rustgis_engine::map::layout::PAGE_TOKENS];
         let fields = crate::textform::Fields {
             text: &mut buf,
@@ -1552,6 +1610,7 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
             italic: Some(&mut it),
             align: Some(&mut al),
             letter_spacing: Some(&mut ls),
+            font: Some(&mut fam),
             select: false,
         };
         let settled = crate::textform::section(ui, "Text", |ui| crate::textform::show(ui, ("layout_text", li, id), &tokens, fields))
@@ -1578,6 +1637,9 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
         }
         if settled.letter_spacing {
             update(app, json!({"letterSpacing": ls}));
+        }
+        if settled.font {
+            update(app, json!({"font": fam.code()}));
         }
     }
     // The layers a legend lists: a checkbox for each vector layer of its frame's map, ticked when
@@ -1731,7 +1793,7 @@ mod tests {
         let area = Rc::new(Cell::new(Rect::NOTHING));
         let shown = area.clone();
         let mut fonts = false;
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 760.0)).build_ui_state(
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(vec2(1000.0, 760.0)).build_ui_state(
             move |ui, app: &mut RustGisApp| {
                 if !fonts {
                     crate::theme::install_fonts(ui.ctx(), &[], None);
@@ -1770,6 +1832,67 @@ mod tests {
         assert_eq!(app.layout.selected, Some(id), "still selected");
     }
 
+    /// While a map frame is panned, its map is drawn past the frame's sides and slid with the
+    /// pointer, so what comes into view is map rather than the page beside the frame; the drawing
+    /// is let go when the pan ends, which moves the frame's map as before.
+    #[test]
+    fn a_panned_frame_shows_map_beyond_its_edges() {
+        use rustgis_engine::map::layout::ElementKind;
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Pan"})).unwrap();
+        app.layout.navigate = true;
+        let li = app.session.active_layout.unwrap();
+        let area = Rc::new(Cell::new(Rect::NOTHING));
+        let shown = area.clone();
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(vec2(1000.0, 760.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                shown.set(ui.available_rect_before_wrap());
+                super::show(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let layout = h.state().session.project.layouts[li].clone();
+        let id = layout.first_frame().unwrap();
+        let center = |l: &rustgis_engine::map::layout::Layout| match &l.element(id).unwrap().kind {
+            ElementKind::MapFrame { center, .. } => *center,
+            k => panic!("{k:?}"),
+        };
+        let before = center(&layout);
+        let e = layout.element(id).unwrap();
+        let (page, s) = page_rect(&h.state().layout, area.get(), &layout);
+        let from = to_screen(page, s, (e.x + e.w / 2.0, e.y + e.h / 2.0));
+        let to = from + vec2(120.0, 0.0);
+        let button = |pos: Pos2, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        h.event(Event::PointerMoved(from));
+        h.step();
+        h.event(button(from, true));
+        h.step();
+        for i in 1..=4 {
+            h.event(Event::PointerMoved(from + (to - from) * i as f32 / 4.0));
+            h.step();
+        }
+        // Mid-pan: the frame's map with its overscan is drawn, three frames wide and high.
+        let (pid, map) = h.state().layout.pan_preview.clone().expect("a preview while panning");
+        assert_eq!(pid, id);
+        let size = map.expect("the frame's map was drawn").size();
+        let frame_px = (e.w as f32 * s * h.ctx.pixels_per_point(), e.h as f32 * s * h.ctx.pixels_per_point());
+        assert!(
+            (size[0] as f32 - 3.0 * frame_px.0).abs() < 3.0 && (size[1] as f32 - 3.0 * frame_px.1).abs() < 3.0,
+            "{size:?} for a frame of {frame_px:?} px"
+        );
+        h.event(button(to, false));
+        h.step();
+        assert!(h.state().layout.pan_preview.is_none(), "let go after the pan");
+        assert_ne!(center(&h.state().session.project.layouts[li]), before, "the pan moved the frame's map");
+    }
+
     /// Pressing a corner handle and dragging away fast resizes the element, though by the time
     /// egui starts the drag the pointer is already off the handle; it used to move the element.
     #[test]
@@ -1783,7 +1906,7 @@ mod tests {
         let area = Rc::new(Cell::new(Rect::NOTHING));
         let shown = area.clone();
         let mut fonts = false;
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 760.0)).build_ui_state(
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(vec2(1000.0, 760.0)).build_ui_state(
             move |ui, app: &mut RustGisApp| {
                 if !fonts {
                     crate::theme::install_fonts(ui.ctx(), &[], None);
@@ -1838,7 +1961,7 @@ mod tests {
         let area = Rc::new(Cell::new(Rect::NOTHING));
         let shown = area.clone();
         let mut fonts = false;
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 760.0)).build_ui_state(
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(vec2(1000.0, 760.0)).build_ui_state(
             move |ui, app: &mut RustGisApp| {
                 if !fonts {
                     crate::theme::install_fonts(ui.ctx(), &[], None);
@@ -1882,7 +2005,7 @@ mod tests {
         let shown = area.clone();
         // Fonts take effect on the frame after they are installed.
         let mut fonts = false;
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 760.0)).build_ui_state(
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(vec2(1000.0, 760.0)).build_ui_state(
             move |ui, app: &mut RustGisApp| {
                 if !fonts {
                     crate::theme::install_fonts(ui.ctx(), &[], None);
@@ -2002,7 +2125,7 @@ mod tests {
         let area = Rc::new(Cell::new(Rect::NOTHING));
         let shown = area.clone();
         let mut fonts = false;
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 760.0)).build_ui_state(
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(vec2(1000.0, 760.0)).build_ui_state(
             move |ui, app: &mut RustGisApp| {
                 if !fonts {
                     crate::theme::install_fonts(ui.ctx(), &[], None);
@@ -2046,7 +2169,7 @@ mod tests {
         let title = app.session.project.layouts[li].elements.iter().find(|e| e.name == "Title").unwrap().clone();
         app.layout.selected = Some(title.id);
         let mut fonts = false;
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 760.0)).build_ui_state(
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(vec2(1000.0, 760.0)).build_ui_state(
             move |ui, app: &mut RustGisApp| {
                 if !fonts {
                     crate::theme::install_fonts(ui.ctx(), &[], None);
@@ -2099,7 +2222,7 @@ mod tests {
         let title = app.session.project.layouts[li].elements.iter().find(|e| e.name == "Title").unwrap().clone();
         app.layout.selected = Some(title.id);
         let mut fonts = false;
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 760.0)).build_ui_state(
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(vec2(1000.0, 760.0)).build_ui_state(
             move |ui, app: &mut RustGisApp| {
                 if !fonts {
                     crate::theme::install_fonts(ui.ctx(), &[], None);
@@ -2150,7 +2273,7 @@ mod tests {
         let area = Rc::new(Cell::new(Rect::NOTHING));
         let shown = area.clone();
         let mut fonts = false;
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 760.0)).build_ui_state(
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(vec2(1000.0, 760.0)).build_ui_state(
             move |ui, app: &mut RustGisApp| {
                 if !fonts {
                     crate::theme::install_fonts(ui.ctx(), &[], None);
@@ -2205,7 +2328,7 @@ mod tests {
         let title = app.session.project.layouts[li].elements.iter().find(|e| e.name == "Title").unwrap().id;
         app.layout.selected = Some(title);
         let mut fonts = false;
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(vec2(1200.0, 900.0)).build_ui_state(
             move |ui, app: &mut RustGisApp| {
                 if !fonts {
                     crate::theme::install_fonts(ui.ctx(), &[], None);
@@ -2235,6 +2358,16 @@ mod tests {
             matches!(kind, ElementKind::Text { italic: true, align: TextAlign::Left, letter_spacing, .. } if *letter_spacing == 3.5),
             "{kind:?}"
         );
+        // The family (#517): Serif picked from the Font list is stored.
+        h.get_by_role_and_label(Role::ComboBox, "Font").click();
+        h.run_steps(2);
+        h.get_by_label("Serif").click();
+        h.run_steps(3);
+        let kind = &h.state().session.project.layouts[li].element(title).unwrap().kind;
+        assert!(matches!(kind, ElementKind::Text { font: rustgis_engine::map::layout::FontFamily::Serif, .. }), "{kind:?}");
+        // Said where no serif is installed, and only there.
+        let said = h.query_by_label_contains("No serif font is installed").is_some();
+        assert_eq!(said, !rustgis_engine::render::fonts::serif_available());
     }
 
     /// A number dragged in the Format pane and let go is applied (#607): X moves the element by
@@ -2249,7 +2382,7 @@ mod tests {
         let title = app.session.project.layouts[li].elements.iter().find(|e| e.name == "Title").unwrap().clone();
         app.layout.selected = Some(title.id);
         let mut fonts = false;
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(vec2(1200.0, 900.0)).build_ui_state(
             move |ui, app: &mut RustGisApp| {
                 if !fonts {
                     crate::theme::install_fonts(ui.ctx(), &[], None);
@@ -2296,7 +2429,7 @@ mod tests {
             app.run("layout.addElement", json!({"kind": "arrow", "angle": 0, "length": 60})).unwrap()["element"].as_u64().unwrap() as u32;
         app.layout.selected = Some(id);
         let mut fonts = false;
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(vec2(1200.0, 900.0)).build_ui_state(
             move |ui, app: &mut RustGisApp| {
                 if !fonts {
                     crate::theme::install_fonts(ui.ctx(), &[], None);
@@ -2342,7 +2475,7 @@ mod tests {
         let title = app.session.project.layouts[li].elements.iter().find(|e| e.name == "Title").unwrap().id;
         app.layout.selected = Some(title);
         let mut fonts = false;
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(vec2(1200.0, 900.0)).build_ui_state(
             move |ui, app: &mut RustGisApp| {
                 if !fonts {
                     crate::theme::install_fonts(ui.ctx(), &[], None);
@@ -2389,7 +2522,7 @@ mod tests {
         app.run("layout.addElement", json!({"kind": "extentIndicator", "frame": inset, "of": main, "width": 1.5})).unwrap();
         app.layout.selected = Some(inset);
         let mut fonts = false;
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(vec2(1200.0, 900.0)).build_ui_state(
             move |ui, app: &mut RustGisApp| {
                 if !fonts {
                     crate::theme::install_fonts(ui.ctx(), &[], None);
@@ -2427,7 +2560,7 @@ mod tests {
         app.run("layout.update", json!({"element": legend, "exclude": ["Cities"]})).unwrap();
         app.layout.selected = Some(legend);
         let mut fonts = false;
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(vec2(1200.0, 900.0)).build_ui_state(
             move |ui, app: &mut RustGisApp| {
                 if !fonts {
                     crate::theme::install_fonts(ui.ctx(), &[], None);
@@ -2478,7 +2611,7 @@ mod tests {
         let ids: Vec<u32> = app.session.project.layouts[li].elements.iter().map(|e| e.id).collect();
         app.run("ui.pane.bookmarks", json!({})).unwrap();
         let mut fonts = false;
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(vec2(1200.0, 900.0)).build_ui_state(
             move |ui, app: &mut RustGisApp| {
                 if !fonts {
                     crate::theme::install_fonts(ui.ctx(), &[], None);
@@ -2564,7 +2697,7 @@ mod tests {
             let text = serde_json::to_string(&app.session.project).unwrap();
             app.layout.selected = Some(title);
             let mut fonts = false;
-            let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+            let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(vec2(1200.0, 900.0)).build_ui_state(
                 move |ui, app: &mut RustGisApp| {
                     if !fonts {
                         crate::theme::install_fonts(ui.ctx(), &[], None);
@@ -2642,7 +2775,7 @@ mod tests {
         let area = Rc::new(Cell::new(Rect::NOTHING));
         let shown = area.clone();
         let mut fonts = false;
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 760.0)).build_ui_state(
+        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(vec2(1000.0, 760.0)).build_ui_state(
             move |ui, app: &mut RustGisApp| {
                 if !fonts {
                     crate::theme::install_fonts(ui.ctx(), &[], None);
