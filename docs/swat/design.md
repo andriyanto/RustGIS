@@ -1,6 +1,6 @@
 # SWAT+ di RustGIS: dokumen desain
 
-Status: draf untuk ditinjau · Fork: `andriyanto/rustgis` · Tanggal: 2026-10-22
+Status: draf untuk ditinjau · Fork: `andriyanto/rustgis` · Tanggal: 2026-10-22, diperbarui 2026-10-26
 
 Dokumen ini mencatat keputusan untuk membawa seluruh alur kerja SWAT+ (GIS, editor, dan engine
 simulasi) ke dalam RustGIS, di desktop dan di web. Fitur ini dikembangkan di fork dulu karena
@@ -333,8 +333,8 @@ security per `project_id`; rinciannya diputuskan di fase 5.
 | 0 | Baseline Fortran di CI, alat pembanding, dokumen ini | Artifact baseline tersedia untuk `Osu_1hru` dan `Ames_sub1` |
 | 1 | Repo engine `swatplus-rs` (LGPL-2.1): model, pembaca TxtInOut, iklim dan weather generator | Model dari kedua data contoh terbaca lengkap; data iklim harian cocok |
 | 2 | Neraca air HRU, bertahap di skenario turunan Ames (lihat `docs/phase2.md` di repo engine): 2a tanah bera tanpa tanaman dan manajemen ✅; 2b-1 padang rumput tanpa manajemen dengan model karbon asli (`cswat` 0): tanaman, hara N/P tanah, erosi ✅; 2b-2 padang rumput dengan model karbon Century (`cswat` 2) ✅ | 2a: `hru_wb` harian `Ames_bare` identik; 2b-1: `hru_wb`, `hru_pw`, `hru_nb`, `hru_ls` harian `Ames_past0` identik; 2b-2: tabel yang sama untuk `Ames_past` identik, karbon tanah per lapisan dalam presisi cetak |
-| 3 | Objek spasial dan routing: loop `command`, routing unit, akuifer, kanal SWAT-DEG (Muskingum) | `channel_sd` dan `aquifer` harian dalam toleransi |
-| 4 | Manajemen, irigasi, nutrien, sedimen, karbon (`mgt_operatn`, tabel keputusan), lalu waduk dan lahan basah termasuk sawah (Osu) | `Ames_sub1` dan `Osu_1hru` utuh: `hru_wb`, `hru_nb`, `hru_ls`, `hru_pw`, hasil panen dalam toleransi |
+| 3 | Objek spasial dan routing: loop `command`, routing unit, akuifer, kanal SWAT-DEG, bertahap pada varian proyek Batanghari dan Pessel (lihat `docs/phase3.md` di repo engine) | `channel_sd` dan `aquifer` harian dalam toleransi |
+| 4 | Manajemen, irigasi, nutrien, sedimen, karbon (`mgt_operatn`, tabel keputusan), lalu waduk dan lahan basah termasuk sawah (Osu). Sudah selesai lebih awal: M1 (operasi terjadwal pada jagung) ✅ dan M2 (komunitas tanaman, irigasi lewat tabel keputusan, lapisan tanah kustom; `Ames_sub1` utuh identik) ✅ | `Ames_sub1` dan `Osu_1hru` utuh: `hru_wb`, `hru_nb`, `hru_ls`, `hru_pw`, hasil panen dalam toleransi |
 | 5 | `swat-store` (PostGIS tulis/baca, Parquet), server API, antrean job, worker | Simulasi berjalan dari job server, output terbaca di web |
 | 6 | Editor di RustGIS (iklim, parameter, jadwal), perintah `swat.*`, panel SWAT di ribbon | Proyek bisa dibuat dan diedit tanpa SWAT+ Editor |
 | 7 | `swat-gis`: delineasi dengan Whitebox, pembentukan HRU, mode agen desktop | Proyek baru dari DEM sampai simulasi tanpa QSWAT+ |
@@ -358,5 +358,9 @@ Catatan revisi (22 Okt 2026): kedua skenario acuan tidak bisa menguji neraca air
   ditulis ulang dari dokumentasi teori SWAT, bukan dari kode engine.
 - **Format QSWAT+ dan SWAT+ Editor.** Kode keduanya (Python) belum dipetakan. Ini diperlukan
   sebelum fase 6 dan 7 agar logika pembentukan HRU dan nilai bawaan editor sama.
-- **Data uji besar.** Perlu satu proyek nyata dengan banyak subDAS, sebaiknya dari wilayah
-  Indonesia, sebelum fase 3.
+- **Data uji besar.** Terpenuhi (26 Okt 2026): dua proyek nyata dari Sumatera Barat ada di
+  `testdata/` repo engine, masing-masing dengan acuan Fortran yang identik dengan run SWAT+ rev.
+  62.0.1 pemiliknya. `Batanghari` (DAS hulu bergunung, 42 subbasin, 284 kanal, 1.858 HRU) dan
+  `Pessel` (DAS pesisir, 230 subbasin, 1.454 kanal, 3.966 HRU, gambut, sawah, lahan basah).
+  Perilaku SWAT+ yang ditemukan saat menyusunnya (tanaman tahunan yang tidak pernah dorman di
+  bawah lintang 20°, `perco`, nilai bawaan SWAT+ Editor) dicatat di `docs/swat-quirks.md`.
