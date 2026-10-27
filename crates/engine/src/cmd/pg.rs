@@ -112,6 +112,13 @@ fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
             return Ok(json!({"saved": false, "inserted": 0, "updated": 0, "deleted": 0}));
         }
         let table = edit.origin.table.clone();
+        // Undone past a save: the database holds those edits already, and its new rows would be
+        // inserted again.
+        if s.pg_saved_over.iter().any(|v| v.shares(&edit.versions)) {
+            return Err(format!(
+                "{name}: the layer is back before an edit saved to {table} (undone), so nothing was saved. Discard Edits loads the rows as they are now"
+            ));
+        }
         if !edit.writable {
             return Err(format!("{name}: the database's user can't insert, update or delete the rows of {table}"));
         }
@@ -161,6 +168,9 @@ fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
                 pg.versions = baseline;
             }
         }
+        // The versions saved over, while an undo step can bring them back.
+        s.pg_saved_over.retain(rustgis_map::source::Versions::held_elsewhere);
+        s.pg_saved_over.push(edit.versions);
         s.notify(
             format!("{name}: saved to {table}: {} new, {} changed, {} deleted", saved.inserted.len(), saved.updated, saved.deleted),
             false,

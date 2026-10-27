@@ -538,6 +538,11 @@ pub struct Session {
     /// The PostGIS database the PostGIS tab works with (`pg.connect`): its connection, never
     /// with its password. Kept for the session, not in the project.
     pub postgis: Option<String>,
+    /// The PostGIS layers' row versions that `pg.saveEdits` saved over: a layer back on one
+    /// (undone, or restored by a failed command, past a save) would write its edits again.
+    /// Outside the project, so undo keeps it.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) pg_saved_over: Vec<rustgis_map::source::Versions>,
     /// The feature cache fills itself after projection changes (Data › Feature Cache).
     pub auto_cache: bool,
     /// Mensuration results (Analyze › Mensuration › Results).
@@ -796,6 +801,7 @@ impl Session {
             measurements: Vec::new(),
             auto_cache: false,
             postgis: None,
+            pg_saved_over: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
             merge: None,

@@ -243,10 +243,15 @@ or deleted in the database since you loaded it, or a new row's key is already ta
 saved**, and the message lists those rows. Discard Edits then loads them as they are now. A row
 someone else changed that you didn't edit is no conflict, and stays as they left it.
 
+Undo doesn't reach into the database: undoing a save brings back the layer as it was before, but
+the rows stay saved. Saving that layer again is refused, since it would write the same edits
+twice (its new rows as more new rows); Redo, or Discard Edits, brings the layer back in step.
+
 Only what you changed is written: the columns whose values differ, and the geometry when it moved
 (converted back to the table's coordinate system, single or multi type and dimensions). A new row
 takes the value of its key field, else the table's default key (`serial`, identity), else its
-feature id, and its feature takes the key it was saved with. Fields the table has no column for
+feature id, and its feature takes the key it was saved with. A new row's empty fields take their
+column's default, NULL when it has none. Fields the table has no column for
 aren't saved, and the message names them. The layer says when the database's user can't insert,
 update or delete the table's rows; saving is then refused.
 

@@ -17,9 +17,8 @@ use crate::widgets::{
 use crate::{RightPane, RustGisApp, icons};
 
 #[cfg(not(target_arch = "wasm32"))]
-pub const TABS: &[&str] = &[
-    "Home", "Data", "Style", "Labeling", "Edit", "Analyze", "View", "Publish", "PostGIS", "Plugins", "Settings", "Help",
-];
+pub const TABS: &[&str] =
+    &["Home", "Data", "Style", "Labeling", "Edit", "Analyze", "View", "Publish", "PostGIS", "Plugins", "Settings", "Help"];
 /// The browser has no PostGIS: its databases are reached from the desktop app.
 #[cfg(target_arch = "wasm32")]
 pub const TABS: &[&str] = &["Home", "Data", "Style", "Labeling", "Edit", "Analyze", "View", "Publish", "Plugins", "Settings", "Help"];

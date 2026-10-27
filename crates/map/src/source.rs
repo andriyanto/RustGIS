@@ -190,6 +190,11 @@ impl Versions {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
+    /// Whether anything but this holds the same rows (a layer, an undo step).
+    pub fn held_elsewhere(&self) -> bool {
+        Arc::strong_count(&self.0) > 1
+    }
+
     /// The keys and rows, in key order.
     pub fn iter(&self) -> impl Iterator<Item = (u64, RowVersion)> + '_ {
         self.0.iter().map(|(k, v)| (*k, *v))

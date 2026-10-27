@@ -17621,6 +17621,17 @@ fn postgis_edits_are_counted_and_checked() {
     assert!(s.run("pg.discardEdits", &p).is_err());
     // The edits are still there to save.
     assert_eq!(s.run("pg.pendingEdits", &p).unwrap()["updates"], 1);
+    // Back on rows a save wrote over (undone past it): its edits, new rows too, aren't written
+    // again, and no database is asked.
+    let read = s.map().layer(id).unwrap().postgis.as_ref().unwrap().versions.clone();
+    s.pg_saved_over.push(read.clone());
+    let e = s.run("pg.saveEdits", &p).unwrap_err();
+    assert!(e.contains("back before an edit saved to roads"), "{e}");
+    // Rows read again are a baseline of their own.
+    s.map_mut().layer_mut(id).unwrap().postgis.as_mut().unwrap().versions = read.iter().collect();
+    let e = s.run("pg.saveEdits", &p).unwrap_err();
+    assert!(e.starts_with("gis: "), "{e}");
+    s.pg_saved_over.clear();
     // A layer not from PostGIS has no edits to save there.
     crate::cmd::layer::add_dataset(&mut s, Dataset::new("plain", GeometryType::Point, Vec::new()));
     let e = s.run("pg.saveEdits", &json!({"layer": "plain"})).unwrap_err();
@@ -17685,6 +17696,13 @@ fn postgis_edits_live() {
     let r = s.run("pg.saveEdits", &json!({"layer": "T"})).unwrap();
     assert_eq!((r["inserted"].as_u64(), r["updated"].as_u64(), r["deleted"].as_u64()), (Some(1), Some(1), Some(1)), "{r}");
     let new_key = r["keys"][0].as_i64().unwrap() as i32;
+    // Undone, the save isn't made again (its new row inserted twice); redone, it is the layer
+    // as saved.
+    assert!(s.undo());
+    let e = s.run("pg.saveEdits", &json!({"layer": "T"})).unwrap_err();
+    assert!(e.contains("back before an edit saved"), "{e}");
+    assert!(s.redo());
+    assert_eq!(s.run("pg.saveEdits", &json!({"layer": "T"})).unwrap()["saved"], false);
     assert_eq!(name_of(&mut db, 1).as_deref(), Some("renamed"));
     assert_eq!(name_of(&mut db, 3), None);
     let row = db
