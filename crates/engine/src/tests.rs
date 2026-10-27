@@ -17509,7 +17509,7 @@ fn scans_have_no_coordinates_to_give_away() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The PostGIS tab's commands need a connection first, and a connection that isn't there fails
+/// The PostGIS editing commands need a connection first, and a connection that isn't there fails
 /// as an error that never shows its password, leaving the session unconnected.
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
@@ -17530,7 +17530,7 @@ fn postgis_tab_needs_a_connection() {
     assert_eq!(s.map().layers.len(), before);
 }
 
-/// A live PostGIS database through the PostGIS tab's commands: `RUSTGIS_TEST_POSTGIS` names one
+/// A live PostGIS database through the PostGIS editing commands: `RUSTGIS_TEST_POSTGIS` names one
 /// (as for `postgis_live_end_to_end`) with a table that has an integer primary key.
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
@@ -17635,7 +17635,7 @@ fn postgis_edits_are_counted_and_checked() {
     // A layer not from PostGIS has no edits to save there.
     crate::cmd::layer::add_dataset(&mut s, Dataset::new("plain", GeometryType::Point, Vec::new()));
     let e = s.run("pg.saveEdits", &json!({"layer": "plain"})).unwrap_err();
-    assert!(e.contains("not a layer added with PostGIS"), "{e}");
+    assert!(e.contains("not a PostGIS layer loaded for editing"), "{e}");
 }
 
 /// Edits saved to a live PostGIS database and read back, and every conflict refused:

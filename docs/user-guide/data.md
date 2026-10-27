@@ -217,35 +217,36 @@ A query can read any file the app can and fetch any web address, and a database 
 server, so the [AI Assistant](assistant.md) asks before it runs a query or reads a database, and
 plugins need both the files and network permissions.
 
-### The PostGIS tab
+### Editing PostGIS tables
 
-The **PostGIS** tab of the ribbon (desktop only) works with one PostgreSQL database with PostGIS
-at a time, and loads its tables to be edited.
+On the desktop, a PostgreSQL table with PostGIS can be loaded to be edited and its edits saved
+back to it. In **Home › Add › Add Data › Database…**, give a PostgreSQL connection, choose a table
+(**List Tables**) and tick **Load for editing**.
 
-- **Connect PostGIS** (`pg.connect`) asks for the host, port, database, user, password and
-  encryption, or takes a whole connection string instead. The connection lasts until you
-  **Disconnect** (`pg.disconnect`) or close RustGIS. It isn't saved with the project, and neither
-  is the password. Without a password, `PGPASSWORD` or libpq's password file serve.
-- **Add Layer** (`pg.addLayer`) lists the database's tables with a geometry or geography column
-  (`pg.tables`) and loads the one you choose whole, up to 100,000 rows a layer, in the order of its key.
+- The connection (`pg.connect`) lasts until RustGIS closes, or until **Disconnect** in the same
+  form (`pg.disconnect`). It isn't saved with the project, and neither is the password. Without a
+  password, `PGPASSWORD` or libpq's password file serve.
+- The table (`pg.addLayer`; `pg.tables` lists those with a geometry or geography column) loads
+  whole, up to 100,000 rows a layer, in the order of its key.
   A table whose geometries are of several types loads each type as its own layer, each up to that many.
   A **condition** (an SQL expression on its columns, such as `population > 10000`) loads only the
   rows it keeps. The layer is an ordinary layer in memory, so every editing tool works on it.
 
-- **Save Edits** (`pg.saveEdits`) shows how many of the layer's rows are new, changed and
-  deleted, and writes them to its table in one transaction. **Discard Edits** (`pg.discardEdits`)
+- **Edit › Manage Edits › Save to PostGIS…** (`pg.saveEdits`), there while a layer is loaded for
+  editing, shows how many of the layer's rows are new, changed and deleted, and writes them to its
+  table in one transaction. **Discard PostGIS Edits…** (`pg.discardEdits`)
   loads the rows again as they are in the database, dropping the edits (Undo brings them back).
 
 A table needs a single-column integer primary key to be added this way. The key becomes each
 feature's id, and the layer keeps each row's version (PostgreSQL's `xmin`) and what it held as it
 was read. Saving locks the rows you changed or deleted and checks them first: when one was changed
 or deleted in the database since you loaded it, or a new row's key is already taken, **nothing is
-saved**, and the message lists those rows. Discard Edits then loads them as they are now. A row
+saved**, and the message lists those rows. Discard PostGIS Edits then loads them as they are now. A row
 someone else changed that you didn't edit is no conflict, and stays as they left it.
 
 Undo doesn't reach into the database: undoing a save brings back the layer as it was before, but
 the rows stay saved. Saving that layer again is refused, since it would write the same edits
-twice (its new rows as more new rows); Redo, or Discard Edits, brings the layer back in step.
+twice (its new rows as more new rows); Redo, or Discard PostGIS Edits, brings the layer back in step.
 
 Only what you changed is written: the columns whose values differ, and the geometry when it moved
 (converted back to the table's coordinate system, single or multi type and dimensions). A new row

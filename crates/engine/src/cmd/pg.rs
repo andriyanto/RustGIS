@@ -1,5 +1,6 @@
 //! PostGIS: connect to a PostgreSQL database with PostGIS, list its tables and add them as layers
-//! that can be edited (desktop only). The ribbon's PostGIS tab runs these.
+//! that can be edited (desktop only). Home › Add Data › Database… (Load for editing) and
+//! Edit › Manage Edits run these.
 //!
 //! The connection is the session's (`Session::postgis`), never the project's, and never with its
 //! password, which is remembered for the session only. A table added with `pg.addLayer` is loaded
@@ -19,7 +20,7 @@ use super::{f, ps};
 use crate::{CmdResult, CommandSpec as C, Session};
 
 /// Why a command needs a connection first.
-const NOT_CONNECTED: &str = "connect to a PostGIS database first (PostGIS › Connect PostGIS)";
+const NOT_CONNECTED: &str = "connect to a PostGIS database first (Home › Add Data › Database…, Load for editing)";
 
 /// `sslmode`s a connection may name, as libpq's.
 #[cfg(not(target_arch = "wasm32"))]
@@ -31,18 +32,18 @@ const MAX_LISTED: usize = 5_000;
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("pg.connect", "Connect PostGIS", "PostGIS › Connection", connect).view().params(
+        C::new("pg.connect", "Connect PostGIS", "Home › Add › Add Data", connect).view().params(
             r#"{"connection"?: "host=… port=… dbname=… user=…, or a postgresql:// address (instead of the parts below)", "host"?: string, "port"?: number, "database"?: string, "user"?: string, "password"?: "kept for this session only, never saved", "sslmode"?: "disable"|"prefer"|"require"|"verify-ca"|"verify-full"}"#,
         ),
-        C::new("pg.disconnect", "Disconnect PostGIS", "PostGIS › Connection", disconnect).view().when(need_connection),
-        C::new("pg.status", "PostGIS Connection", "PostGIS › Connection", status).view(),
-        C::new("pg.tables", "List PostGIS Tables", "PostGIS › Layer", tables).view().when(need_connection).params(r#"{"schema"?: string}"#),
-        C::new("pg.pendingEdits", "PostGIS Edits", "PostGIS › Edit", pending_edits).view().params(r#"{"layer"?: "a layer added with pg.addLayer (default: the active one)"}"#),
-        C::new("pg.saveEdits", "Save PostGIS Edits", "PostGIS › Edit", save_edits)
+        C::new("pg.disconnect", "Disconnect PostGIS", "Home › Add › Add Data", disconnect).view().when(need_connection),
+        C::new("pg.status", "PostGIS Connection", "Home › Add › Add Data", status).view(),
+        C::new("pg.tables", "List PostGIS Tables", "Home › Add › Add Data", tables).view().when(need_connection).params(r#"{"schema"?: string}"#),
+        C::new("pg.pendingEdits", "PostGIS Edits", "Edit › Manage Edits", pending_edits).view().params(r#"{"layer"?: "a layer added with pg.addLayer (default: the active one)"}"#),
+        C::new("pg.saveEdits", "Save to PostGIS", "Edit › Manage Edits", save_edits)
             .params(r#"{"layer"?: "a layer added with pg.addLayer (default: the active one)"}"#),
-        C::new("pg.discardEdits", "Discard PostGIS Edits", "PostGIS › Edit", discard_edits)
+        C::new("pg.discardEdits", "Discard PostGIS Edits", "Edit › Manage Edits", discard_edits)
             .params(r#"{"layer"?: "a layer added with pg.addLayer (default: the active one)"}"#),
-        C::new("pg.addLayer", "Add PostGIS Layer", "PostGIS › Layer", add_layer).when(need_connection).params(
+        C::new("pg.addLayer", "Add PostGIS Layer", "Home › Add › Add Data", add_layer).when(need_connection).params(
             r#"{"table": "table, schema.table, or table:column for one of several geometry columns", "where"?: "an SQL condition on the table's columns", "limit"?: "the most rows of each layer (default and most: 100000)", "name"?: string, "crs"?: "EPSG:… of a geometry that doesn't say"}"#,
         ),
     ]
@@ -57,7 +58,10 @@ pub(crate) fn need_connection(s: &Session) -> Option<&'static str> {
 fn postgis_layer(s: &Session, p: &Value) -> Result<(u32, String, rustgis_map::source::PostgisEdit), String> {
     let id = s.layer_id(p)?;
     let l = s.map().layer(id).ok_or("no such layer")?;
-    let edit = l.postgis.clone().ok_or_else(|| format!("{}: not a layer added with PostGIS › Add Layer", l.name))?;
+    let edit = l
+        .postgis
+        .clone()
+        .ok_or_else(|| format!("{}: not a PostGIS layer loaded for editing (Home › Add Data › Database…, Load for editing)", l.name))?;
     Ok((id, l.name.clone(), edit))
 }
 
@@ -130,8 +134,8 @@ fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
         // The user's own credentials (PGPASSWORD, the password file) go only to the database
         // they connected to this session, never to one a project file names.
         let ask = s.postgis.as_deref() == Some(dsn.as_str());
-        let conn =
-            postgis::connect_writable(&dsn, ask).map_err(|e| format!("{label}: {e} (connect again with PostGIS › Connect PostGIS)"))?;
+        let conn = postgis::connect_writable(&dsn, ask)
+            .map_err(|e| format!("{label}: {e} (connect again: Home › Add Data › Database…, Load for editing)"))?;
         let t = postgis::find_table(&conn, &table).map_err(err)?;
         let src = postgis::PostgisSource::open(conn, t, edit.origin.family, edit.origin.crs.as_deref()).map_err(err)?;
         let rows = changes.insert_rows.clone();
@@ -206,7 +210,8 @@ fn discard_edits(s: &mut Session, p: &Value) -> CmdResult {
         let label = Database::Postgres(dsn.clone()).short();
         let err = |e: rustgis_data::DataError| format!("{label}: {e}");
         let ask = s.postgis.as_deref() == Some(dsn.as_str());
-        let conn = postgis::connect(&dsn, ask).map_err(|e| format!("{label}: {e} (connect again with PostGIS › Connect PostGIS)"))?;
+        let conn = postgis::connect(&dsn, ask)
+            .map_err(|e| format!("{label}: {e} (connect again: Home › Add Data › Database…, Load for editing)"))?;
         let t = postgis::find_table(&conn, &edit.origin.table).map_err(err)?;
         let src = postgis::PostgisSource::open(conn, t, edit.origin.family, edit.origin.crs.as_deref()).map_err(err)?;
         let limit = if edit.limit == 0 { postgis::MAX_EDITABLE } else { edit.limit };

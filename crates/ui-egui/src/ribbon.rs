@@ -16,12 +16,7 @@ use crate::widgets::{
 };
 use crate::{RightPane, RustGisApp, icons};
 
-#[cfg(not(target_arch = "wasm32"))]
-pub const TABS: &[&str] =
-    &["Home", "Data", "Style", "Labeling", "Edit", "Analyze", "View", "Publish", "PostGIS", "Plugins", "Settings", "Help"];
-/// The browser has no PostGIS: its databases are reached from the desktop app.
-#[cfg(target_arch = "wasm32")]
-pub const TABS: &[&str] = &["Home", "Data", "Style", "Labeling", "Edit", "Analyze", "View", "Publish", "Plugins", "Settings", "Help"];
+pub const TABS: [&str; 11] = ["Home", "Data", "Style", "Labeling", "Edit", "Analyze", "View", "Publish", "Plugins", "Settings", "Help"];
 
 /// Tabs that always show: Settings holds Customize › Ribbon, the way to show hidden tabs again.
 pub const FIXED_TABS: [&str; 2] = ["Settings", "Help"];
@@ -114,7 +109,6 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                         "Analyze" => analyze_tab(app, ui),
                         "View" => view_tab(app, ui),
                         "Publish" => publish_tab(app, ui),
-                        "PostGIS" => postgis_tab(app, ui),
                         "Plugins" => plugins_tab(app, ui),
                         "Settings" => settings_tab(app, ui),
                         "Help" => help_tab(app, ui),
@@ -2341,62 +2335,6 @@ fn active_layer(app: &RustGisApp) -> Option<&rustgis_engine::map::Layer> {
     app.session.active_layer.and_then(|id| app.session.map().layer(id))
 }
 
-/// The PostGIS tab: a PostgreSQL database's PostGIS tables as layers to edit (desktop only).
-fn postgis_tab(app: &mut RustGisApp, ui: &mut Ui) {
-    let connected = app.session.postgis.is_some();
-    group(ui, "Connection", |ui| {
-        big(
-            ui,
-            app,
-            "database",
-            "Connect\nPostGIS",
-            "Connect to a PostgreSQL database with PostGIS.",
-            "ui.dialog",
-            json!({"name": "pgConnect"}),
-            connected,
-            false,
-        );
-        big(ui, app, "close", "Disconnect", "Close the PostGIS connection.", "pg.disconnect", Value::Null, false, false);
-    });
-    group(ui, "Layer", |ui| {
-        big(
-            ui,
-            app,
-            "db_add",
-            "Add\nLayer",
-            "Add a table of the database as a layer you can edit.",
-            "ui.dialog",
-            json!({"name": "pgAddLayer"}),
-            false,
-            false,
-        );
-    });
-    group(ui, "Edit", |ui| {
-        big(
-            ui,
-            app,
-            "save",
-            "Save\nEdits",
-            "Save a PostGIS layer's edits to its table, unless rows changed there since.",
-            "ui.dialog",
-            json!({"name": "pgSave"}),
-            false,
-            false,
-        );
-        big(
-            ui,
-            app,
-            "update",
-            "Discard\nEdits",
-            "Load a PostGIS layer's rows again as they are in the database, dropping its edits.",
-            "ui.dialog",
-            json!({"name": "pgDiscard"}),
-            false,
-            false,
-        );
-    });
-}
-
 /// Keeps edit commands and transient vertex modes together, with deeper settings in Editing.
 fn edit_tab(app: &mut RustGisApp, ui: &mut Ui) {
     let editing = app.session.map().editing.clone();
@@ -2409,6 +2347,33 @@ fn edit_tab(app: &mut RustGisApp, ui: &mut Ui) {
             small(ui, app, "redo", "Redo", "Redo the change you undid.", "edit.redo", Value::Null, false);
             small(ui, app, "history", "Status", "Edits since the project was saved.", "ui.pane.editing", Value::Null, pane);
         });
+        // A layer loaded from PostGIS for editing saves its edits to its table, not the project
+        // (desktop only: the browser doesn't reach databases).
+        #[cfg(not(target_arch = "wasm32"))]
+        if app.session.map().layers.iter().any(|l| l.postgis.is_some()) {
+            col(ui, |ui| {
+                small(
+                    ui,
+                    app,
+                    "save",
+                    "Save to PostGIS…",
+                    "Save a PostGIS layer's edits to its table, unless rows changed there since.",
+                    "ui.dialog",
+                    json!({"name": "pgSave"}),
+                    false,
+                );
+                small(
+                    ui,
+                    app,
+                    "update",
+                    "Discard PostGIS Edits…",
+                    "Load a PostGIS layer's rows again as they are in the database, dropping its edits.",
+                    "ui.dialog",
+                    json!({"name": "pgDiscard"}),
+                    false,
+                );
+            });
+        }
         col(ui, |ui| {
             small(ui, app, "settings", "Settings", "Editing settings.", "ui.pane.editing", Value::Null, pane);
             small(

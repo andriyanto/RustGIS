@@ -942,7 +942,7 @@ mod tests {
         assert_eq!(d, Database::Postgres("host=db.example dbname=gis user=me".into()));
         assert_eq!(d.label(), "postgres:host=db.example dbname=gis user=me");
         assert_eq!(d.short(), "gis");
-        // Quoted values (as PostGIS › Connect writes them) are named without their quotes, whole.
+        // Quoted values (as `pg.connect` writes them) are named without their quotes, whole.
         assert_eq!(Database::Postgres("host='h' dbname='my gis' user='o\\'neil'".into()).short(), "my gis");
         assert_eq!(Database::Postgres("host='h' dbname='gis'".into()).short(), "gis");
         assert_eq!(password(Some(&d)).as_deref(), Some("pw1"));

@@ -26,6 +26,8 @@ pub struct Dialogs {
     pub c: String,
     pub d: String,
     pub e: String,
+    /// Add From Database: load the PostgreSQL table whole, to be edited and saved back.
+    pub edit: bool,
     pub mode: &'static str,
     pub flag: bool,
     pub error: Option<String>,
@@ -87,8 +89,8 @@ impl Dialogs {
             "addUrl" => "addUrl",
             "addService" => "addService",
             "addDatabase" => "addDatabase",
-            "pgConnect" => "pgConnect",
-            "pgAddLayer" => "pgAddLayer",
+            // Add From Database with Load for editing ticked.
+            "pgAddLayer" => "addDatabase",
             "pgSave" => "pgSave",
             "pgDiscard" => "pgDiscard",
             "chooseConnection" => "chooseConnection",
@@ -106,16 +108,13 @@ impl Dialogs {
         if name == "exportLayer" && active.is_some_and(|l| l.is_raster()) {
             return Err("Export Features needs a vector layer (Data › Export Raster writes a raster)".into());
         }
-        if name == "pgAddLayer" && s.postgis.is_none() {
-            return Err("connect to a PostGIS database first (PostGIS › Connect PostGIS)".into());
-        }
         if matches!(name, "pgSave" | "pgDiscard") && !s.map().layers.iter().any(|l| l.postgis.is_some()) {
-            return Err("the map has no layer from PostGIS (PostGIS › Add Layer)".into());
+            return Err("the map has no PostGIS layer loaded for editing (Home › Add Data › Database…, Load for editing)".into());
         }
         if name == "selectByAttributes" && s.map().layers.is_empty() {
             return Err("the map has no layers".into());
         }
-        *self = Dialogs { open: Some(name), mode: "new", reset_collapse: true, ..Dialogs::default() };
+        *self = Dialogs { open: Some(name), mode: "new", edit: which == "pgAddLayer", reset_collapse: true, ..Dialogs::default() };
         self.layer = active.or_else(|| s.map().layers.first()).map(|l| l.name.clone()).unwrap_or_default();
         match name {
             "defineProjection" => {
@@ -151,10 +150,6 @@ impl Dialogs {
             // A file name can't hold a folder separator, which a project name may.
             "saveProject" => self.text = format!("{}.rgis", s.project.name.replace(['/', '\\'], "-")),
             "exportLayer" => self.mode = "geojson",
-            "pgConnect" => {
-                (self.a, self.b) = ("localhost".into(), "5432".into());
-                self.mode = "prefer";
-            }
             // The active layer when it is from PostGIS, else the first that is.
             "pgSave" | "pgDiscard" => {
                 let pg = |l: &&rustgis_engine::map::Layer| l.postgis.is_some();
@@ -207,9 +202,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         "addUrl" => "Add Data From URL",
         "addService" => "Add From Service",
         "addDatabase" => "Add From Database",
-        "pgConnect" => "Connect PostGIS",
-        "pgAddLayer" => "Add PostGIS Layer",
-        "pgSave" => "Save PostGIS Edits",
+        "pgSave" => "Save to PostGIS",
         "pgDiscard" => "Discard PostGIS Edits",
         "newConnection" => "New Connection",
         "editConnection" => "Edit Connection",
@@ -352,8 +345,6 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
             "addUrl" => close = add_url(app, ui),
             "addService" => close = add_service(app, ui),
             "addDatabase" => close = add_database(app, ui),
-            "pgConnect" => close = pg_connect(app, ui),
-            "pgAddLayer" => close = pg_add_layer(app, ui),
             "pgSave" => close = pg_save(app, ui),
             "pgDiscard" => close = pg_discard(app, ui),
             "newConnection" | "editConnection" => close = crate::connectionui::dialog(app, ui),
@@ -1059,6 +1050,8 @@ fn add_database(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     let connections = crate::sourcespane::connections_snapshot(app);
     let typed = database(&app.dialogs.a);
     let current = crate::connectionui::picked(&connections, app.dialogs.connection.as_deref(), &typed);
+    #[cfg(not(target_arch = "wasm32"))]
+    let postgres = rustgis_engine::connections::database_kind(&typed) == Some("postgres");
     let mut pick = None;
     let mut list = false;
     egui::Grid::new("database").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
@@ -1102,7 +1095,45 @@ fn add_database(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
         ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text(tl!("of a geometry that doesn't say")).desired_width(280.0))
             .labelled_by(input_label.id);
         ui.end_row();
+        // A PostgreSQL table can instead be loaded whole, to be edited and saved back to it.
+        #[cfg(not(target_arch = "wasm32"))]
+        if postgres {
+            ui.label("");
+            ui.checkbox(&mut app.dialogs.edit, tl!("Load for editing")).on_hover_text(tl!(
+                "Load the table whole (up to 100,000 rows) so its edits can be saved back to it with Edit › Save to PostGIS. It needs a single-column integer primary key."
+            ));
+            ui.end_row();
+            if app.dialogs.edit {
+                let input_label = ui.label(tl!("Condition"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.dialogs.d)
+                        .hint_text(tl!("optional, such as population > 10000"))
+                        .desired_width(280.0),
+                )
+                .labelled_by(input_label.id);
+                ui.end_row();
+                let input_label = ui.label(tl!("Most rows"));
+                ui.add(egui::TextEdit::singleline(&mut app.dialogs.e).hint_text("100000").desired_width(280.0)).labelled_by(input_label.id);
+                ui.end_row();
+            }
+        }
     });
+    // The connection that layers loaded for editing save through, until RustGIS closes.
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(dsn) = app.session.postgis.clone() {
+        ui.horizontal(|ui| {
+            let short = rustgis_engine::data::source::duckdb::Database::Postgres(dsn).short();
+            ui.label(egui::RichText::new(crate::i18n::fmt("Connected for editing: {db}", &[("db", &short)])).weak());
+            if ui
+                .button(tl!("Disconnect"))
+                .on_hover_text(tl!("Close the connection that PostGIS layers loaded for editing save through."))
+                .clicked()
+                && let Err(e) = app.run("pg.disconnect", Value::Null)
+            {
+                app.dialogs.error = Some(e);
+            }
+        });
+    }
     // The tables listed and the one chosen belong to the address they were listed for.
     if app.dialogs.listed.as_deref().is_some_and(|l| l != database(&app.dialogs.a)) {
         app.dialogs.listed = None;
@@ -1149,7 +1180,11 @@ fn add_database(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
         }
     });
     buttons(app, ui, "Add", |app| {
-        let mut p = json!({"database": database(&app.dialogs.a), "password": app.dialogs.b});
+        let address = database(&app.dialogs.a);
+        if app.dialogs.edit && rustgis_engine::connections::database_kind(&address) == Some("postgres") {
+            return add_for_editing(app, address);
+        }
+        let mut p = json!({"database": address, "password": app.dialogs.b});
         for (key, v) in [("layer", &app.dialogs.c), ("crs", &app.dialogs.text)] {
             if !v.trim().is_empty() {
                 p[key] = json!(v.trim());
@@ -1164,147 +1199,29 @@ fn add_database(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     })
 }
 
-/// Connect PostGIS: a PostgreSQL database with PostGIS, by its parts or a whole connection
-/// string. The password is kept until RustGIS closes, never in the project.
-fn pg_connect(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
-    ui.label(egui::RichText::new(tl!("A PostgreSQL database with PostGIS. The password is kept until RustGIS closes, never in the project; without one, PGPASSWORD or the password file serve.")).weak());
-    egui::Grid::new("pg_connect").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
-        let d = &mut app.dialogs;
-        for (label, value, hint) in [
-            (tl!("Host"), &mut d.a, "localhost"),
-            (tl!("Port"), &mut d.b, "5432"),
-            (tl!("Database"), &mut d.c, "gis"),
-            (tl!("User"), &mut d.d, "postgres"),
-        ] {
-            ui.label(label);
-            ui.add(egui::TextEdit::singleline(value).hint_text(hint).desired_width(280.0));
-            ui.end_row();
-        }
-        ui.label(tl!("Password"));
-        ui.add(egui::TextEdit::singleline(&mut d.e).password(true).desired_width(280.0));
-        ui.end_row();
-        ui.label(tl!("Encryption"));
-        let modes: [(&'static str, &str); 4] = [
-            ("prefer", tl!("When the server offers it")),
-            ("require", tl!("Always, certificate not checked")),
-            ("verify-full", tl!("Always, certificate checked")),
-            ("disable", tl!("Off")),
-        ];
-        let shown = modes.iter().find(|(m, _)| *m == d.mode).map_or(modes[0].1, |(_, l)| *l);
-        egui::ComboBox::from_id_salt("pg_sslmode").selected_text(shown).width(270.0).show_ui(ui, |ui| {
-            for (m, l) in modes {
-                ui.selectable_value(&mut d.mode, m, l);
-            }
-        });
-        ui.end_row();
-        ui.label(tl!("Connection string"));
-        ui.add(
-            egui::TextEdit::singleline(&mut d.text)
-                .hint_text(tl!("instead: host=… dbname=… user=…, or postgresql://…"))
-                .desired_width(280.0),
-        );
-        ui.end_row();
-    });
-    buttons(app, ui, "Connect", |app| {
-        let p = {
-            let d = &app.dialogs;
-            let mut p = json!({"password": d.e});
-            if d.text.trim().is_empty() {
-                for (key, v) in [("host", &d.a), ("port", &d.b), ("database", &d.c), ("user", &d.d)] {
-                    if !v.trim().is_empty() {
-                        p[key] = json!(v.trim());
-                    }
-                }
-                p["sslmode"] = json!(d.mode);
-            } else {
-                p["connection"] = json!(d.text.trim());
-            }
-            p
-        };
-        let r = app.run("pg.connect", p).map(|_| ());
-        // The password is the session's to keep, not the dialog's.
-        if r.is_ok() {
-            app.dialogs.e.clear();
-        }
-        r
-    })
-}
-
-/// Lists the connected database's tables into Add PostGIS Layer's choices.
-fn list_pg_tables(app: &mut RustGisApp) {
-    match app.run("pg.tables", json!({})) {
-        Ok(v) => {
-            app.dialogs.list =
-                v["tables"].as_array().into_iter().flatten().filter_map(|t| t["name"].as_str().map(str::to_string)).collect();
-            if app.dialogs.c.is_empty()
-                && let Some(first) = app.dialogs.list.first()
-            {
-                app.dialogs.c = first.clone();
-            }
-            app.dialogs.error = None;
-            app.dialogs.info = Some(crate::i18n::fmt("{n} tables with geometry", &[("n", &app.dialogs.list.len().to_string())]));
-        }
-        Err(e) => {
-            app.dialogs.info = None;
-            app.dialogs.error = Some(e);
+/// Add From Database with Load for editing: connects to the PostgreSQL database for editing
+/// (`pg.connect`) and loads the chosen table whole (`pg.addLayer`).
+fn add_for_editing(app: &mut RustGisApp, address: String) -> Result<(), String> {
+    let d = &app.dialogs;
+    let table = d.c.trim();
+    if table.is_empty() {
+        return Err(tl!("Choose a table to load for editing").to_string());
+    }
+    let mut p = json!({"table": table});
+    for (key, v) in [("where", &d.d), ("crs", &d.text)] {
+        if !v.trim().is_empty() {
+            p[key] = json!(v.trim());
         }
     }
-}
-
-/// Add PostGIS Layer: a table of the connected database, loaded whole to be edited.
-fn pg_add_layer(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
-    // The tables are listed once, when the dialog opens.
-    if !app.dialogs.flag {
-        app.dialogs.flag = true;
-        list_pg_tables(app);
+    if !d.e.trim().is_empty() {
+        let n: u64 = d.e.trim().replace([',', '.'], "").parse().map_err(|_| tl!("Most rows: a whole number").to_string())?;
+        p["limit"] = json!(n);
     }
-    ui.label(egui::RichText::new(tl!("A table of the connected database, loaded whole so you can edit it (up to 100,000 rows a layer). Its integer primary key tells the rows apart.")).weak());
-    let mut refresh = false;
-    egui::Grid::new("pg_add_layer").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
-        ui.label(tl!("Table"));
-        ui.horizontal(|ui| {
-            let shown = if app.dialogs.c.is_empty() { tl!("Choose a table").to_string() } else { app.dialogs.c.clone() };
-            egui::ComboBox::from_id_salt("pg_table").selected_text(shown).width(200.0).show_ui(ui, |ui| {
-                for t in app.dialogs.list.clone() {
-                    ui.selectable_value(&mut app.dialogs.c, t.clone(), t);
-                }
-            });
-            refresh = ui.button(tl!("Refresh")).clicked();
-        });
-        ui.end_row();
-        ui.label(tl!("Condition"));
-        ui.add(
-            egui::TextEdit::singleline(&mut app.dialogs.text).hint_text(tl!("optional, such as population > 10000")).desired_width(280.0),
-        );
-        ui.end_row();
-        ui.label(tl!("Most rows"));
-        ui.add(egui::TextEdit::singleline(&mut app.dialogs.b).hint_text("100000").desired_width(280.0));
-        ui.end_row();
-        ui.label(tl!("Layer name"));
-        ui.add(egui::TextEdit::singleline(&mut app.dialogs.a).hint_text(tl!("the table's")).desired_width(280.0));
-        ui.end_row();
-    });
-    if refresh {
-        list_pg_tables(app);
-    }
-    buttons(app, ui, "Add", |app| {
-        let d = &app.dialogs;
-        if d.c.trim().is_empty() {
-            return Err(tl!("Choose a table").to_string());
-        }
-        let mut p = json!({"table": d.c.trim()});
-        if !d.text.trim().is_empty() {
-            p["where"] = json!(d.text.trim());
-        }
-        if !d.a.trim().is_empty() {
-            p["name"] = json!(d.a.trim());
-        }
-        if !d.b.trim().is_empty() {
-            let n: u64 = d.b.trim().replace([',', '.'], "").parse().map_err(|_| tl!("Most rows: a whole number").to_string())?;
-            p["limit"] = json!(n);
-        }
-        app.run("pg.addLayer", p).map(|_| ())
-    })
+    let connect = json!({"connection": address, "password": d.b});
+    app.run("pg.connect", connect)?;
+    // The password is the session's to keep, not the dialog's.
+    app.dialogs.b.clear();
+    app.run("pg.addLayer", p).map(|_| ())
 }
 
 /// A PostGIS layer to save or discard the edits of, and what changed in it: its table and how

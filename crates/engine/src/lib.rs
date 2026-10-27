@@ -535,8 +535,8 @@ pub struct Session {
     /// Edits per layer id since the project was last saved (Edit › Status). A failed command's
     /// are rolled back; undo doesn't subtract them, since they count edits made, not the net change.
     pub edit_counts: std::collections::HashMap<u32, cmd::design::EditCounts>,
-    /// The PostGIS database the PostGIS tab works with (`pg.connect`): its connection, never
-    /// with its password. Kept for the session, not in the project.
+    /// The PostGIS database that layers loaded for editing work with (`pg.connect`): its
+    /// connection, never with its password. Kept for the session, not in the project.
     pub postgis: Option<String>,
     /// The PostGIS layers' row versions that `pg.saveEdits` saved over: a layer back on one
     /// (undone, or restored by a failed command, past a save) would write its edits again.
