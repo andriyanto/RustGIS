@@ -155,8 +155,23 @@ pub struct PostgisEdit {
 /// How a loaded row is told apart from the same row edited: a hash of its geometry and
 /// attributes (FNV-1a over their JSON, the same in every build).
 pub fn row_hash(f: &rustgis_data::Feature) -> u64 {
-    let bytes = serde_json::to_vec(&(&f.geometry, &f.attrs)).unwrap_or_default();
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
+    /// FNV-1a over the bytes written to it, kept as they come (no buffer per row).
+    struct Fnv(u64);
+    impl std::io::Write for Fnv {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = buf.iter().fold(self.0, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut h = Fnv(0xcbf2_9ce4_8422_2325);
+    // As before, a row that can't be written hashes as no bytes.
+    if serde_json::to_writer(&mut h, &(&f.geometry, &f.attrs)).is_err() {
+        return 0xcbf2_9ce4_8422_2325;
+    }
+    h.0
 }
 
 /// A loaded row: its version (PostgreSQL's `xmin`) and [`row_hash`] as read.
@@ -1054,6 +1069,20 @@ mod tests {
         // A copy (an undo snapshot) shares the versions.
         let copy = edit.clone();
         assert!(std::sync::Arc::ptr_eq(&copy.versions.0, &edit.versions.0));
+    }
+
+    /// The hash is FNV-1a over the row's JSON, the same as the projects saved with it hold.
+    #[test]
+    fn row_hashes_are_fnv_over_the_rows_json() {
+        use rustgis_data::{Coord, Feature, Geometry, Value};
+        let f = Feature {
+            id: 3,
+            geometry: Some(Geometry::Point(Coord { x: 1.5, y: -2.0 })),
+            attrs: vec![Value::Text("Main St".into()), Value::Int(4), Value::Null],
+        };
+        let bytes = serde_json::to_vec(&(&f.geometry, &f.attrs)).unwrap();
+        let fnv = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3));
+        assert_eq!(super::row_hash(&f), fnv);
     }
 
     #[test]
