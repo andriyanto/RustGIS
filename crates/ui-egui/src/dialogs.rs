@@ -18,6 +18,8 @@ pub struct Dialogs {
     pub repair: Option<crate::repairsource::Form>,
     pub open: Option<&'static str>,
     pub layer: String,
+    /// The PostGIS layer whose edits were last counted (Save or Discard PostGIS Edits).
+    pub counted: String,
     pub text: String,
     pub a: String,
     pub b: String,
@@ -1256,7 +1258,7 @@ fn pg_add_layer(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
         app.dialogs.flag = true;
         list_pg_tables(app);
     }
-    ui.label(egui::RichText::new(tl!("A table of the connected database, loaded whole so you can edit it (up to 100,000 rows). Its integer primary key tells the rows apart.")).weak());
+    ui.label(egui::RichText::new(tl!("A table of the connected database, loaded whole so you can edit it (up to 100,000 rows a layer). Its integer primary key tells the rows apart.")).weak());
     let mut refresh = false;
     egui::Grid::new("pg_add_layer").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
         ui.label(tl!("Table"));
@@ -1309,8 +1311,8 @@ fn pg_add_layer(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
 /// many rows are new, changed and deleted (counted again when another layer is chosen).
 fn pg_layer_edits(app: &mut RustGisApp, ui: &mut egui::Ui) {
     let layers: Vec<String> = app.session.map().layers.iter().filter(|l| l.postgis.is_some()).map(|l| l.name.clone()).collect();
-    if app.dialogs.text != app.dialogs.layer {
-        app.dialogs.text = app.dialogs.layer.clone();
+    if app.dialogs.counted != app.dialogs.layer {
+        app.dialogs.counted = app.dialogs.layer.clone();
         app.dialogs.list = match app.run("pg.pendingEdits", json!({"layer": app.dialogs.layer})) {
             Ok(v) => vec![
                 v["table"].as_str().unwrap_or_default().to_string(),
@@ -1318,7 +1320,10 @@ fn pg_layer_edits(app: &mut RustGisApp, ui: &mut egui::Ui) {
                 v["updates"].to_string(),
                 v["deletes"].to_string(),
             ],
-            Err(_) => Vec::new(),
+            Err(e) => {
+                app.dialogs.error = Some(e);
+                Vec::new()
+            }
         };
     }
     egui::Grid::new("pg_edits").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
@@ -1351,7 +1356,7 @@ fn pg_save(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     buttons(app, ui, "Save", |app| {
         let r = app.run("pg.saveEdits", json!({"layer": app.dialogs.layer})).map(|_| ());
         // Counted again, whatever happened.
-        app.dialogs.text.clear();
+        app.dialogs.counted.clear();
         r
     })
 }

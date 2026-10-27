@@ -43,7 +43,7 @@ pub fn commands() -> Vec<C> {
         C::new("pg.discardEdits", "Discard PostGIS Edits", "PostGIS › Edit", discard_edits)
             .params(r#"{"layer"?: "a layer added with pg.addLayer (default: the active one)"}"#),
         C::new("pg.addLayer", "Add PostGIS Layer", "PostGIS › Layer", add_layer).when(need_connection).params(
-            r#"{"table": "table, schema.table, or table:column for one of several geometry columns", "where"?: "an SQL condition on the table's columns", "limit"?: "the most rows (default and most: 100000)", "name"?: string, "crs"?: "EPSG:… of a geometry that doesn't say"}"#,
+            r#"{"table": "table, schema.table, or table:column for one of several geometry columns", "where"?: "an SQL condition on the table's columns", "limit"?: "the most rows of each layer (default and most: 100000)", "name"?: string, "crs"?: "EPSG:… of a geometry that doesn't say"}"#,
         ),
     ]
 }

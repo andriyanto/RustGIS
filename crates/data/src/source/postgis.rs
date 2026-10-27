@@ -28,7 +28,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Tables with an estimated row count above this aren't counted exactly when opened.
 const EXACT_COUNT_BELOW: f64 = 2_000_000.0;
 
-/// The most rows a table loaded to be edited holds ([`PostgisSource::read_editable`]).
+/// The most rows a layer loaded to be edited holds ([`PostgisSource::read_editable`]); a table of
+/// several geometry types loads each as its own layer.
 pub const MAX_EDITABLE: usize = 100_000;
 
 /// How long counting or measuring a table when it opens may take (one never analyzed has no
@@ -181,6 +182,28 @@ impl Conn {
             }
         }
         Err(DataError::Format("not connected".into()))
+    }
+
+    /// Runs `f` once, without the reconnect of [`Conn::with`]: a write that failed when the connection
+    /// dropped may have been committed, so it must not run again on a new one.
+    fn once<T>(&self, f: impl FnOnce(&mut postgres::Client) -> std::result::Result<T, postgres::Error>) -> Result<T> {
+        let mut guard = self.client.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.as_ref().is_none_or(postgres::Client::is_closed) {
+            *guard = Some(open_client(&self.config, &self.tls, self.writable)?);
+        }
+        let client = guard.as_mut().ok_or_else(|| DataError::Format("not connected".into()))?;
+        let r = f(client);
+        let dropped = client.is_closed();
+        if dropped {
+            *guard = None;
+        }
+        match r {
+            Ok(v) => Ok(v),
+            Err(_) if dropped => {
+                Err(DataError::Format("the connection dropped during the save: it may have been saved, so check the table".into()))
+            }
+            Err(e) => Err(redacted(&self.config, err(e))),
+        }
     }
 
     /// Runs `f` in a read-only transaction seeing one snapshot of the database (`REPEATABLE
@@ -1161,10 +1184,10 @@ impl PostgisSource {
         let has_m = kind.ends_with('M') && !kind.ends_with("ZM") && dims == 3;
         let base = kind.trim_end_matches(['Z', 'M']);
         // RustGIS holds lines and polygons as multi-part: one part goes in a single-type column as
-        // that type, more fail there as the server says.
+        // that type, more fail there as the server says. A column of any type keeps what it holds.
         if base.starts_with("MULTI") {
             e = format!("ST_Multi({e})");
-        } else if base != "GEOMETRYCOLLECTION" {
+        } else if base != "GEOMETRYCOLLECTION" && base != "GEOMETRY" {
             e = format!("(SELECT CASE WHEN ST_NumGeometries(g) = 1 THEN ST_GeometryN(g, 1) ELSE g END FROM (SELECT {e} AS g) s)");
         }
         e = match dims {
@@ -1197,7 +1220,7 @@ impl PostgisSource {
         let rel = format!("{}.{}", ident(&self.table.schema), ident(&self.table.name));
         let column = ident(&self.table.column);
         let key_field = fields.iter().position(|f| f.name == key);
-        self.conn.with(|c| {
+        self.conn.once(|c| {
             let mut t = c.build_transaction().isolation_level(postgres::IsolationLevel::ReadCommitted).start()?;
             // The table's columns: their types, whether they are computed, and whether they have
             // a default.
@@ -1443,6 +1466,43 @@ mod tests {
         assert_eq!(family_of("CURVEPOLYGON"), Some(Family::Polygons));
         assert_eq!(family_of("GEOMETRY"), None);
         assert_eq!(family_of("GEOMETRYCOLLECTION"), None);
+    }
+
+    #[test]
+    fn unconstrained_geometry_keeps_its_parts() {
+        let source = |kind: &str| PostgisSource {
+            info: SourceInfo {
+                name: "t".into(),
+                format: "PostGIS",
+                geometry_type: GeometryType::Polygon,
+                fields: Vec::new(),
+                extent: Extent::EMPTY,
+                count: None,
+                crs: "EPSG:4326".into(),
+                indexed: false,
+                notes: Vec::new(),
+            },
+            conn: Arc::new(Conn { config: postgres::Config::new(), tls: Tls::Disable, writable: false, client: Mutex::new(None) }),
+            table: Table {
+                schema: "public".into(),
+                name: "t".into(),
+                column: "geom".into(),
+                srid: 0,
+                kind: kind.into(),
+                geography: false,
+                several: false,
+            },
+            family: None,
+            srid: 0,
+            raw_srid: 0,
+            native: String::new(),
+            key: None,
+            select: Vec::new(),
+            reproject: None,
+        };
+        // A typed column takes one part as its type; an unconstrained one keeps the geometry as it is.
+        assert!(source("POLYGON").geometry_in(1, 2).contains("ST_NumGeometries"));
+        assert!(!source("GEOMETRY").geometry_in(1, 2).contains("ST_NumGeometries"));
     }
 
     #[test]

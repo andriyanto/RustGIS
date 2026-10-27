@@ -227,7 +227,8 @@ at a time, and loads its tables to be edited.
   **Disconnect** (`pg.disconnect`) or close RustGIS. It isn't saved with the project, and neither
   is the password. Without a password, `PGPASSWORD` or libpq's password file serve.
 - **Add Layer** (`pg.addLayer`) lists the database's tables with a geometry or geography column
-  (`pg.tables`) and loads the one you choose whole, up to 100,000 rows, in the order of its key.
+  (`pg.tables`) and loads the one you choose whole, up to 100,000 rows a layer, in the order of its key.
+  A table whose geometries are of several types loads each type as its own layer, each up to that many.
   A **condition** (an SQL expression on its columns, such as `population > 10000`) loads only the
   rows it keeps. The layer is an ordinary layer in memory, so every editing tool works on it.
 
@@ -250,7 +251,7 @@ aren't saved, and the message names them. The layer says when the database's use
 update or delete the table's rows; saving is then refused.
 
 ```sh
-rustgis-cli run --cmd 'pg.connect={"host":"localhost","database":"gis","user":"postgres","password":"…"}' \
+rustgis-cli run --cmd 'pg.connect={"host":"localhost","database":"gis","user":"postgres"}' \
   --cmd 'pg.addLayer={"table":"public.roads","where":"lanes > 2","name":"Roads"}' \
   --cmd 'edit.enable={"on":true}' \
   --cmd 'edit.setValue={"layer":"Roads","row":0,"field":"name","value":"Main St"}' \
