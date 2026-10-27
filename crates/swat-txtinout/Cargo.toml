@@ -1,0 +1,12 @@
+[package]
+name = "rustgis-swat-txtinout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RustGIS L2: SWAT+ TxtInOut files read and written losslessly, and their structure (tables, nested records) for editing"
+
+[lints]
+workspace = true
+
+[dependencies]
+rustgis-swat-model = { workspace = true }

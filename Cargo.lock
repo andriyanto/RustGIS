@@ -4649,6 +4649,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgis-swat-model"
+version = "0.3.0"
+
+[[package]]
+name = "rustgis-swat-txtinout"
+version = "0.3.0"
+dependencies = [
+ "rustgis-swat-model",
+]
+
+[[package]]
 name = "rustgis-tiles"
 version = "0.3.0"
 dependencies = [
