@@ -1083,6 +1083,8 @@ mod tests {
         let bytes = serde_json::to_vec(&(&f.geometry, &f.attrs)).unwrap();
         let fnv = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3));
         assert_eq!(super::row_hash(&f), fnv);
+        // And the value itself: a change in how rows are written would show every saved row edited.
+        assert_eq!(super::row_hash(&f), 8_547_063_913_914_077_080);
     }
 
     #[test]
