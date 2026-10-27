@@ -160,7 +160,8 @@ pub fn header(app: &mut RustGisApp, ui: &mut Ui) {
                 // Command search on the right: full width when there is room, a round icon button
                 // otherwise. It never reaches into the toolbar.
                 let label = tl!("Command Search");
-                let hint = if cfg!(target_os = "macos") { "⌘K" } else { "Ctrl+K" };
+                // As egui reads the keys: ⌘ on a Mac, the browser's too (from its user agent).
+                let hint = if ui.ctx().os().is_mac() { "⌘K" } else { "Ctrl+K" };
                 let right = full.max.x;
                 let room = right - qat_end;
                 let full_w = (text_w(ui, label, regular(12.0)) + text_w(ui, hint, regular(11.0)) + 70.0).clamp(200.0, 260.0);
@@ -202,7 +203,7 @@ pub fn header(app: &mut RustGisApp, ui: &mut Ui) {
                 }
                 // Title: centred when it fits, otherwise in the free gap; the map name and then the
                 // project name drop out when there is no room.
-                let title = format!("{}{}", app.session.project.name, if app.session.dirty { " •" } else { "" });
+                let title = format!("{}{}", app.session.project.name, if app.session.dirty() { " •" } else { "" });
                 let sub = format!("  —  {}", app.session.map().name);
                 let (title_w, sub_w) = (text_w(ui, &title, semibold(12.5)), text_w(ui, &sub, regular(12.0)));
                 let (a, b) = (qat_end + 8.0, sr.min.x - 16.0);
@@ -235,7 +236,7 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
                 // Scale: typed (1:12,345, 12345, 25k, …) and set with Enter, or picked from the
                 // list. Esc, or clicking away, leaves the map's scale as it was.
                 let scale = app.session.scale();
-                let shown = format!("1:{}", crate::ribbon::fmt_thousands(scale.round()));
+                let shown = rustgis_engine::map::graphics::scale_ratio(scale);
                 let mut text = app.ui.scale_text.take().unwrap_or_else(|| shown.clone());
                 let mut edit = egui::TextEdit::singleline(&mut text).id_salt("status_scale").desired_width(96.0).show(ui);
                 // Clicking in selects the scale, so typing replaces it.
@@ -436,10 +437,23 @@ fn sep(ui: &mut Ui, t: &Tokens) {
 
 /// A map scale typed into the status bar, as its denominator: `1:12,345`, `1/12345`, `12345`,
 /// `12 345`, `12'345`, `12.345` (dots grouping thousands, as many languages write it), `25k` or
-/// `2.5m`. None unless it's a plain number of at least 1: no exponents, and commas or
-/// apostrophes only between groups of three digits (`1:2,5m` is a typo, not 25 million).
+/// `2.5m`, or larger than life as `2:1` (#902). None unless it's a plain number of at least 1: no
+/// exponents, and commas or apostrophes only between groups of three digits (`1:2,5m` is a typo,
+/// not 25 million).
 fn parse_scale(text: &str) -> Option<f64> {
     let t: String = text.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
+    if let Some(up) = t.strip_suffix(":1").or_else(|| t.strip_suffix("/1")).filter(|u| !u.contains([':', '/'])) {
+        // Times life size, as the status bar writes it: a dot is a decimal point (`1.5:1`), commas
+        // group thousands (`2,000:1`), and there are no `k`/`m` suffixes.
+        let times = if up.contains('.') {
+            up.bytes().all(|b| b.is_ascii_digit() || b == b'.').then(|| up.parse::<f64>().ok()).flatten()?
+        } else if up.ends_with(['k', 'm']) {
+            return None;
+        } else {
+            parse_scale(up)?
+        };
+        return (times.is_finite() && times > 0.0).then(|| 1.0 / times);
+    }
     let chars: Vec<char> = t.chars().collect();
     for (i, c) in chars.iter().enumerate() {
         if matches!(c, ',' | '\'' | '’') {
@@ -472,6 +486,12 @@ fn parse_scale(text: &str) -> Option<f64> {
 
 /// Global keyboard shortcuts.
 pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
+    // Behind a dialog (Save changes?, Recover unsaved work?, Command Search…) the keys are the
+    // dialog's: Escape answers it rather than switching tools, and Ctrl+N can't start what it
+    // asks about.
+    if ctx.memory(|m| m.top_modal_layer()).is_some() {
+        return;
+    }
     crate::modelbuilder::shortcuts(app, ctx);
     // The search box was typed in until egui took its focus away on Escape: that Escape clears
     // the box, not the tool.
@@ -534,10 +554,6 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
         if id == "tool.set" {
             app.map.cancel_sketch();
             app.layout.cancel_tool();
-            if app.ui.command_search.is_some() {
-                app.ui.command_search = None;
-                continue;
-            }
         }
         // An arrow key nudged the selected layout element (unless it's locked): a held key, or
         // taps close together, are one step to undo.
@@ -612,25 +628,24 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
             }
             continue;
         }
-        let _ = app.run(id, p);
+        let _ = app.run_by_user(id, p);
     }
 }
 
 /// The `ui.*` commands Command Search lists: (id, label, ribbon location).
 pub(crate) const UI_COMMANDS: &[(&str, &str, &str)] = &[
     ("ui.addData", "Add Data…", "Home › Add"),
-    ("ui.addDelimited", "Add Delimited Text…", "Home › Add"),
-    ("ui.addUrl", "Add Data From URL…", "Home › Add"),
-    ("ui.addZarr", "Add Zarr Variable…", "Home › Add"),
-    ("ui.addService", "Add From Service…", "Home › Add"),
-    ("ui.openSources", "Connections…", "Home › Add Data"),
-    ("ui.searchOpenData", "Search Open Data…", "Home › Web Data"),
-    ("ui.stac.planet", "Planet Open Data…", "Home › Web Data"),
-    ("ui.stac.portolan", "Portolan…", "Home › Web Data"),
-    ("ui.stac.sentinel2", "Sentinel-2 Explorer…", "Home › Web Data"),
-    ("ui.stac.vantor", "Vantor…", "Home › Web Data"),
-    ("ui.stac.usgsLidar", "USGS LiDAR…", "Home › Web Data › United States"),
-    ("ui.pane.sources", "Data Sources Pane", "View › Windows"),
+    ("ui.addDelimited", "Add Delimited Text…", "Home › Add › Add Data"),
+    ("ui.addUrl", "Add Data From URL…", "Home › Add › Add Data"),
+    ("ui.addZarr", "Add Zarr Variable…", "Home › Add › Add Data"),
+    ("ui.addService", "Add From Service…", "Home › Add › Add Data"),
+    ("ui.searchOpenData", "Search Open Data…", "Home › Add › Web Data"),
+    ("ui.stac.planet", "Planet Open Data…", "Home › Add › Web Data"),
+    ("ui.stac.portolan", "Portolan…", "Home › Add › Web Data"),
+    ("ui.stac.sentinel2", "Sentinel-2 Explorer…", "Home › Add › Web Data"),
+    ("ui.stac.vantor", "Vantor…", "Home › Add › Web Data"),
+    ("ui.stac.usgsLidar", "USGS LiDAR…", "Home › Add › Web Data › United States"),
+    ("ui.pane.sources", "Data Sources", "Home › Add"),
     ("ui.plugins", "Plugin Manager…", "Plugins"),
     ("ui.mcpRelay", "MCP Relay", "Help › Help"),
     ("ui.pane.geoprocessing", "Tools Pane", "View › Windows"),
@@ -644,6 +659,7 @@ pub(crate) const UI_COMMANDS: &[(&str, &str, &str)] = &[
     ("ui.map.gpu", "Toggle GPU Rendering", "View"),
     ("ui.importShapefile", "Import Shapefile with Projection…", "Home › Add"),
     ("ui.measurementUnits", "Toggle Imperial Measurements", "Home › Inspect › Measure"),
+    ("ui.moveSharedVertices", "Shared Vertices", "Edit › Features"),
     ("ui.exportMap", "Export Map…", "Publish › Output"),
     ("ui.checkUpdate", "Check for Updates…", "Help › Help"),
 ];
@@ -676,10 +692,12 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "map.package" => SaveItem("mapPackage"),
         "map.rename" => Dialog("renameMap"),
         "map.goToXY" => Dialog("goToXY"),
+        "map.findPlace" => Dialog("findPlace"),
         "map.camera" | "map.setScale" => Dialog("camera"),
         "map.basemap" => Dialog("basemap"),
         "map.body" => Dialog("body"),
         "map.addTiles" => Dialog("addTiles"),
+        "map.repairTiles" => Dialog("repairTiles"),
         "bookmark.add" => Dialog("bookmark"),
         "bookmark.import" => OpenItem("bookmarks"),
         "bookmark.save" => SaveItem("bookmarks"),
@@ -687,6 +705,7 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "layer.addUrl" => Command("ui.addUrl"),
         "service.add" | "service.import" => Command("ui.addService"),
         "connection.new" => Command("ui.connection"),
+        "connection.resolveS3" => Command("ui.s3Connections"),
         "layer.addSql" => Pane(RightPane::Sql),
         "layer.addDatabase" => Dialog("addDatabase"),
         "layer.addZarr" => Command("ui.addZarr"),
@@ -698,6 +717,7 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "layer.geocode" => Dialog("geocode"),
         "layer.rename" => Dialog("renameLayer"),
         "layer.defineProjection" => Dialog("defineProjection"),
+        "layer.repairSource" => Dialog("repairSource"),
         "ui.importShapefile" => Dialog("addShapefile"),
         "layer.definitionQuery" => Dialog("definitionQuery"),
         "layer.symbology" | "raster.symbology" | "layer.color" | "layer.outline" | "layer.lineStrokes" | "layer.ramp" => {
@@ -713,6 +733,8 @@ fn search_action(id: &str) -> Option<SearchAction> {
         }
         "style.add" => OpenItem("styles"),
         "style.import" => OpenItem("importStyles"),
+        "style.importQgis" => OpenItem("qgisStyle"),
+        "project.importQgis" => OpenItem("qgisProject"),
         "style.save" => SaveItem("styles"),
         "ramp.add" => OpenItem("ramps"),
         "ramp.save" => SaveItem("ramps"),
@@ -783,6 +805,18 @@ fn search_action(id: &str) -> Option<SearchAction> {
     })
 }
 
+/// Desktop-only interactive actions stay visible but disabled in web Command Search.
+fn search_platform_disabled(id: &str, web: bool) -> Option<&'static str> {
+    if !web {
+        return None;
+    }
+    match id {
+        "project.addFolder" => Some("folder connections need the desktop app"),
+        "layer.addDatabase" => Some("databases are read through DuckDB, a program the browser can't run"),
+        _ => None,
+    }
+}
+
 /// Availability of the interactive entry point, not the parameterized engine operation.
 fn search_disabled(app: &RustGisApp, id: &str) -> Option<&'static str> {
     if id.starts_with("gp:") || id.starts_with("panel:") || id.starts_with("pane:") {
@@ -791,9 +825,8 @@ fn search_disabled(app: &RustGisApp, id: &str) -> Option<&'static str> {
     if matches!(search_action(id), Some(SearchAction::Workflow(_))) {
         return None; // The workflow lets the user choose its inputs, including the layer.
     }
-    // The ribbon hides the Database dialog in the browser for the same reason.
-    if id == "layer.addDatabase" && cfg!(target_arch = "wasm32") {
-        return Some("databases are read through DuckDB, a program the browser can't run");
+    if let Some(reason) = search_platform_disabled(id, cfg!(target_arch = "wasm32")) {
+        return Some(reason);
     }
     why_disabled(app, id).or_else(|| {
         (search_action(id).is_none() && app.session.registry.get(id).is_some_and(rustgis_engine::CommandSpec::needs_input))
@@ -933,7 +966,7 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
                 let on = why.is_none();
                 let mut b = egui::Button::new(egui::RichText::new(label).size(13.0)).frame(false).min_size(vec2(row_w, 26.0));
                 // The command's shortcut after its location.
-                let keys = if id.contains(':') { String::new() } else { crate::keymap::shortcut_text(app, id, &Value::Null) };
+                let keys = if id.contains(':') { String::new() } else { crate::keymap::shortcut_text(ui.ctx(), app, id, &Value::Null) };
                 let right = match (show_loc, keys.is_empty()) {
                     (true, false) => format!("{loc}   {keys}"),
                     (true, true) => loc.clone(),
@@ -972,7 +1005,7 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
             let _ = app.run("ui.pane.workflows", json!({"section": section}));
         } else if let Some(action) = search_action(&id) {
             let _ = match action {
-                SearchAction::Command(command) => app.run(command, Value::Null),
+                SearchAction::Command(command) => app.run_by_user(command, Value::Null),
                 SearchAction::Dialog(name) => app.run("ui.dialog", json!({"name": name})),
                 SearchAction::OpenItem(kind) => app.run("ui.openItem", json!({"kind": kind})),
                 SearchAction::SaveItem(kind) => app.run("ui.saveItem", json!({"kind": kind})),
@@ -983,7 +1016,7 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
                 }
             };
         } else {
-            let _ = app.run(&id, Value::Null);
+            let _ = app.run_by_user(&id, Value::Null);
         }
     }
     if keep {
@@ -1066,6 +1099,7 @@ pub fn about(app: &mut RustGisApp, ctx: &egui::Context) {
             .pivot(Align2::CENTER_CENTER)
             .default_pos(ctx.content_rect().center())
             .show(ctx, |ui| {
+                let mac = ctx.os().is_mac();
                 egui::Grid::new("keys").striped(true).spacing(vec2(24.0, 6.0)).show(ui, |ui| {
                     // The keys that run now, from the keymap.
                     let rows: Vec<(String, String)> = app
@@ -1074,7 +1108,7 @@ pub fn about(app: &mut RustGisApp, ctx: &egui::Context) {
                         .grouped()
                         .into_iter()
                         .map(|(command, params, keys)| {
-                            let keys: Vec<String> = keys.into_iter().map(crate::keymap::Chord::text).collect();
+                            let keys: Vec<String> = keys.into_iter().map(|c| c.text(mac)).collect();
                             (keys.join(" / "), crate::keymap::label(app, command, params))
                         })
                         .collect();
@@ -1087,7 +1121,7 @@ pub fn about(app: &mut RustGisApp, ctx: &egui::Context) {
                     let clipboard: Vec<String> = crate::keymap::CLIPBOARD
                         .iter()
                         .filter_map(|(keys, _)| crate::keymap::Chord::parse(keys))
-                        .map(|c| c.text())
+                        .map(|c| c.text(mac))
                         .collect();
                     let clipboard = clipboard.join(" / ");
                     for (k, d) in [
@@ -1161,6 +1195,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn desktop_only_search_actions_are_disabled_only_on_the_web() {
+        for id in ["project.addFolder", "layer.addDatabase"] {
+            assert!(search_platform_disabled(id, true).is_some(), "{id} must explain its web restriction");
+            assert_eq!(search_platform_disabled(id, false), None, "{id} stays available on desktop");
+        }
+        assert_eq!(search_platform_disabled("ui.addData", true), None, "browser file uploads remain available");
+    }
+
+    #[test]
     fn typed_scales_read_as_people_write_them() {
         for (text, want) in [
             ("1:12,345", 12_345.0),
@@ -1179,12 +1222,21 @@ mod tests {
             ("2.5M", 2_500_000.0),
             ("1:1", 1.0),
             ("  7500  ", 7_500.0),
+            // Larger than life (#902).
+            ("2:1", 0.5),
+            ("2.5:1", 0.4),
+            ("10 : 1", 0.1),
+            ("4/1", 0.25),
+            // A dot is a decimal point there, as the status bar shows it (#923).
+            ("1.234:1", 1.0 / 1.234),
+            ("1.5:1", 1.0 / 1.5),
+            ("2,000:1", 1.0 / 2000.0),
         ] {
             assert_eq!(parse_scale(text), Some(want), "{text}");
         }
         for text in [
             "", "1:", "abc", "0", "1:0", "-5000", "1:-5000", "inf", "NaN", "12.34.5", "k", "1e5", "1:5e300", "0.5", "1:2,5m", "1:12,34",
-            ",345", "12,3456",
+            ",345", "12,3456", "0:1", "1:2:1", ":1", "25k:1", "1.2.3:1", ".:1",
         ] {
             assert_eq!(parse_scale(text), None, "{text}");
         }
@@ -1197,7 +1249,7 @@ mod tests {
         use egui_kittest::kittest::Queryable;
         let mut app = RustGisApp::with_sample();
         app.run("labels.style", serde_json::json!({"layer": "Cities", "size": 20})).unwrap();
-        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).with_size(vec2(500.0, 700.0)).build_ui_state(
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(500.0, 700.0)).build_ui_state(
             |ui, app: &mut RustGisApp| {
                 let ctx = ui.ctx().clone();
                 shortcuts(app, &ctx);
@@ -1268,23 +1320,6 @@ mod tests {
             assert!(l.left_pad.is_finite() && (10.0..=120.0).contains(&l.left_pad), "{l:?}");
             assert!(l.height.is_finite() && (34.0..=80.0).contains(&l.height), "{l:?}");
         }
-    }
-
-    #[test]
-    fn connections_entry_opens_sources_without_ever_closing_it() {
-        let mut app = RustGisApp::with_sample();
-        app.run("ui.pane.sources", serde_json::Value::Null).unwrap();
-        app.run("ui.pane.sources", serde_json::Value::Null).unwrap();
-        assert_eq!(app.ui.left, None, "the View entry still toggles");
-        app.run("ui.openSources", serde_json::Value::Null).unwrap();
-        assert_eq!(app.ui.left, Some(crate::LeftPane::Sources), "opens from closed");
-        app.run("ui.openSources", serde_json::Value::Null).unwrap();
-        assert_eq!(app.ui.left, Some(crate::LeftPane::Sources), "idempotent when already open");
-        app.ui.left = Some(crate::LeftPane::Catalog);
-        app.run("ui.openSources", serde_json::Value::Null).unwrap();
-        assert_eq!(app.ui.left, Some(crate::LeftPane::Sources), "replaces another left pane");
-        app.run("ui.pane.sources", serde_json::Value::Null).unwrap();
-        assert_eq!(app.ui.left, None, "toggle closes it again");
     }
 
     #[test]

@@ -11,10 +11,17 @@ pub mod triangulate;
 pub use body::{BODIES, Body};
 pub use sinusoidal::Sinusoidal;
 
+use std::sync::LazyLock;
+
+use geographiclib_rs::{DirectGeodesic, Geodesic, InverseGeodesic};
 use serde::{Deserialize, Serialize};
 
 /// Mean Earth radius used by the haversine formula (metres).
 pub const EARTH_RADIUS_M: f64 = 6_371_008.8;
+/// The smallest radius of curvature of the WGS 84 ellipsoid, b²/a, along the meridian at the
+/// equator (metres). Every path on the ellipsoid is at least as long as on a sphere of this radius
+/// through the same longitudes and latitudes, so a reach worked out on that sphere is never short.
+pub const WGS84_MIN_RADIUS_M: f64 = 6_335_439.327_293;
 /// Web Mercator sphere radius (metres).
 pub const MERCATOR_R: f64 = 6_378_137.0;
 /// Latitude limit of Web Mercator.
@@ -160,13 +167,13 @@ pub fn extent_to_merc(e: &Extent) -> Extent {
     Extent::from_points(lonlat_to_merc(Coord::new(e.min_x, e.min_y)), lonlat_to_merc(Coord::new(e.max_x, e.max_y)))
 }
 
-/// Great-circle distance between two lon/lat points (metres).
+/// Great-circle distance between two lon/lat points (metres); NaN for non-finite coordinates.
 pub fn haversine_m(a: Coord, b: Coord) -> f64 {
     let (la1, la2) = (a.y.to_radians(), b.y.to_radians());
     let dlat = la2 - la1;
     let dlon = (b.x - a.x).to_radians();
     let h = (dlat / 2.0).sin().powi(2) + la1.cos() * la2.cos() * (dlon / 2.0).sin().powi(2);
-    2.0 * EARTH_RADIUS_M * h.sqrt().min(1.0).asin()
+    2.0 * EARTH_RADIUS_M * h.sqrt().clamp(0.0, 1.0).asin()
 }
 
 /// Length of a lon/lat polyline along great circles (metres).
@@ -226,60 +233,58 @@ pub fn spherical_centre(pts: &[Coord]) -> Option<Coord> {
     from_vector(s)
 }
 
-/// The point `dist_m` metres from `c` along the great circle leaving it at `azimuth_deg`
-/// (clockwise from north): the direct geodesic problem on the sphere.
+/// The point `dist_m` metres from `c` along the geodesic leaving it at `azimuth_deg` (clockwise
+/// from north): the direct geodesic problem on the WGS 84 ellipsoid.
 pub fn geodesic_destination(c: Coord, azimuth_deg: f64, dist_m: f64) -> Coord {
     let (s, co) = azimuth_deg.to_radians().sin_cos();
     Aeqd::new(c).inverse(Coord::new(dist_m * s, dist_m * co))
 }
 
-/// The azimuthal equidistant projection on the sphere, centred on a lon/lat point: distances
-/// and directions from the centre are true, so a buffer drawn in it is geodesic near the centre.
-/// Coordinates are metres east and north of the centre.
+/// The geodesic distance between two lon/lat points on the WGS 84 ellipsoid (metres): the inverse
+/// geodesic problem, solved by GeographicLib.
+pub fn wgs84_distance_m(a: Coord, b: Coord) -> f64 {
+    let (s12, _): (f64, f64) = WGS84.inverse(a.y.clamp(-90.0, 90.0), a.x, b.y.clamp(-90.0, 90.0), b.x);
+    s12
+}
+
+/// The WGS 84 ellipsoid's geodesic solver.
+static WGS84: LazyLock<Geodesic> = LazyLock::new(Geodesic::wgs84);
+
+/// The azimuthal equidistant projection on the WGS 84 ellipsoid, centred on a lon/lat point:
+/// distances and directions from the centre are true, so a buffer drawn in it is geodesic near
+/// the centre. Coordinates are metres east and north of the centre.
+///
+/// It is Karney's ellipsoidal form (Karney 2013, "Algorithms for geodesics"): a point's
+/// distance and azimuth from the centre are the inverse geodesic problem, and back again the
+/// direct one, both solved by GeographicLib to a few nanometres.
 #[derive(Clone, Copy, Debug)]
 pub struct Aeqd {
     lon0: f64,
-    sin0: f64,
-    cos0: f64,
+    lat0: f64,
 }
 
 impl Aeqd {
     pub fn new(centre: Coord) -> Self {
-        let lat0 = centre.y.clamp(-90.0, 90.0).to_radians();
-        Aeqd { lon0: centre.x, sin0: lat0.sin(), cos0: lat0.cos() }
+        Aeqd { lon0: centre.x, lat0: centre.y.clamp(-90.0, 90.0) }
     }
 
     /// Lon/lat (degrees) → metres from the centre.
     pub fn forward(&self, c: Coord) -> Coord {
-        let lat = c.y.clamp(-90.0, 90.0).to_radians();
-        let dlon = (c.x - self.lon0).to_radians();
-        let (sl, cl) = lat.sin_cos();
-        let east = cl * dlon.sin();
-        let north = self.cos0 * sl - self.sin0 * cl * dlon.cos();
-        let cos_c = self.sin0 * sl + self.cos0 * cl * dlon.cos();
-        let sin_c = east.hypot(north);
-        if sin_c < 1e-15 {
-            return Coord::new(0.0, 0.0);
-        }
-        let k = EARTH_RADIUS_M * sin_c.atan2(cos_c) / sin_c;
-        Coord::new(k * east, k * north)
+        let (s12, azi1, _, _): (f64, f64, f64, f64) = WGS84.inverse(self.lat0, self.lon0, c.y.clamp(-90.0, 90.0), c.x);
+        let (sa, ca) = azi1.to_radians().sin_cos();
+        Coord::new(s12 * sa, s12 * ca)
     }
 
     /// Metres from the centre → lon/lat (degrees). The longitude is within 180° of the centre's,
-    /// not folded into −180..180, so a shape across the antimeridian stays in one piece.
+    /// not folded into −180..180, so a shape across the antimeridian stays in one piece. Metres
+    /// that aren't finite give no place (both coordinates NaN).
     pub fn inverse(&self, p: Coord) -> Coord {
-        let rho = p.x.hypot(p.y);
-        let c = rho / EARTH_RADIUS_M;
-        let (sc, cc) = c.sin_cos();
-        let (sa, ca) = if rho > 0.0 { (p.x / rho, p.y / rho) } else { (0.0, 1.0) };
-        let lat = (self.sin0 * cc + self.cos0 * sc * ca).clamp(-1.0, 1.0).asin();
-        // At a pole every direction is south (or north): the azimuth is the meridian.
-        let dlon = if self.cos0 < 1e-9 {
-            if self.sin0 > 0.0 { p.x.atan2(-p.y) } else { p.x.atan2(p.y) }
-        } else {
-            (sa * sc * self.cos0).atan2(cc - self.sin0 * lat.sin())
-        };
-        Coord::new(self.lon0 + dlon.to_degrees(), lat.to_degrees())
+        if !(p.x.is_finite() && p.y.is_finite()) {
+            return Coord::new(f64::NAN, f64::NAN);
+        }
+        // At a pole the azimuth is taken from the meridian `lon0`, as `forward` gives it.
+        let (lat, lon): (f64, f64) = WGS84.direct(self.lat0, self.lon0, p.x.atan2(p.y).to_degrees(), p.x.hypot(p.y));
+        Coord::new(self.lon0 + wrap_lon(lon - self.lon0), lat)
     }
 }
 
@@ -294,7 +299,11 @@ pub fn geodesic_ring_area_m2(ring: &[Coord]) -> f64 {
     let mut total = 0.0;
     for i in 0..n {
         let (Some(p1), Some(p2)) = (ring.get(i), ring.get((i + 1) % n)) else { continue };
-        total += (p2.x - p1.x).to_radians() * (2.0 + p1.y.to_radians().sin() + p2.y.to_radians().sin());
+        // An edge that jumps across the antimeridian (179° to -179°) is a short hop east, not 358°
+        // west. A full 360° edge (-180° to 180°, as a world-wide rectangle has) is kept as it is.
+        let dlon = p2.x - p1.x;
+        let dlon = if dlon.abs() > 180.0 && dlon.abs() < 360.0 { wrap_lon(dlon) } else { dlon };
+        total += dlon.to_radians() * (2.0 + p1.y.to_radians().sin() + p2.y.to_radians().sin());
     }
     (total * EARTH_RADIUS_M * EARTH_RADIUS_M / 2.0).abs()
 }
@@ -321,9 +330,27 @@ pub fn nice_distance(d: f64) -> f64 {
     n * p
 }
 
-/// Formats a distance in metres as `850 m` / `12.5 km`.
+/// Formats a distance in metres as `0.2 mm` / `5 mm` / `20 cm` / `850 m` / `12.5 km`: under a
+/// metre in centimetres or millimetres, so a scale bar on a site plan (#902) doesn't read `0 m`.
+/// Non-finite values display as `—`.
 pub fn format_distance(m: f64) -> String {
-    if m.round() < 1000.0 {
+    if !m.is_finite() {
+        return "—".to_string();
+    }
+    // Each unit is picked, and shown, by the value rounded as it shows: formatting alone rounds
+    // halves to even.
+    let (mm, cm) = ((m * 1000.0).round(), (m * 100.0).round());
+    if m != 0.0 && mm == 0.0 {
+        // Under half a millimetre, which the closest zoom spreads over pixels: tenths, then a
+        // bound rather than 0.
+        let tenths = (m * 10_000.0).round() / 10.0;
+        return if tenths != 0.0 { format!("{tenths:.1} mm") } else { "< 0.1 mm".to_string() };
+    }
+    if m != 0.0 && mm.abs() < 10.0 {
+        format!("{mm:.0} mm")
+    } else if m != 0.0 && cm.abs() < 100.0 {
+        format!("{cm:.0} cm")
+    } else if m.round() < 1000.0 {
         format!("{m:.0} m")
     } else if (m / 100.0).round() < 1000.0 {
         format!("{:.1} km", m / 1000.0)
@@ -332,19 +359,26 @@ pub fn format_distance(m: f64) -> String {
     }
 }
 
-/// Formats an area in square metres as `km²` or `m²`.
+/// Formats an area in square metres as `km²` or `m²`; `—` for non-finite values.
 pub fn format_area(m2: f64) -> String {
+    if !m2.is_finite() {
+        return "—".to_string();
+    }
     if m2.round() < 1.0e6 { format!("{m2:.0} m²") } else { format!("{:.1} km²", m2 / 1.0e6) }
 }
 
 /// Formats a lon/lat pair in decimal degrees with hemispheres: `12.345° E 45.678° N`.
+/// Displays `—` if either coordinate is non-finite.
 pub fn format_lonlat(c: Coord) -> String {
+    if !c.is_finite() {
+        return "—".to_string();
+    }
     let ew = if c.x < 0.0 { 'W' } else { 'E' };
     let ns = if c.y < 0.0 { 'S' } else { 'N' };
     format!("{:.4}° {ew}  {:.4}° {ns}", c.x.abs(), c.y.abs())
 }
 
-/// Formats a lon/lat pair as degrees-minutes-seconds.
+/// Formats a lon/lat pair as degrees-minutes-seconds; `—` if either coordinate is non-finite.
 pub fn format_dms(c: Coord) -> String {
     fn dms(v: f64) -> String {
         let tenths = (v.abs() * 36_000.0).round();
@@ -352,6 +386,9 @@ pub fn format_dms(c: Coord) -> String {
         let m = ((tenths % 36_000.0) / 600.0).floor();
         let s = (tenths % 600.0) / 10.0;
         format!("{d:.0}°{m:02.0}′{s:04.1}″")
+    }
+    if !c.is_finite() {
+        return "—".to_string();
     }
     let ew = if c.x < 0.0 { 'W' } else { 'E' };
     let ns = if c.y < 0.0 { 'S' } else { 'N' };
@@ -373,28 +410,66 @@ mod tests {
 
     #[test]
     fn azimuthal_equidistant_keeps_distances_from_its_centre() {
-        let centre = Coord::new(10.0, 60.0);
-        let p = Aeqd::new(centre);
-        for (x, y) in [(10.0, 70.0), (-170.0, 80.0), (40.0, 20.0), (10.0, 60.0), (179.5, -30.0)] {
-            let c = Coord::new(x, y);
+        // Distances and azimuths on WGS 84 from GeographicLib (pyproj.Geod(ellps="WGS84").inv).
+        for (centre, (x, y), s12, azi1) in [
+            ((10.0, 60.0), (10.0, 70.0), 1_114_907.908_280, 0.0),
+            ((10.0, 60.0), (-170.0, 80.0), 4_464_718.767_198, 0.0),
+            ((10.0, 60.0), (40.0, 20.0), 5_037_117.406_299, 138.557_618_275_686),
+            ((10.0, 60.0), (179.5, -30.0), 16_578_966.423_682, 17.827_025_777_178),
+            ((2.3522, 48.8566), (-0.1276, 51.5072), 343_896.891_267, -30.048_593_801_903),
+        ] {
+            let (centre, c) = (Coord::new(centre.0, centre.1), Coord::new(x, y));
+            let p = Aeqd::new(centre);
             let m = p.forward(c);
-            assert!((m.x.hypot(m.y) - haversine_m(centre, c)).abs() < 1e-3, "{c:?}");
+            assert!((m.x.hypot(m.y) - s12).abs() < 1e-5, "{c:?}: {m:?}");
+            assert!((m.x.atan2(m.y).to_degrees() - azi1).abs() < 1e-9, "{c:?}: {m:?}");
             let back = p.inverse(m);
             assert!((back.x - x).abs() < 1e-9 && (back.y - y).abs() < 1e-9, "{c:?} → {back:?}");
         }
+        assert_eq!(Aeqd::new(Coord::new(10.0, 60.0)).forward(Coord::new(10.0, 60.0)), Coord::new(0.0, 0.0));
+        assert!((wgs84_distance_m(Coord::new(2.3522, 48.8566), Coord::new(-0.1276, 51.5072)) - 343_896.891_267).abs() < 1e-5);
+        // A tenth of a degree north from the equator is shorter than on the mean sphere, but not
+        // than on the sphere of the smallest radius of curvature.
+        let (a, b) = (Coord::new(0.0, 0.0), Coord::new(0.0, 0.1));
+        assert!(wgs84_distance_m(a, b) < haversine_m(a, b));
+        assert!(wgs84_distance_m(a, b) >= haversine_m(a, b) * WGS84_MIN_RADIUS_M / EARTH_RADIUS_M);
+        // Metres that aren't finite are no place, not half of one.
+        for m in [Coord::new(f64::NAN, 0.0), Coord::new(f64::INFINITY, 0.0), Coord::new(0.0, f64::NEG_INFINITY)] {
+            let c = Aeqd::new(Coord::new(10.0, 45.0)).inverse(m);
+            assert!(c.x.is_nan() && c.y.is_nan(), "{m:?} → {c:?}");
+        }
         // The inverse stays next to the centre's longitude rather than folding into −180..180.
-        assert!((Aeqd::new(Coord::new(179.0, 0.0)).inverse(Coord::new(300_000.0, 0.0)).x - 181.698).abs() < 1e-3);
+        assert!((Aeqd::new(Coord::new(179.0, 0.0)).inverse(Coord::new(300_000.0, 0.0)).x - 181.694_945_852_359).abs() < 1e-9);
+        // Centred on a pole, the azimuth is taken from the centre's meridian, both ways.
+        for pole in [90.0, -90.0] {
+            let p = Aeqd::new(Coord::new(25.0, pole));
+            for c in [Coord::new(25.0, pole * 0.9), Coord::new(-100.0, pole * 0.8), Coord::new(170.0, pole * 0.95)] {
+                let back = p.inverse(p.forward(c));
+                assert!((wrap_lon(back.x - c.x)).abs() < 1e-9 && (back.y - c.y).abs() < 1e-9, "{c:?} → {back:?}");
+            }
+        }
     }
 
     #[test]
     fn geodesic_destination_and_interpolation() {
-        let start = Coord::new(10.0, 60.0);
-        for az in [0.0, 45.0, 90.0, 180.0, 300.0] {
-            let d = geodesic_destination(start, az, 1_000_000.0);
-            assert!((haversine_m(start, d) - 1_000_000.0).abs() < 1e-3, "{az}: {d:?}");
+        // Destinations on WGS 84 from GeographicLib (pyproj.Geod(ellps="WGS84").fwd): 10 km from
+        // the equator and from 46.5° and 60°N (#888), 1,000 km from 60°N, and from either pole.
+        for (lon, lat, az, d, lon2, lat2) in [
+            (0.0, 0.0, 0.0, 10_000.0, 0.0, 0.090_436_946_951),
+            (0.0, 0.0, 90.0, 10_000.0, 0.089_831_528_412, 0.0),
+            (10.5, 46.5, 0.0, 10_000.0, 10.5, 46.589_958_829_711),
+            (10.5, 46.5, 90.0, 10_000.0, 10.630_271_666_436, 46.499_925_816_591),
+            (10.5, 46.5, 225.0, 10_000.0, 10.407_991_242_765, 46.436_351_607_689),
+            (30.0, 60.0, 90.0, 10_000.0, 30.179_211_026_165, 59.999_878_434_646),
+            (10.0, 60.0, 0.0, 1_000_000.0, 10.0, 68.969_947_795_748),
+            (10.0, 60.0, 300.0, 1_000_000.0, -7.552_217_029_942, 63.435_692_055_327),
+            (0.0, 90.0, 0.0, 1_000_000.0, 180.0, 81.046_232_815_951),
+            (0.0, -90.0, 90.0, 1_000_000.0, 90.0, -81.046_232_815_951),
+        ] {
+            let p = geodesic_destination(Coord::new(lon, lat), az, d);
+            // 1e-11° is about a micrometre.
+            assert!(wrap_lon(p.x - lon2).abs() < 1e-11 && (p.y - lat2).abs() < 1e-11, "{lon} {lat} {az}: {p:?}");
         }
-        let north = geodesic_destination(start, 0.0, 1_000_000.0);
-        assert!((north.x - 10.0).abs() < 1e-9 && north.y > 68.9, "{north:?}");
         let (a, b) = (Coord::new(2.3522, 48.8566), Coord::new(-0.1276, 51.5072));
         let mid = geodesic_interpolate(a, b, 0.5);
         assert!((haversine_m(a, mid) - haversine_m(mid, b)).abs() < 1e-3);
@@ -405,14 +480,64 @@ mod tests {
     }
 
     #[test]
+    fn nonfinite_coordinates_do_not_become_valid_distances() {
+        let c = Coord::new;
+        let origin = c(0.0, 0.0);
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for invalid in [c(value, 0.0), c(0.0, value)] {
+                assert!(haversine_m(origin, invalid).is_nan());
+                assert!(haversine_m(invalid, origin).is_nan());
+                assert!(geodesic_length_m(&[origin, invalid, c(1.0, 0.0)]).is_nan());
+                assert!(geodesic_ring_area_m2(&[origin, invalid, c(1.0, 1.0)]).is_nan());
+            }
+        }
+        assert_eq!(haversine_m(origin, origin), 0.0);
+        let antipodal = haversine_m(origin, c(180.0, 0.0));
+        assert!((antipodal - std::f64::consts::PI * EARTH_RADIUS_M).abs() < 1e-6);
+        let across = haversine_m(c(179.0, 0.0), c(-179.0, 0.0));
+        let unwrapped = haversine_m(c(179.0, 0.0), c(181.0, 0.0));
+        assert!((across - unwrapped).abs() < 1e-6);
+    }
+
+    #[test]
     fn haversine_paris_london() {
         let d = haversine_m(Coord::new(2.3522, 48.8566), Coord::new(-0.1276, 51.5072));
         assert!((d - 343_500.0).abs() < 2_000.0, "{d}");
     }
 
     #[test]
+    fn nonfinite_measurements_display_as_unavailable() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(format_distance(value), "—");
+            assert_eq!(format_area(value), "—");
+            for coord in [Coord::new(value, 50.0), Coord::new(12.0, value), Coord::new(value, value)] {
+                assert_eq!(format_lonlat(coord), "—");
+                assert_eq!(format_dms(coord), "—");
+            }
+        }
+        assert_eq!(format_area(0.0), "0 m²");
+        assert_eq!(format_lonlat(Coord::new(-12.5, 45.25)), "12.5000° W  45.2500° N");
+        assert_eq!(format_lonlat(Coord::new(0.0, 0.0)), "0.0000° E  0.0000° N");
+    }
+
+    #[test]
     fn distances_and_areas_switch_unit_when_they_round_up() {
         assert_eq!(format_distance(850.0), "850 m");
+        assert_eq!(format_distance(0.0), "0 m");
+        assert_eq!(format_distance(0.005), "5 mm");
+        assert_eq!(format_distance(0.0096), "1 cm");
+        assert_eq!(format_distance(0.2), "20 cm");
+        assert_eq!(format_distance(0.996), "1 m");
+        // Ties round away from zero, as the unit is picked; signs stay.
+        assert_eq!(format_distance(0.0045), "5 mm");
+        assert_eq!(format_distance(0.0095), "1 cm");
+        assert_eq!(format_distance(0.995), "1 m");
+        assert_eq!(format_distance(-0.005), "-5 mm");
+        assert_eq!(format_distance(-0.2), "-20 cm");
+        // Under half a millimetre, never 0 (#923).
+        assert_eq!(format_distance(0.0002), "0.2 mm");
+        assert_eq!(format_distance(-0.0002), "-0.2 mm");
+        assert_eq!(format_distance(0.00001), "< 0.1 mm");
         assert_eq!(format_distance(999.4), "999 m");
         assert_eq!(format_distance(999.6), "1.0 km");
         assert_eq!(format_distance(12_500.0), "12.5 km");
@@ -429,10 +554,12 @@ mod tests {
         let from = Coord::new(10.0, 60.0);
         for az in [0.0, 45.0, 90.0, 180.0, 270.0, 333.0] {
             let to = geodesic_destination(from, az, 500_000.0);
-            assert!((haversine_m(from, to) - 500_000.0).abs() < 1e-3, "{az}: {to:?}");
+            let m = Aeqd::new(from).forward(to);
+            assert!((m.x.hypot(m.y) - 500_000.0).abs() < 1e-6, "{az}: {to:?}");
+            assert!(wrap_lon(m.x.atan2(m.y).to_degrees() - az).abs() < 1e-9, "{az}: {to:?}");
         }
-        // North and east go where they say.
-        assert!((geodesic_destination(from, 0.0, 111_195.0).y - 61.0).abs() < 1e-3);
+        // North and east go where they say: 60° to 61°N is 111,420.728 m on WGS 84 (GeographicLib).
+        assert!((geodesic_destination(from, 0.0, 111_420.727_870).y - 61.0).abs() < 1e-9);
         assert!(geodesic_destination(from, 90.0, 1000.0).x > 10.0);
         // Longitudes stay continuous across the antimeridian, so the points around one centre
         // form one shape (Tissot's indicatrix draws its circles with them).
@@ -444,6 +571,22 @@ mod tests {
         let ring = [Coord::new(0.0, 0.0), Coord::new(1.0, 0.0), Coord::new(1.0, 1.0), Coord::new(0.0, 1.0)];
         let a = geodesic_ring_area_m2(&ring);
         assert!((a - 1.2364e10).abs() / 1.2364e10 < 0.01, "{a}");
+    }
+
+    #[test]
+    fn ring_area_across_the_antimeridian() {
+        let c = Coord::new;
+        let across = geodesic_ring_area_m2(&[c(179.0, 0.0), c(-179.0, 0.0), c(-179.0, 2.0), c(179.0, 2.0)]);
+        let unwrapped = geodesic_ring_area_m2(&[c(179.0, 0.0), c(181.0, 0.0), c(181.0, 2.0), c(179.0, 2.0)]);
+        let reversed = geodesic_ring_area_m2(&[c(179.0, 2.0), c(-179.0, 2.0), c(-179.0, 0.0), c(179.0, 0.0)]);
+        assert!((across - unwrapped).abs() / unwrapped < 1e-9, "{across} vs {unwrapped}");
+        assert!((reversed - unwrapped).abs() / unwrapped < 1e-9, "{reversed}");
+        // The same box away from the antimeridian has the same area to within the latitude band.
+        let plain = geodesic_ring_area_m2(&[c(0.0, 0.0), c(2.0, 0.0), c(2.0, 2.0), c(0.0, 2.0)]);
+        assert!((across - plain).abs() / plain < 1e-9, "{across} vs {plain}");
+        // A full -180° to 180° edge is not collapsed: a world-wide band keeps its area.
+        let band = geodesic_ring_area_m2(&[c(-180.0, -10.0), c(180.0, -10.0), c(180.0, 10.0), c(-180.0, 10.0)]);
+        assert!(band > 1.0e13, "{band}");
     }
 
     #[test]

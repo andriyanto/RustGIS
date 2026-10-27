@@ -1,6 +1,6 @@
 //! Project items: folder connections, map and layer files, styles, project templates, packages,
-//! layer templates, tasks, and 3D export (Home › Project; Data › Layer Templates and Styles; Share ›
-//! Package, Save As and Output).
+//! layer templates, tasks, and 3D export (Home › Add; Data › Layer Templates and Styles; Publish ›
+//! Package, Save As and Output; Command Search for map/template imports).
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -21,7 +21,7 @@ const MAX_FILE: u64 = 512 << 20;
 pub fn commands() -> Vec<C> {
     vec![
         // Folder connections.
-        C::new("project.addFolder", "Add Folder", "Home › Project", |s, p| {
+        C::new("project.addFolder", "Add Folder", "Home › Add › Add Data", |s, p| {
             let path = ps(p, "path").map(str::trim).filter(|p| !p.is_empty()).ok_or("path is required")?;
             if !cfg!(target_arch = "wasm32") && !Path::new(path).is_dir() {
                 return Err(format!("{path} isn't a folder"));
@@ -56,7 +56,7 @@ pub fn commands() -> Vec<C> {
         C::new("map.save", "Save Map File", "Publish › Save As", |s, p| save_item(s, "map", p))
         .view()
         .params(r#"{"path": "*.rgismap", "map"?: name}"#),
-        C::new("map.import", "Import", "Home › Project", import_maps).params(r#"{"path": "*.rgismap|*.rgis|*.rgispkg" | "text": map file JSON | "data": base64 file}"#),
+        C::new("map.import", "Import", "Command Search", import_maps).params(r#"{"path": "*.rgismap|*.rgis|*.rgispkg" | "text": map file JSON | "data": base64 file}"#),
         C::new("layer.save", "Save Layer File", "Publish › Save As", |s, p| save_item(s, "layer", p))
         .view()
         .when(need_layer)
@@ -172,13 +172,13 @@ pub fn commands() -> Vec<C> {
         C::new("project.saveTemplate", "Save Project Template", "Publish › Save As", |s, p| save_item(s, "template", p))
         .view()
         .params(r#"{"path": "*.rgistemplate", "name"?: template name}"#),
-        C::new("project.newTemplate", "New Custom Template", "Home › Project", |s, p| save_item(s, "template", p))
+        C::new("project.newTemplate", "New Custom Template", "Publish › Save As", |s, p| save_item(s, "template", p))
         .view()
         .params(r#"{"path": "*.rgistemplate", "name"?: template name}"#),
-        C::new("project.fromTemplate", "Open Custom Template", "Home › Project", |s, p| {
+        C::new("project.fromTemplate", "Open Custom Template", "Command Search", |s, p| {
             let text = read_text(p)?;
             super::connections::clear_active();
-            let mut proj = match Project::from_import_json(&text) {
+            let mut proj = match Project::from_import_json(&text, None) {
                 Ok(proj) => proj,
                 Err(error) => {
                     super::connections::restore_active(s);
@@ -428,10 +428,16 @@ fn embedded_map(m: &Map, budget: &mut u64) -> Map {
 /// Adds maps from a map file, project or package.
 fn import_maps(s: &mut Session, p: &Value) -> CmdResult {
     let text = read_text(p)?;
+    let dir = ps(p, "path").and_then(|path| std::path::absolute(path).ok()).and_then(|p| p.parent().map(Path::to_path_buf));
     super::connections::clear_active();
     let maps: Vec<Map> = match serde_json::from_str::<Map>(&text) {
-        Ok(m) => vec![m],
-        Err(_) => match Project::from_import_json(&text) {
+        Ok(mut m) => {
+            if let Some(d) = dir.as_deref().and_then(Path::to_str) {
+                crate::project::resolve_file_paths(d, m.file_paths_mut());
+            }
+            vec![m]
+        }
+        Err(_) => match Project::from_import_json(&text, dir.as_deref()) {
             Ok(project) => project.maps,
             Err(_) => {
                 super::connections::restore_active(s);
@@ -441,6 +447,8 @@ fn import_maps(s: &mut Session, p: &Value) -> CmdResult {
     };
     let mut names = Vec::new();
     for mut m in maps.into_iter().take(100) {
+        // A binding in a file is no authority to use a login here.
+        crate::s3_connections::clear_bindings(m.addresses_mut());
         let base = m.name.clone();
         let mut i = 1;
         while s.project.maps.iter().any(|o| o.name.eq_ignore_ascii_case(&m.name)) {
@@ -450,10 +458,12 @@ fn import_maps(s: &mut Session, p: &Value) -> CmdResult {
         names.push(m.name.clone());
         s.project.maps.push(m);
     }
-    // Repair what was read (rasters reopen, cameras clamp).
+    // Repair what was read (rasters reopen, cameras clamp); the sources that read S3 wait for
+    // the saved connection that is to read them.
     s.project.normalize();
     super::connections::restore_active(s);
     super::connections::resolve_project(s);
+    crate::s3_connections::resolve_project_s3(s);
     super::connections::note_waiting(s);
     if let Some(n) = names.last()
         && let Some(i) = s.project.maps.iter().position(|m| &m.name == n)
@@ -483,7 +493,7 @@ fn import_styles(s: &mut Session, p: &Value) -> CmdResult {
     } else {
         // A project parse opens sources even though this import only takes their styles.
         super::connections::clear_active();
-        let project = Project::from_import_json(&text);
+        let project = Project::from_import_json(&text, None);
         super::connections::restore_active(s);
         project.map_err(|_| "not a RustGIS layer file, map file or project".to_string())?.maps.into_iter().flat_map(|m| m.layers).collect()
     };
@@ -654,8 +664,22 @@ fn task_mut<'a>(s: &'a mut Session, p: &Value) -> Result<&'a mut Task, String> {
     }
 }
 
-/// Runs a task's steps (or one of them), stopping at the first that fails.
+/// Runs a task without allowing its steps to re-enter tasks indirectly through scripts or
+/// notebooks. Clear the session marker on errors and caught panics as well as success.
 fn run_task(s: &mut Session, p: &Value) -> CmdResult {
+    if s.task_running {
+        return Err("a task is already running (a step can't run tasks, even through a script or notebook)".into());
+    }
+    s.task_running = true;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_task_steps(s, p)))
+        .unwrap_or_else(|_| Err("the task failed unexpectedly".into()));
+    s.task_running = false;
+    result
+}
+
+/// Executes the selected task steps inside the caller's transaction and re-entry guard,
+/// retaining the existing direct task ban and imported-task restrictions.
+fn run_task_steps(s: &mut Session, p: &Value) -> CmdResult {
     let t = task_ref(s, p)?.clone();
     // `"step": null` runs them all, as no step does.
     let steps: Vec<(usize, TaskStep)> = match p.get("step").filter(|v| !v.is_null()) {

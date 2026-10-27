@@ -11,9 +11,11 @@ pub mod graphics;
 pub mod layout;
 pub mod lod;
 pub mod palette;
+pub mod paths;
 pub mod planets;
 pub mod presentation;
 pub mod projection;
+pub mod qgis;
 pub mod raster;
 pub mod report;
 pub mod source;
@@ -29,7 +31,8 @@ pub use color::{Ramp, RampGroup, Rgba};
 pub use globe::{Globe, Projection};
 pub use raster::{RasterDefaults, RasterLayer, RasterRenderer, RasterStyle, Resampling, Stretch};
 pub use symbology::{
-    ClassMethod, LabelClass, LabelKey, LabelMatcher, LabelPlacement, Labeling, LineCap, LineJoin, LineStroke, Marker, Renderer, Symbol,
+    ClassMethod, FontName, Glyph, LabelBackground, LabelClass, LabelKey, LabelMatcher, LabelPlacement, Labeling, LineCap, LineJoin,
+    LineMark, LineMarkers, LineStroke, Marker, MarkerRotation, Placements, Renderer, Symbol,
 };
 pub use tiles::{TileKind, TileLayer};
 
@@ -141,7 +144,9 @@ pub struct Layer {
     #[serde(default)]
     pub extrusion: Option<effects::Extrusion>,
     /// A line layer's stacked strokes, drawn bottom first in place of its single stroke (none:
-    /// the renderer's stroke alone).
+    /// the renderer's stroke alone). A point layer's are its marks: each stroke of markers draws
+    /// its marker at the point, bottom first, in place of the symbol's (see
+    /// [`LineStroke`]); a stroke without markers draws nothing there.
     #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "symbology::de_strokes")]
     pub line_strokes: Vec<symbology::LineStroke>,
     /// Draws the stacked strokes in levels (symbol levels): every feature's strokes of one
@@ -149,6 +154,10 @@ pub struct Layer {
     /// instead of cutting across them where lines meet.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stroke_levels: bool,
+    /// Turns each point's marker (and its marks, their offsets with them) by the angle in a
+    /// field, as QGIS's data-defined symbol angle does.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "symbology::de_marker_rotation")]
+    pub marker_rotation: Option<symbology::MarkerRotation>,
     /// The scale (1:N) its symbol and label sizes are set for: drawn at another scale they grow
     /// and shrink with the map, as on paper (QGIS's reference scale). `None`: they keep their
     /// size on screen.
@@ -202,6 +211,80 @@ fn yes() -> bool {
 }
 
 impl Layer {
+    /// Local linked paths, followed by the dataset's record-only provenance.
+    pub fn file_paths_mut(&mut self) -> Vec<(&mut String, bool)> {
+        let Layer { dataset, source, raster, .. } = self;
+        let mut paths = Vec::new();
+        if let Some(src) = source {
+            if let Some(g) = &mut src.gdal {
+                paths.push((&mut g.path, false));
+            } else if let Some(d) = &mut src.duckdb {
+                if let Some(p) = &mut d.database {
+                    paths.push((p, false));
+                }
+            } else if src.embedded.is_none()
+                && src.postgis.is_none()
+                && src.mysql.is_none()
+                && src.sqlserver.is_none()
+                && let Some(p) = &mut src.path
+            {
+                paths.push((p, false));
+            }
+        }
+        if let Some(r) = raster {
+            if r.embedded.is_none()
+                && let Some(p) = &mut r.path
+            {
+                paths.push((p, false));
+            }
+            if let Some(z) = &mut r.time_zarr {
+                paths.push((&mut z.store, false));
+            }
+        }
+        if let Some(p) = &mut dataset.source {
+            paths.push((p, true));
+        }
+        paths.retain(|(p, _)| paths::is_local(p));
+        paths
+    }
+
+    /// The original local file replaced by Repair Data Source.
+    pub fn linked_file(&self) -> Option<&str> {
+        let p = if let Some(r) = &self.raster {
+            if r.embedded.is_some() {
+                return None;
+            }
+            r.time_zarr.as_ref().map(|z| z.store.as_str()).or(r.path.as_deref())
+        } else {
+            self.source.as_ref().and_then(source::SourceLayer::linked_file)
+        };
+        p.filter(|p| paths::is_local(p))
+    }
+
+    /// The dataset within the linked container.
+    pub fn linked_table(&self) -> Option<&str> {
+        self.raster.as_ref().and_then(|r| r.subdataset.as_deref()).or_else(|| {
+            self.source.as_ref().and_then(|s| {
+                s.table
+                    .as_deref()
+                    .or_else(|| s.gdal.as_ref().map(|g| g.layer.as_str()))
+                    .or_else(|| s.duckdb.as_ref().and_then(|d| d.table.as_deref()))
+            })
+        })
+    }
+
+    /// Installs a fresh source without changing the layer's identity or configuration.
+    pub fn replace_source(&mut self, src: source::SourceLayer) {
+        self.selection.clear();
+        if let Some(info) = src.info() {
+            self.dataset.fields = info.fields.clone();
+            self.dataset.crs = info.coordinate_system();
+        }
+        self.dataset.source = src.linked_file().map(String::from);
+        self.source = Some(src);
+        self.install(Vec::new());
+    }
+
     /// The dataset, streamed, raster and time-following Zarr addresses used to read this layer
     /// again, in that order. Local paths are included; database origins stay password-free.
     pub fn addresses_mut(&mut self) -> impl Iterator<Item = &mut String> {
@@ -235,6 +318,7 @@ impl Layer {
             extrusion: None,
             line_strokes: Vec::new(),
             stroke_levels: false,
+            marker_rotation: None,
             reference_scale: None,
             priority: 0,
             design: design::Design::default(),
@@ -429,6 +513,13 @@ impl Layer {
     /// The symbol a row draws with.
     pub fn symbol(&self, row: usize) -> Symbol {
         if self.graphics { graphics::symbol(&self.dataset, row) } else { self.renderer.symbol_for(&self.dataset, row) }
+    }
+
+    /// How far a point row's marker is turned, in degrees clockwise ([`Layer::marker_rotation`]): 0
+    /// without, or where the row's value isn't a number.
+    pub fn marker_turn(&self, row: usize) -> f32 {
+        let Some(r) = self.marker_rotation.as_ref().filter(|_| !self.graphics) else { return 0.0 };
+        r.turn(&self.dataset, row)
     }
 
     /// The stacked strokes a line feature row is drawn with: its class's own
@@ -923,6 +1014,20 @@ pub struct LabelDisplay {
 }
 
 impl Map {
+    /// All local linked files and record-only provenance in serialization order.
+    pub fn file_paths_mut(&mut self) -> Vec<(&mut String, bool)> {
+        let mut paths = Vec::new();
+        for tile in &mut self.tiles {
+            if tile.archive_file().is_some() {
+                paths.push((&mut tile.url, false));
+            }
+        }
+        for layer in &mut self.layers {
+            paths.extend(layer.file_paths_mut());
+        }
+        paths
+    }
+
     pub fn new(name: impl Into<String>) -> Self {
         Map {
             name: name.into(),
@@ -967,6 +1072,10 @@ impl Map {
             }
             for (_, url) in &mut tile.time_urls {
                 addresses.push(url);
+            }
+            // (A legend's address is built from the service's, its key or password included.)
+            for legend in &mut tile.legends {
+                addresses.push(&mut legend.url);
             }
         }
         if let Some(view::Terrain { source: view::TerrainSource::Tiles { url, .. }, .. }) = &mut self.view.terrain {
@@ -1337,6 +1446,9 @@ impl Map {
         let sources = self.layers.iter().filter(|l| l.source.is_some()).count().max(1);
         let bytes = source::VIEW_BYTES / sources;
         for layer in &mut self.layers {
+            if let Some(raster) = &mut layer.raster {
+                pending |= raster.poll_reload();
+            }
             if let Some(src) = &mut layer.source {
                 let changed = src.projection.as_ref().is_some_and(|p| p != &self.projection);
                 let mode_changed = src.full_read != block;
@@ -1592,15 +1704,17 @@ impl Map {
         out
     }
 
+    /// Layers eligible for map selection, including the visibility and scale of their groups.
+    pub fn selectable_layers(&mut self, scale: f64) -> impl Iterator<Item = &mut Layer> + '_ {
+        let held = self.held_by_group(scale);
+        self.layers.iter_mut().filter(move |l| l.visible && l.selectable && l.in_scale_range(scale) && !held.contains(&l.id))
+    }
+
     /// Rows of each selectable, visible layer inside a rectangle in the camera's coordinates.
     pub fn hits_in(&mut self, e: &Extent, scale: f64) -> Vec<(u32, Vec<usize>)> {
         let (flat, key) = (self.flat(), self.projection.code());
         let mut out = Vec::new();
-        let held = self.held_by_group(scale);
-        for l in &mut self.layers {
-            if !l.visible || !l.selectable || !l.in_scale_range(scale) || held.contains(&l.id) {
-                continue;
-            }
+        for l in self.selectable_layers(scale) {
             // Only features drawn: the definition query and the display filters let them through.
             let rows = l.drawn_rows(scale);
             let id = l.id;
@@ -1647,6 +1761,34 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_rotation_is_kept_and_a_crafted_one_reads_as_none() {
+        let mut l =
+            Layer::new(1, Dataset::new("p", GeometryType::Point, vec![rustgis_data::Field::new("a", rustgis_data::FieldType::Double)]));
+        l.dataset.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![rustgis_data::Value::Float(450.0)]);
+        // None isn't written: an older RustGIS reads the layer as before.
+        assert!(serde_json::to_value(&l).unwrap().get("marker_rotation").is_none());
+        l.marker_rotation = Some(symbology::MarkerRotation { field: "a".into(), counterclockwise: true });
+        let v = serde_json::to_value(&l).unwrap();
+        let back: Layer = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(back.marker_rotation, l.marker_rotation);
+        assert_eq!(back.marker_turn(0), -90.0, "450° counterclockwise");
+        for junk in [
+            serde_json::json!(5),
+            serde_json::json!({"field": 3}),
+            serde_json::json!({"field": ""}),
+            serde_json::json!({"field": "x".repeat(10_000)}),
+        ] {
+            let mut v = v.clone();
+            v["marker_rotation"] = junk.clone();
+            let read: Layer = serde_json::from_value(v).unwrap();
+            assert!(read.marker_rotation.is_none(), "{junk}");
+        }
+        // A field the data lacks turns nothing.
+        l.marker_rotation = Some(symbology::MarkerRotation { field: "gone".into(), counterclockwise: false });
+        assert_eq!(l.marker_turn(0), 0.0);
+    }
+
+    #[test]
     fn hostile_line_strokes_in_a_project_are_brought_into_range() {
         // A crafted project file: too many strokes, and widths and offsets far out of range.
         let mut l = Layer::new(1, Dataset::new("lines", GeometryType::Polyline, vec![]));
@@ -1657,6 +1799,90 @@ mod tests {
         assert!(
             back.line_strokes.iter().all(|st| st.width == Some(symbology::MAX_STROKE_WIDTH) && st.offset == -symbology::MAX_STROKE_OFFSET)
         );
+    }
+
+    #[test]
+    fn dash_patterns_are_kept_and_hostile_ones_brought_into_range() {
+        use symbology::{Dash, MAX_DASH_STEP, MAX_DASH_STEPS};
+        // Built: in range, not all 0, at most MAX_DASH_STEPS.
+        assert_eq!(Dash::new(&[4.0, 2.0]).map(|d| d.steps().to_vec()), Some(vec![4.0, 2.0]));
+        assert_eq!(Dash::new(&[3.0]).map(|d| (d.even_steps(), d.period())), Some((vec![3.0, 3.0], 6.0)), "odd: twice over");
+        for bad in [&[][..], &[0.0, 0.0], &[-1.0, 2.0], &[f32::NAN, 1.0], &[MAX_DASH_STEP + 1.0], &[1.0; MAX_DASH_STEPS + 1]] {
+            assert!(Dash::new(bad).is_none(), "{bad:?}");
+        }
+        // Saved as a plain list and read back.
+        let mut l = Layer::new(1, Dataset::new("lines", GeometryType::Polyline, vec![]));
+        l.line_strokes = vec![symbology::LineStroke { dash: Dash::new(&[4.0, 2.0, 1.0, 2.0]), ..Default::default() }];
+        let text = serde_json::to_string(&l).unwrap();
+        assert!(text.contains(r#""dash":[4.0,2.0,1.0,2.0]"#), "{text}");
+        assert_eq!(serde_json::from_str::<Layer>(&text).unwrap().line_strokes, l.line_strokes);
+        // A crafted project's: steps clamped, too many cut, and one without length solid.
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let read = |v: &serde_json::Value| serde_json::from_value::<Layer>(v.clone()).unwrap().line_strokes[0].dash;
+        v["line_strokes"][0]["dash"] = serde_json::json!([1e30, -5, 2]);
+        assert_eq!(read(&v).map(|d| d.steps().to_vec()), Some(vec![MAX_DASH_STEP, 0.0, 2.0]));
+        // Too large for an f32 (infinite once read): the longest step, as a large one is.
+        v["line_strokes"][0]["dash"] = serde_json::json!([1e40, 2]);
+        assert_eq!(read(&v).map(|d| d.steps().to_vec()), Some(vec![MAX_DASH_STEP, 2.0]));
+        v["line_strokes"][0]["dash"] = serde_json::json!(vec![1.0; 5000]);
+        assert_eq!(read(&v).map(|d| d.steps().len()), Some(MAX_DASH_STEPS));
+        for solid in [serde_json::json!([0, 0]), serde_json::json!([]), serde_json::json!([-3])] {
+            v["line_strokes"][0]["dash"] = solid.clone();
+            assert_eq!(read(&v), None, "{solid}");
+            // Read as a stroke alone too, so no empty pattern is ever made.
+            let st = serde_json::from_value::<symbology::LineStroke>(v["line_strokes"][0].clone()).unwrap();
+            assert_eq!(st.dash, None, "{solid}");
+        }
+    }
+
+    #[test]
+    fn markers_along_lines_are_kept_and_hostile_ones_brought_into_range() {
+        use symbology::{LineMark, LineMarkers, MAX_LINE_MARKER_SIZE, MAX_MARKER_INTERVAL, MIN_MARKER_INTERVAL, Placements};
+        let mut l = Layer::new(1, Dataset::new("lines", GeometryType::Polyline, vec![]));
+        let m = LineMarkers {
+            mark: LineMark::Marker(Marker::Triangle),
+            size: 6.0,
+            at: Placements::FIRST.with(Placements::LAST),
+            interval: 20.0,
+            offset_along: -2.0,
+            rotate: false,
+            average_angle: 15.0,
+            angle: 45.0,
+            outline: Some(Rgba::rgb(0, 0, 0)),
+        };
+        l.line_strokes = vec![
+            symbology::LineStroke { markers: Some(m), ..Default::default() },
+            symbology::LineStroke { markers: Some(LineMarkers { mark: LineMark::Hash, ..LineMarkers::default() }), ..Default::default() },
+        ];
+        // Saved with the places as codes, and read back as they were.
+        let text = serde_json::to_string(&l).unwrap();
+        assert!(text.contains(r#""at":["first","last"]"#) && text.contains(r#""mark":"hash""#), "{text}");
+        assert_eq!(serde_json::from_str::<Layer>(&text).unwrap().line_strokes, l.line_strokes);
+        // A stroke without markers is written as before.
+        let plain = serde_json::to_string(&symbology::LineStroke::default()).unwrap();
+        assert!(!plain.contains("markers"), "{plain}");
+
+        // A crafted project's: sizes and intervals clamped, angles within a turn, places it doesn't
+        // know left out (none at all: every interval).
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let read = |v: &serde_json::Value| serde_json::from_value::<Layer>(v.clone()).unwrap().line_strokes[0].markers.unwrap();
+        let mk = &mut v["line_strokes"][0]["markers"];
+        mk["size"] = serde_json::json!(1e30);
+        mk["interval"] = serde_json::json!(0);
+        mk["offset_along"] = serde_json::json!(-1e40);
+        mk["average_angle"] = serde_json::json!(-3);
+        mk["angle"] = serde_json::json!(-90);
+        mk["at"] = serde_json::json!(["last", "sideways"]);
+        let got = read(&v);
+        assert_eq!((got.size, got.interval, got.offset_along), (MAX_LINE_MARKER_SIZE, MIN_MARKER_INTERVAL, -MAX_MARKER_INTERVAL));
+        assert_eq!((got.average_angle, got.angle, got.at), (0.0, 270.0, Placements::LAST));
+        v["line_strokes"][0]["markers"]["at"] = serde_json::json!(["sideways"]);
+        assert_eq!(read(&v).at, Placements::INTERVAL);
+        v["line_strokes"][0]["markers"]["at"] = serde_json::json!(vec!["first"; 5000]);
+        assert_eq!(read(&v).at, Placements::FIRST);
+        // Only what's given: the rest is the default.
+        v["line_strokes"][0]["markers"] = serde_json::json!({});
+        assert_eq!(read(&v), LineMarkers::default());
     }
 
     #[test]
@@ -1716,6 +1942,7 @@ mod tests {
             ramp: Ramp::Ember,
             method: ClassMethod::NaturalBreaks,
             min: 0.0,
+            classes: 1,
             class_labels: Default::default(),
             class_strokes: [(0, wild)].into_iter().collect(),
         };

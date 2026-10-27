@@ -16,9 +16,12 @@ pub enum Marker {
     Triangle,
     Diamond,
     Star,
+    /// A character of a font, as QGIS's font markers draw one: the size is the font's em.
+    Char(Glyph),
 }
 
 impl Marker {
+    /// The shapes (every marker but [`Marker::Char`]).
     pub const ALL: [Marker; 5] = [Marker::Circle, Marker::Square, Marker::Triangle, Marker::Diamond, Marker::Star];
     pub fn label(self) -> &'static str {
         match self {
@@ -27,7 +30,73 @@ impl Marker {
             Marker::Triangle => "Triangle",
             Marker::Diamond => "Diamond",
             Marker::Star => "Star",
+            Marker::Char(_) => "Character",
         }
+    }
+}
+
+/// A character marker's character, and the installed family it is drawn from (empty: the label
+/// font). A family the machine lacks draws in the label font, as a label's does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Glyph {
+    pub ch: char,
+    #[serde(default, skip_serializing_if = "FontName::is_default")]
+    pub font: FontName,
+}
+
+impl Glyph {
+    pub fn new(ch: char, font: &str) -> Glyph {
+        Glyph { ch, font: FontName::new(font) }
+    }
+}
+
+/// The most font names kept (each is kept for the rest of the run); one past them is the label font.
+const MAX_FONT_NAMES: usize = 4096;
+
+/// A font family's name, kept once for the rest of the run so a symbol naming one stays `Copy`.
+/// Empty for the label font. Names are kept as a label's are ([`font_name`]), and past
+/// [`MAX_FONT_NAMES`] different ones (from a crafted file) the rest are the label font.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FontName(&'static str);
+
+impl FontName {
+    pub fn new(name: &str) -> FontName {
+        use std::collections::HashSet;
+        use std::sync::{Mutex, OnceLock};
+        static NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+        let Some(name) = font_name(name) else { return FontName::default() };
+        let name = name.as_str();
+        let mut names = NAMES.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(kept) = names.get(name) {
+            return FontName(kept);
+        }
+        if names.len() >= MAX_FONT_NAMES {
+            return FontName::default();
+        }
+        let kept: &'static str = Box::leak(name.to_owned().into_boxed_str());
+        names.insert(kept);
+        FontName(kept)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        self.0
+    }
+
+    pub fn is_default(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Serialize for FontName {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for FontName {
+    /// Not a name (a crafted file): the label font, and the rest still reads.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(de_font(d)?.map_or_else(FontName::default, |n| FontName::new(&n)))
     }
 }
 
@@ -162,6 +231,66 @@ pub const MAX_STROKES: usize = 16;
 /// The widest stroke and the farthest offset, in points.
 pub const MAX_STROKE_WIDTH: f32 = 50.0;
 pub const MAX_STROKE_OFFSET: f32 = 100.0;
+/// The most steps a dash pattern has, and the longest step, in points.
+pub const MAX_DASH_STEPS: usize = 8;
+pub const MAX_DASH_STEP: f32 = 500.0;
+
+/// A stroke's dash pattern: lengths in points, dash and gap in turn, starting with a dash (as
+/// SVG's `stroke-dasharray`: an odd number of steps is repeated to make it even). Written to a
+/// project as that list, `[4, 2]`. Built only through [`Dash::new`], so its steps are always
+/// in range and add up to more than nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(into = "Vec<f32>")]
+pub struct Dash {
+    steps: [f32; MAX_DASH_STEPS],
+    len: u8,
+}
+
+impl Dash {
+    /// The pattern of `steps` (at most [`MAX_DASH_STEPS`], each 0 to [`MAX_DASH_STEP`]), or
+    /// `None` for none: no steps, a step that isn't a number from 0 to [`MAX_DASH_STEP`], too
+    /// many, or all of them 0.
+    pub fn new(steps: &[f32]) -> Option<Dash> {
+        let ok = |v: &f32| v.is_finite() && (0.0..=MAX_DASH_STEP).contains(v);
+        if steps.is_empty() || steps.len() > MAX_DASH_STEPS || !steps.iter().all(ok) || steps.iter().sum::<f32>() <= 0.0 {
+            return None;
+        }
+        let mut d = Dash { steps: [0.0; MAX_DASH_STEPS], len: u8::try_from(steps.len()).ok()? };
+        d.steps.get_mut(..steps.len())?.copy_from_slice(steps);
+        Some(d)
+    }
+
+    /// Its steps, as given.
+    pub fn steps(&self) -> &[f32] {
+        self.steps.get(..usize::from(self.len)).unwrap_or(&[])
+    }
+
+    /// Its steps made even (an odd number twice over), as a renderer takes them.
+    pub fn even_steps(&self) -> Vec<f32> {
+        let s = self.steps();
+        if s.len().is_multiple_of(2) { s.to_vec() } else { s.iter().chain(s).copied().collect() }
+    }
+
+    /// One round of the pattern, in points.
+    pub fn period(&self) -> f32 {
+        self.even_steps().iter().sum()
+    }
+}
+
+/// Reads a stroke's pattern from a project, brought into range: at most [`MAX_DASH_STEPS`] steps,
+/// each clamped to 0 to [`MAX_DASH_STEP`] (one too large for a number, infinite, the longest);
+/// one left without length is `None`, solid (a project file is hostile input).
+fn de_dash<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Dash>, D::Error> {
+    let Some(v) = Option::<Vec<f32>>::deserialize(d)? else { return Ok(None) };
+    let steps: Vec<f32> = v.iter().take(MAX_DASH_STEPS).map(|x| if x.is_nan() { 0.0 } else { x.clamp(0.0, MAX_DASH_STEP) }).collect();
+    Ok(Dash::new(&steps))
+}
+
+impl From<Dash> for Vec<f32> {
+    fn from(d: Dash) -> Vec<f32> {
+        d.steps().to_vec()
+    }
+}
 
 /// One stroke of a line layer's stacked symbol (`Layer::line_strokes`). Widths and offsets are
 /// in points, so they keep their size on screen at every scale; the geometry is left as it is.
@@ -188,11 +317,241 @@ pub struct LineStroke {
     /// join under the cores. `None` is its place in the stack, the bottom one 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<u8>,
+    /// Dashed: the pattern along the line, in points; `None` is a solid line.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_dash")]
+    pub dash: Option<Dash>,
+    /// Markers or hash marks along the line instead of the stroke: in the stroke's colour, the
+    /// width their outline's (a hash mark's line's), shifted sideways by its offset. Cap, join
+    /// and dash don't apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markers: Option<LineMarkers>,
 }
 
 impl Default for LineStroke {
     fn default() -> Self {
-        LineStroke { color: None, width: None, offset: 0.0, cap: LineCap::Round, join: LineJoin::Round, level: None }
+        LineStroke {
+            color: None,
+            width: None,
+            offset: 0.0,
+            cap: LineCap::Round,
+            join: LineJoin::Round,
+            level: None,
+            dash: None,
+            markers: None,
+        }
+    }
+}
+
+/// The largest marker or hash mark along a line, in points.
+pub const MAX_LINE_MARKER_SIZE: f32 = 100.0;
+/// The shortest and longest interval between markers along a line, in points.
+pub const MIN_MARKER_INTERVAL: f32 = 0.5;
+pub const MAX_MARKER_INTERVAL: f32 = 10_000.0;
+
+/// Where a stroke's markers go on each part of a line, several places at once. Written to a
+/// project as their codes, `["first", "last"]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Placements(u8);
+
+impl Placements {
+    /// At every interval along the line, from its start.
+    pub const INTERVAL: Placements = Placements(1);
+    pub const VERTICES: Placements = Placements(1 << 1);
+    /// Every vertex but the first and the last.
+    pub const INNER_VERTICES: Placements = Placements(1 << 2);
+    pub const FIRST: Placements = Placements(1 << 3);
+    pub const LAST: Placements = Placements(1 << 4);
+    /// Halfway along the line.
+    pub const MIDDLE: Placements = Placements(1 << 5);
+    /// Halfway along each segment.
+    pub const SEGMENT_MIDDLES: Placements = Placements(1 << 6);
+    pub const NONE: Placements = Placements(0);
+
+    const CODES: [(Placements, &'static str); 7] = [
+        (Placements::INTERVAL, "interval"),
+        (Placements::VERTICES, "vertices"),
+        (Placements::INNER_VERTICES, "innerVertices"),
+        (Placements::FIRST, "first"),
+        (Placements::LAST, "last"),
+        (Placements::MIDDLE, "middle"),
+        (Placements::SEGMENT_MIDDLES, "segmentMiddles"),
+    ];
+
+    pub fn has(self, p: Placements) -> bool {
+        self.0 & p.0 != 0
+    }
+
+    pub fn with(self, p: Placements) -> Placements {
+        Placements(self.0 | p.0)
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Its codes, in a fixed order.
+    pub fn codes(self) -> Vec<&'static str> {
+        Self::CODES.iter().filter(|(p, _)| self.has(*p)).map(|(_, c)| *c).collect()
+    }
+
+    /// The placement a code names ("first", "middle", …), whatever its case.
+    pub fn from_code(code: &str) -> Option<Placements> {
+        Self::CODES.iter().find(|(_, c)| c.eq_ignore_ascii_case(code.trim())).map(|(p, _)| *p)
+    }
+
+    /// Every code there is, for messages.
+    pub fn all_codes() -> String {
+        Self::CODES.iter().map(|(_, c)| format!("\"{c}\"")).collect::<Vec<_>>().join(", ")
+    }
+}
+
+impl Default for Placements {
+    fn default() -> Self {
+        Placements::INTERVAL
+    }
+}
+
+impl Serialize for Placements {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.codes().serialize(s)
+    }
+}
+
+/// Read from a project leniently: codes it doesn't know are left out, and none at all is the
+/// default (at every interval).
+impl<'de> Deserialize<'de> for Placements {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let codes: Vec<String> = Vec::deserialize(d)?;
+        let p = codes.iter().take(16).filter_map(|c| Placements::from_code(c)).fold(Placements::NONE, Placements::with);
+        Ok(if p.is_empty() { Placements::default() } else { p })
+    }
+}
+
+/// A point layer's markers turned by a field's angle ([`crate::Layer::marker_rotation`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MarkerRotation {
+    /// The field the angle is read from, in degrees.
+    pub field: String,
+    /// The angle runs counterclockwise (as in mathematics), not clockwise (as on a compass).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub counterclockwise: bool,
+}
+
+/// Reads a layer's marker rotation leniently: one that isn't (a crafted file's) is none, and the rest
+/// of the layer still reads. A field name is at most [`MAX_FONT_NAME`]·2 characters.
+pub fn de_marker_rotation<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<MarkerRotation>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Read {
+        Rotation(MarkerRotation),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Option::<Read>::deserialize(d)? {
+        Some(Read::Rotation(r)) if !r.field.is_empty() && r.field.chars().count() <= 2 * MAX_FONT_NAME => Some(r),
+        _ => None,
+    })
+}
+
+impl MarkerRotation {
+    /// Row `row`'s turn in degrees clockwise: 0 where its value isn't a number (or the field is gone).
+    pub fn turn(&self, ds: &Dataset, row: usize) -> f32 {
+        let Some(v) = ds.field_index(&self.field).and_then(|fi| ds.value(row, fi).as_f64()).filter(|v| v.is_finite()) else {
+            return 0.0;
+        };
+        let a = v.rem_euclid(360.0) as f32;
+        if self.counterclockwise { -a } else { a }
+    }
+}
+
+/// What a stroke draws along a line instead of a line: a marker, or a hash mark across it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LineMark {
+    Marker(Marker),
+    Hash,
+}
+
+impl Default for LineMark {
+    fn default() -> Self {
+        LineMark::Marker(Marker::Circle)
+    }
+}
+
+/// Markers or hash marks along a line (a [`LineStroke::markers`]), as QGIS's marker and hashed
+/// lines draw them. Lengths are in points.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LineMarkers {
+    #[serde(default)]
+    pub mark: LineMark,
+    /// A marker's size, or a hash mark's length.
+    #[serde(default = "LineMarkers::default_size")]
+    pub size: f32,
+    #[serde(default)]
+    pub at: Placements,
+    /// The distance between two markers placed at every interval.
+    #[serde(default = "LineMarkers::default_interval")]
+    pub interval: f32,
+    /// How far along the line the markers move: from its start (at every interval, the first
+    /// vertex), back from its end (the last vertex), or on from the middle.
+    #[serde(default)]
+    pub offset_along: f32,
+    /// Turned with the line, so a marker's top faces left of the line's direction; otherwise
+    /// upright.
+    #[serde(default = "LineMarkers::yes")]
+    pub rotate: bool,
+    /// The stretch of line, centred on a marker placed at an interval, whose direction it turns
+    /// with: smoother on a line of many short bends. 0 is the direction of the segment it sits on.
+    #[serde(default)]
+    pub average_angle: f32,
+    /// Turned further, in degrees clockwise. A hash mark at 0 crosses the line square.
+    #[serde(default)]
+    pub angle: f32,
+    /// A marker's outline colour; `None` draws none. Its width is the stroke's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outline: Option<Rgba>,
+}
+
+impl Default for LineMarkers {
+    fn default() -> Self {
+        LineMarkers {
+            mark: LineMark::default(),
+            size: Self::default_size(),
+            at: Placements::default(),
+            interval: Self::default_interval(),
+            offset_along: 0.0,
+            rotate: true,
+            average_angle: 0.0,
+            angle: 0.0,
+            outline: None,
+        }
+    }
+}
+
+impl LineMarkers {
+    fn default_size() -> f32 {
+        4.0
+    }
+
+    fn default_interval() -> f32 {
+        12.0
+    }
+
+    fn yes() -> bool {
+        true
+    }
+
+    /// Brought into range: a size from 0 to [`MAX_LINE_MARKER_SIZE`], an interval from
+    /// [`MIN_MARKER_INTERVAL`] to [`MAX_MARKER_INTERVAL`], an offset along the line and an
+    /// averaging stretch within the longest interval, an angle within a turn.
+    pub fn clamped(mut self) -> LineMarkers {
+        // Too large for an f32 (infinite once read) is the nearest bound, as a large value is.
+        let fit = |v: f32, lo: f32, hi: f32, or: f32| if v.is_nan() { or } else { v.clamp(lo, hi) };
+        self.size = fit(self.size, 0.0, MAX_LINE_MARKER_SIZE, Self::default_size());
+        self.interval = fit(self.interval, MIN_MARKER_INTERVAL, MAX_MARKER_INTERVAL, Self::default_interval());
+        self.offset_along = fit(self.offset_along, -MAX_MARKER_INTERVAL, MAX_MARKER_INTERVAL, 0.0);
+        self.average_angle = fit(self.average_angle, 0.0, MAX_MARKER_INTERVAL, 0.0);
+        self.angle = if self.angle.is_finite() { self.angle.rem_euclid(360.0) } else { 0.0 };
+        self
     }
 }
 
@@ -212,6 +571,7 @@ impl LineStroke {
     pub fn clamped(mut self) -> LineStroke {
         self.width = self.width.map(|w| if w.is_finite() { w.clamp(0.0, MAX_STROKE_WIDTH) } else { 1.0 });
         self.offset = if self.offset.is_finite() { self.offset.clamp(-MAX_STROKE_OFFSET, MAX_STROKE_OFFSET) } else { 0.0 };
+        self.markers = self.markers.map(LineMarkers::clamped);
         self
     }
 }
@@ -248,15 +608,41 @@ pub enum ClassMethod {
     NaturalBreaks,
     EqualInterval,
     Quantile,
+    /// Class widths that grow by one ratio, for values that pile up at the low end.
+    GeometricInterval,
+    /// Classes one standard deviation wide about the mean.
+    StandardDeviation,
+    /// Class widths that grow by one step (1, 2, 3… units), for more detail among the low values.
+    ArithmeticProgression,
+    /// Splits at the mean, then at the mean of the values above it, while they stay a minority: for
+    /// a few very large values among many small ones. It sets its own number of classes, at most
+    /// the number asked.
+    HeadTailBreaks,
+    /// Bounds typed by hand, kept as they are (see [`Renderer::graduated_manual`]).
+    Manual,
 }
 
 impl ClassMethod {
-    pub const ALL: [ClassMethod; 3] = [ClassMethod::NaturalBreaks, ClassMethod::EqualInterval, ClassMethod::Quantile];
+    pub const ALL: [ClassMethod; 8] = [
+        ClassMethod::NaturalBreaks,
+        ClassMethod::EqualInterval,
+        ClassMethod::Quantile,
+        ClassMethod::GeometricInterval,
+        ClassMethod::StandardDeviation,
+        ClassMethod::ArithmeticProgression,
+        ClassMethod::HeadTailBreaks,
+        ClassMethod::Manual,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             ClassMethod::NaturalBreaks => "Natural Breaks (Jenks)",
             ClassMethod::EqualInterval => "Equal Interval",
             ClassMethod::Quantile => "Quantile",
+            ClassMethod::GeometricInterval => "Geometric Interval",
+            ClassMethod::StandardDeviation => "Standard Deviation",
+            ClassMethod::ArithmeticProgression => "Arithmetic Progression",
+            ClassMethod::HeadTailBreaks => "Head/Tail Breaks",
+            ClassMethod::Manual => "Manual",
         }
     }
     pub fn from_name(s: &str) -> Option<ClassMethod> {
@@ -265,6 +651,13 @@ impl ClassMethod {
             "naturalbreaks" | "natural_breaks" | "jenks" | "natural breaks" => ClassMethod::NaturalBreaks,
             "equalinterval" | "equal_interval" | "equal interval" => ClassMethod::EqualInterval,
             "quantile" => ClassMethod::Quantile,
+            "geometricinterval" | "geometric_interval" | "geometric interval" | "geometric" => ClassMethod::GeometricInterval,
+            "standarddeviation" | "standard_deviation" | "standard deviation" | "stddev" => ClassMethod::StandardDeviation,
+            "arithmeticprogression" | "arithmetic_progression" | "arithmetic progression" | "arithmetic" => {
+                ClassMethod::ArithmeticProgression
+            }
+            "headtailbreaks" | "head_tail_breaks" | "head/tail breaks" | "head/tail" | "headtail" => ClassMethod::HeadTailBreaks,
+            "manual" => ClassMethod::Manual,
             _ => return None,
         })
     }
@@ -302,6 +695,11 @@ pub enum Renderer {
         ramp: Ramp,
         method: ClassMethod,
         min: f64,
+        /// The classes asked for: there can be fewer breaks, as Standard Deviation, Head/Tail
+        /// Breaks and repeated bounds give fewer. 0 (a project from before it was kept) is as many
+        /// as there are breaks; see [`Renderer::classes_asked`].
+        #[serde(default)]
+        classes: usize,
         /// Legend labels set by hand, by class index (0 is the lowest class); a class without one
         /// shows its range.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -444,6 +842,56 @@ impl Renderer {
         ramp: Ramp,
         base: Symbol,
     ) -> Result<Renderer, String> {
+        let k = classes.clamp(1, 12);
+        Self::graduated_by(ds, rows, field, method, ramp, base, |vals| Ok(class_breaks(vals, k, method))).map(|mut r| {
+            if let Renderer::Graduated { classes, .. } = &mut r {
+                *classes = k;
+            }
+            r
+        })
+    }
+
+    /// Builds a graduated-colours renderer on the class bounds typed by hand: the classes' upper
+    /// bounds, sorted and each once, closed by the field's largest value when they stop short of
+    /// it, so every feature has a class. At most 12 classes.
+    pub fn graduated_manual(
+        ds: &Dataset,
+        rows: &[bool],
+        field: &str,
+        breaks: &[f64],
+        ramp: Ramp,
+        base: Symbol,
+    ) -> Result<Renderer, String> {
+        Self::graduated_by(ds, rows, field, ClassMethod::Manual, ramp, base, |vals| {
+            let mut b: Vec<f64> = breaks.iter().copied().filter(|v| v.is_finite()).collect();
+            if b.is_empty() {
+                return Err("manual breaks need at least one number".into());
+            }
+            b.sort_by(|a, b| a.total_cmp(b));
+            b.dedup();
+            if let Some(&hi) = vals.last()
+                && b.last().is_some_and(|&l| l < hi)
+            {
+                b.push(hi);
+            }
+            if b.len() > 12 {
+                return Err(format!("{} classes; Graduated Colors takes at most 12", b.len()));
+            }
+            Ok(b)
+        })
+    }
+
+    /// A graduated renderer on `field`, with the bounds `breaks` works out from the field's sorted
+    /// values.
+    fn graduated_by(
+        ds: &Dataset,
+        rows: &[bool],
+        field: &str,
+        method: ClassMethod,
+        ramp: Ramp,
+        base: Symbol,
+        breaks: impl FnOnce(&[f64]) -> Result<Vec<f64>, String>,
+    ) -> Result<Renderer, String> {
         let fi = ds.field_index(field).ok_or_else(|| format!("no field named '{field}'"))?;
         if !ds.fields.get(fi).is_some_and(|f| f.ty.is_numeric()) {
             return Err(format!("'{field}' is not a numeric field"));
@@ -453,8 +901,7 @@ impl Renderer {
             return Err(format!("'{field}' has no numeric values"));
         }
         vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let k = classes.clamp(1, 12);
-        let breaks = class_breaks(&vals, k, method);
+        let breaks = breaks(&vals)?;
         let n = breaks.len();
         let symbols = (0..n).map(|i| base.with_ramp_fill(ramp.pick(i, n), ds.geometry_type)).collect();
         let min = vals.first().copied().unwrap_or(0.0);
@@ -465,9 +912,25 @@ impl Renderer {
             ramp,
             method,
             min,
+            classes: n,
             class_labels: BTreeMap::new(),
             class_strokes: BTreeMap::new(),
         })
+    }
+
+    /// A Graduated Colors renderer's classes as asked, which can be more than it has (see
+    /// `classes`); 0 for other renderers.
+    pub fn classes_asked(&self) -> usize {
+        match self {
+            Renderer::Graduated { classes, breaks, .. } => {
+                if *classes > 0 {
+                    *classes
+                } else {
+                    breaks.len()
+                }
+            }
+            _ => 0,
+        }
     }
 
     /// Builds a proportional-symbols renderer on a numeric `field`, sized over the rows `rows` keeps
@@ -910,6 +1373,16 @@ impl Renderer {
             Renderer::Proportional { base, .. } => f(base),
         }
     }
+
+    /// Whether any symbol is a character of a font ([`Marker::Char`]).
+    pub fn has_char_markers(&self) -> bool {
+        let char = |s: &Symbol| matches!(s.marker, Marker::Char(_));
+        match self {
+            Renderer::Single(s) | Renderer::Proportional { base: s, .. } => char(s),
+            Renderer::Unique { classes, other, .. } => char(other) || classes.iter().any(|c| char(&c.1)),
+            Renderer::Graduated { symbols, .. } => symbols.iter().any(char),
+        }
+    }
 }
 
 /// `new` with the hand-made parts of `old`, a class whose scheme colour was `scheme`: the fill
@@ -982,14 +1455,99 @@ pub fn class_breaks(sorted: &[f64], k: usize, method: ClassMethod) -> Vec<f64> {
         return vec![hi];
     }
     let mut b = match method {
-        ClassMethod::EqualInterval => (1..=k).map(|i| lo + (hi - lo) * i as f64 / k as f64).collect::<Vec<_>>(),
+        // Manual bounds are typed, not worked out: asked to work them out, it starts from equal intervals.
+        ClassMethod::EqualInterval | ClassMethod::Manual => (1..=k).map(|i| lo + (hi - lo) * i as f64 / k as f64).collect::<Vec<_>>(),
         ClassMethod::Quantile => (1..=k).map(|i| sorted.get(((n * i) / k).saturating_sub(1).min(n - 1)).copied().unwrap_or(hi)).collect(),
         ClassMethod::NaturalBreaks => jenks(sorted, k),
+        ClassMethod::GeometricInterval => {
+            // Positive values: each bound is the one before times (hi / lo)^(1/k), worked out on
+            // logarithms. Values from zero or below are taken as if the minimum sat at a hundredth
+            // of the range, which makes the ratio 101^(1/k); each bound is then a share of the way
+            // from lo to hi. Neither adds large values, so the bounds stay finite and in order.
+            let range = hi - lo;
+            (1..=k)
+                .map(|i| {
+                    let f = i as f64 / k as f64;
+                    let v = if lo > 0.0 {
+                        (lo.ln() + (hi.ln() - lo.ln()) * f).exp()
+                    } else {
+                        let t = (101f64.powf(f) - 1.0) / 100.0;
+                        if range.is_finite() { lo + range * t } else { lo * (1.0 - t) + hi * t }
+                    };
+                    v.clamp(lo, hi)
+                })
+                .collect()
+        }
+        ClassMethod::StandardDeviation => {
+            // On values scaled by the largest magnitude, so the squares can't overflow.
+            let s = lo.abs().max(hi.abs());
+            let mean_s = sorted.iter().map(|v| v / s).sum::<f64>() / n as f64;
+            let mean = mean_s * s;
+            let sd = s * (sorted.iter().map(|v| (v / s - mean_s).powi(2)).sum::<f64>() / n as f64).sqrt();
+            // k − 1 inner bounds one deviation apart, centred on the mean. A bound with no value
+            // above the one before it is dropped, so no class is empty.
+            let inner = (1..k).map(|i| mean + sd * (i as f64 - k as f64 / 2.0)).filter(|&v| v > lo && v < hi);
+            let mut b = Vec::new();
+            let mut below = 0;
+            for v in inner.chain(std::iter::once(hi)) {
+                let upto = sorted.partition_point(|x| *x <= v);
+                if upto > below {
+                    b.push(v);
+                    below = upto;
+                }
+            }
+            b
+        }
+        ClassMethod::ArithmeticProgression => {
+            // Widths of 1, 2… k units, which add up to the range: the i-th bound is i(i + 1)/2 units
+            // above lo. Taken as a share of the way from lo to hi, so an infinite range can't overflow.
+            let range = hi - lo;
+            let units = k.saturating_mul(k.saturating_add(1)) as f64 / 2.0;
+            (1..=k)
+                .map(|i| {
+                    let t = (i.saturating_mul(i.saturating_add(1)) as f64 / 2.0 / units).min(1.0);
+                    let v = if range.is_finite() { lo + range * t } else { lo * (1.0 - t) + hi * t };
+                    v.clamp(lo, hi)
+                })
+                .collect()
+        }
+        ClassMethod::HeadTailBreaks => head_tail(sorted, k),
     };
-    b.dedup_by(|a, b| (*a - *b).abs() < f64::EPSILON);
+    // Only bounds that are the same value: any tolerance merges distinct values somewhere (tiny
+    // ones under an absolute one, large ones under a relative one). Repeated bounds come from
+    // repeated values (quantiles, Jenks), so they are equal exactly.
+    b.dedup();
     if let Some(l) = b.last_mut() {
         *l = hi;
     }
+    b
+}
+
+/// Head/tail breaks (Jiang, 2013): a bound at the mean, then at the mean of the head (the values
+/// above it), and so on while the head holds under 40% of the values it was taken from, for at
+/// most k classes. The last bound is the maximum.
+fn head_tail(sorted: &[f64], k: usize) -> Vec<f64> {
+    let mut b = Vec::new();
+    let mut slice = sorted;
+    while b.len() + 1 < k && slice.len() > 1 {
+        // On values scaled by the largest magnitude (the slice is sorted), so neither a sum of large
+        // values nor large values of opposite signs can overflow.
+        let (Some(&first), Some(&last)) = (slice.first(), slice.last()) else { break };
+        let s = first.abs().max(last.abs());
+        let mean = if s > 0.0 { s * (slice.iter().map(|v| v / s).sum::<f64>() / slice.len() as f64) } else { 0.0 };
+        let tail = slice.partition_point(|x| *x <= mean);
+        // No value at or below the mean (or none above it): no split.
+        if tail == 0 {
+            break;
+        }
+        let Some(head) = slice.get(tail..).filter(|h| !h.is_empty()) else { break };
+        b.push(mean);
+        if head.len() as f64 >= 0.4 * slice.len() as f64 {
+            break;
+        }
+        slice = head;
+    }
+    b.extend(sorted.last());
     b
 }
 
@@ -1046,7 +1604,7 @@ fn jenks(sorted: &[f64], k: usize) -> Vec<f64> {
     breaks
 }
 
-/// The label sizes `labels.style` accepts, in points (Style › Text Symbol).
+/// The label sizes `labels.style` accepts, in points (Labeling › Text Symbol).
 pub const LABEL_SIZE: std::ops::RangeInclusive<f64> = 4.0..=72.0;
 
 /// The most label classes a layer keeps besides its Default class.
@@ -1150,6 +1708,209 @@ pub struct LabelClass {
     /// Where a label sits relative to its feature.
     #[serde(default)]
     pub placement: LabelPlacement,
+    /// Slanted (an italic face where the font has one).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub italic: bool,
+    /// The installed font family the labels are drawn in, by name ("Liberation Sans Narrow"), as
+    /// QGIS names a text format's; none is the label font. A machine without the family draws
+    /// them in the label font too.
+    #[serde(default, deserialize_with = "de_font", skip_serializing_if = "Option::is_none")]
+    pub font: Option<String>,
+    /// The halo's colour, as QGIS's buffer has one; none picks one that stands out from the text
+    /// (white behind dark text, dark behind light).
+    #[serde(default, deserialize_with = "de_halo_color", skip_serializing_if = "Option::is_none")]
+    pub halo_color: Option<Rgba>,
+    /// How far the halo reaches beyond the letters (points, within [`HALO_WIDTH`]), as QGIS's
+    /// buffer size; none is RustGIS's thin halo.
+    #[serde(default, deserialize_with = "de_halo_width", skip_serializing_if = "Option::is_none")]
+    pub halo_width: Option<f32>,
+    /// Space added between letters (points, within a layout text's range), as QGIS's letter
+    /// spacing; negative draws them tighter.
+    #[serde(default, deserialize_with = "de_letter_spacing", skip_serializing_if = "is_zero")]
+    pub spacing: f32,
+    /// How far the label is moved from where its placement puts it (points, right and down, each
+    /// within [`LABEL_OFFSET`]), as QGIS's offset from a point; a label along a line isn't moved.
+    #[serde(default, deserialize_with = "de_label_offset", skip_serializing_if = "is_no_offset")]
+    pub offset: [f32; 2],
+    /// A shape drawn behind the text, as QGIS's label background; none draws the text alone.
+    #[serde(default, deserialize_with = "de_background", skip_serializing_if = "Option::is_none")]
+    pub background: Option<LabelBackground>,
+}
+
+/// How far a label's offset moves it each way (points).
+pub const LABEL_OFFSET: std::ops::RangeInclusive<f64> = -200.0..=200.0;
+
+/// A rectangle behind a label's text, as QGIS's rectangle background: the text's block grown by
+/// its padding, filled and outlined, its corners rounded.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LabelBackground {
+    /// Its fill; none leaves it see-through.
+    #[serde(deserialize_with = "de_halo_color")]
+    pub fill: Option<Rgba>,
+    /// Its outline's colour; none draws no outline.
+    #[serde(deserialize_with = "de_halo_color")]
+    pub stroke: Option<Rgba>,
+    /// Its outline's width (points, within [`BACKGROUND_STROKE`]).
+    #[serde(deserialize_with = "de_background_stroke")]
+    pub stroke_width: f32,
+    /// How far it reaches past the text's block, across and up and down (points, each within
+    /// [`BACKGROUND_PADDING`]).
+    #[serde(deserialize_with = "de_background_padding")]
+    pub padding: [f32; 2],
+    /// Its corners' radius (points, within [`BACKGROUND_PADDING`]); 0 is square.
+    #[serde(deserialize_with = "de_background_radius")]
+    pub radius: f32,
+}
+
+impl Default for LabelBackground {
+    /// White, with a thin dark outline (SMV25's road numbers): what Background turns on.
+    fn default() -> Self {
+        LabelBackground {
+            fill: Some(Rgba::rgb(255, 255, 255)),
+            stroke: Some(Rgba::rgb(38, 38, 38)),
+            stroke_width: 0.3,
+            padding: [1.0, 0.5],
+            radius: 0.0,
+        }
+    }
+}
+
+impl LabelBackground {
+    /// Kept within its ranges (a command's or a crafted file's numbers).
+    pub fn checked(self) -> LabelBackground {
+        // (One past f32's range, infinite, is the most; none of no number.)
+        let within = |v: f32, r: &std::ops::RangeInclusive<f64>| if v.is_nan() { 0.0 } else { v.clamp(*r.start() as f32, *r.end() as f32) };
+        LabelBackground {
+            stroke_width: within(self.stroke_width, &BACKGROUND_STROKE),
+            padding: self.padding.map(|p| within(p, &BACKGROUND_PADDING)),
+            radius: within(self.radius, &BACKGROUND_PADDING),
+            ..self
+        }
+    }
+
+    /// Grown `factor` times, as its label is by a reference scale.
+    pub fn scaled(&self, factor: f32) -> LabelBackground {
+        LabelBackground {
+            stroke_width: self.stroke_width * factor,
+            padding: self.padding.map(|p| p * factor),
+            radius: self.radius * factor,
+            ..self.clone()
+        }
+    }
+
+    /// Whether it draws anything: a fill or an outline that shows.
+    pub fn draws(&self) -> bool {
+        self.fill.is_some_and(|f| f.a() > 0) || (self.stroke.is_some_and(|s| s.a() > 0) && self.stroke_width > 0.0)
+    }
+}
+
+/// The widths a label background's outline takes (points).
+pub const BACKGROUND_STROKE: std::ops::RangeInclusive<f64> = 0.0..=10.0;
+/// The paddings and corner radii a label background takes (points).
+pub const BACKGROUND_PADDING: std::ops::RangeInclusive<f64> = 0.0..=50.0;
+
+/// A label's offset, each way within [`LABEL_OFFSET`]; one that isn't two numbers is none.
+fn de_label_offset<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[f32; 2], D::Error> {
+    let within = |v: f64| if v.is_finite() { v.clamp(*LABEL_OFFSET.start(), *LABEL_OFFSET.end()) as f32 } else { 0.0 };
+    Ok(lenient::<D, [f64; 2]>(d)?.map_or([0.0; 2], |o| o.map(within)))
+}
+
+fn is_no_offset(o: &[f32; 2]) -> bool {
+    *o == [0.0; 2]
+}
+
+/// A label's background, kept within its ranges; one that isn't a background is none.
+fn de_background<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<LabelBackground>, D::Error> {
+    Ok(lenient::<D, LabelBackground>(d)?.map(LabelBackground::checked))
+}
+
+fn de_background_stroke<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+    Ok(lenient::<D, f64>(d)?
+        .filter(|v| v.is_finite())
+        .map_or(0.0, |v| v.clamp(*BACKGROUND_STROKE.start(), *BACKGROUND_STROKE.end()) as f32))
+}
+
+fn de_background_padding<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[f32; 2], D::Error> {
+    let within = |v: f64| if v.is_finite() { v.clamp(*BACKGROUND_PADDING.start(), *BACKGROUND_PADDING.end()) as f32 } else { 0.0 };
+    Ok(lenient::<D, [f64; 2]>(d)?.map_or([0.0; 2], |p| p.map(within)))
+}
+
+fn de_background_radius<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+    Ok(lenient::<D, f64>(d)?
+        .filter(|v| v.is_finite())
+        .map_or(0.0, |v| v.clamp(*BACKGROUND_PADDING.start(), *BACKGROUND_PADDING.end()) as f32))
+}
+
+/// The widths a label's halo takes (points).
+pub const HALO_WIDTH: std::ops::RangeInclusive<f64> = 0.0..=10.0;
+
+/// A label's halo width as `labels.style` would leave it: within [`HALO_WIDTH`]; one that isn't a
+/// number (a crafted file's) is none, the thin halo.
+fn de_halo_width<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Error> {
+    Ok(lenient::<D, f64>(d)?.filter(|w| w.is_finite()).map(|w| w.clamp(*HALO_WIDTH.start(), *HALO_WIDTH.end()) as f32))
+}
+
+/// A label's halo colour; one that isn't a colour is none, the automatic one.
+fn de_halo_color<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Rgba>, D::Error> {
+    lenient::<D, Rgba>(d)
+}
+
+/// A label's letter spacing, within a layout text's range; one that isn't a number is none.
+fn de_letter_spacing<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+    use crate::layout::{MAX_LETTER_SPACING, MIN_LETTER_SPACING};
+    Ok(lenient::<D, f64>(d)?.filter(|s| s.is_finite()).map_or(0.0, |s| s.clamp(MIN_LETTER_SPACING, MAX_LETTER_SPACING) as f32))
+}
+
+/// A value of type `T`, or none for anything else, so a damaged setting doesn't make the project
+/// unreadable.
+fn lenient<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Read<T> {
+        Value(T),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Option::<Read<T>>::deserialize(d)? {
+        Some(Read::Value(v)) => Some(v),
+        Some(Read::Other(_)) | None => None,
+    })
+}
+
+fn is_zero(v: &f32) -> bool {
+    *v == 0.0
+}
+
+/// A halo that stands out from text of colour `text`: white behind dark text, dark behind light.
+pub fn auto_halo(text: Rgba) -> Rgba {
+    let lum = 0.299 * text.r() as f32 + 0.587 * text.g() as f32 + 0.114 * text.b() as f32;
+    if lum < 140.0 { Rgba::new(255, 255, 255, 225) } else { Rgba::new(20, 22, 26, 210) }
+}
+
+/// The longest font family name kept (characters).
+pub const MAX_FONT_NAME: usize = 128;
+
+/// A label font's family name as it is kept: trimmed, at most [`MAX_FONT_NAME`] characters, and
+/// none when blank.
+pub fn font_name(name: &str) -> Option<String> {
+    let name: String = name.trim().chars().filter(|c| !c.is_control()).take(MAX_FONT_NAME).collect();
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// A label class's font as a project has it, kept as [`font_name`] keeps it: a name, or none for
+/// anything else (a number, a list), so a damaged font doesn't make the project unreadable.
+pub(crate) fn de_font<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Font {
+        Name(String),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Option::<Font>::deserialize(d)? {
+        Some(Font::Name(n)) => font_name(&n),
+        Some(Font::Other(_)) | None => None,
+    })
 }
 
 fn default_class_name() -> String {
@@ -1183,10 +1944,22 @@ pub enum LabelPlacement {
     AboveLeft,
     BelowRight,
     BelowLeft,
+    /// Along a line, straight, turned to its direction across the text, at its middle; points
+    /// and polygons are labelled as `Auto`.
+    Parallel,
+    /// Along a line, each character turned with it where it bends, at its middle; points and
+    /// polygons are labelled as `Auto`.
+    Curved,
 }
 
 impl LabelPlacement {
-    pub const ALL: [LabelPlacement; 10] = [
+    /// Whether a line is labelled along it ([`Parallel`](Self::Parallel) or
+    /// [`Curved`](Self::Curved)).
+    pub fn along_line(self) -> bool {
+        matches!(self, LabelPlacement::Parallel | LabelPlacement::Curved)
+    }
+
+    pub const ALL: [LabelPlacement; 12] = [
         LabelPlacement::Auto,
         LabelPlacement::Center,
         LabelPlacement::Above,
@@ -1197,6 +1970,8 @@ impl LabelPlacement {
         LabelPlacement::AboveLeft,
         LabelPlacement::BelowRight,
         LabelPlacement::BelowLeft,
+        LabelPlacement::Parallel,
+        LabelPlacement::Curved,
     ];
     pub fn code(self) -> &'static str {
         match self {
@@ -1210,6 +1985,8 @@ impl LabelPlacement {
             LabelPlacement::AboveLeft => "aboveLeft",
             LabelPlacement::BelowRight => "belowRight",
             LabelPlacement::BelowLeft => "belowLeft",
+            LabelPlacement::Parallel => "parallel",
+            LabelPlacement::Curved => "curved",
         }
     }
     pub fn label(self) -> &'static str {
@@ -1224,6 +2001,8 @@ impl LabelPlacement {
             LabelPlacement::AboveLeft => "Above Left",
             LabelPlacement::BelowRight => "Below Right",
             LabelPlacement::BelowLeft => "Below Left",
+            LabelPlacement::Parallel => "Parallel",
+            LabelPlacement::Curved => "Curved",
         }
     }
     pub fn from_code(s: &str) -> Option<LabelPlacement> {
@@ -1235,8 +2014,8 @@ impl LabelPlacement {
         let gap = marker / 2.0 + 2.0;
         let (dx, dy) = (w / 2.0 + gap, h / 2.0 + gap);
         match self {
-            LabelPlacement::Auto if is_point => (0.0, -(marker / 2.0 + h * 0.6)),
-            LabelPlacement::Auto | LabelPlacement::Center => (0.0, 0.0),
+            LabelPlacement::Auto | LabelPlacement::Parallel | LabelPlacement::Curved if is_point => (0.0, -(marker / 2.0 + h * 0.6)),
+            LabelPlacement::Auto | LabelPlacement::Center | LabelPlacement::Parallel | LabelPlacement::Curved => (0.0, 0.0),
             LabelPlacement::Above => (0.0, -dy),
             LabelPlacement::Below => (0.0, dy),
             LabelPlacement::Left => (-dx, 0.0),
@@ -1274,7 +2053,19 @@ impl LabelClass {
             closest: None,
             farthest: None,
             placement: LabelPlacement::Auto,
+            italic: false,
+            font: None,
+            halo_color: None,
+            halo_width: None,
+            spacing: 0.0,
+            offset: [0.0; 2],
+            background: None,
         }
+    }
+
+    /// The halo's colour behind text of colour `text`: its own, else one that stands out.
+    pub fn halo_color_for(&self, text: Rgba) -> Rgba {
+        self.halo_color.unwrap_or_else(|| auto_halo(text))
     }
 
     /// Whether labels draw at a scale denominator and viewing distance (metres).
@@ -1397,6 +2188,145 @@ mod tests {
         assert_eq!(v["field"], "name");
         assert_eq!(v["classes"][0]["where"], "capital = 1");
         assert_eq!(serde_json::from_value::<Labeling>(v).unwrap(), with);
+    }
+
+    /// A label font is kept by its family name, trimmed and bounded (a project file is hostile
+    /// input); a blank one is the label font, and isn't written.
+    #[test]
+    fn a_label_font_is_kept_by_name() {
+        let read = |font: serde_json::Value| {
+            serde_json::from_value::<Labeling>(serde_json::json!({
+                "enabled": true, "field": "name", "size": 9.0, "color": [0, 0, 0, 255], "halo": false, "bold": false, "font": font
+            }))
+            .unwrap()
+        };
+        let l = read("  Liberation Sans Narrow \n".into());
+        assert_eq!(l.default.font.as_deref(), Some("Liberation Sans Narrow"));
+        assert_eq!(serde_json::to_value(&l).unwrap()["font"], "Liberation Sans Narrow");
+        // Not a name (a number, a list, an object): no font, and the rest of the labels still read.
+        for blank in [
+            serde_json::json!("  "),
+            serde_json::Value::Null,
+            serde_json::json!(7),
+            serde_json::json!(["Arial"]),
+            serde_json::json!({"a": 1}),
+        ] {
+            let l = read(blank);
+            assert_eq!(l.default.font, None);
+            assert!(serde_json::to_value(&l).unwrap().get("font").is_none());
+        }
+        assert_eq!(read("x".repeat(10_000).into()).default.font.map(|f| f.chars().count()), Some(MAX_FONT_NAME));
+    }
+
+    /// A halo's colour and width and the letter spacing are kept; a label saved before them, or
+    /// one without them, is written as it always was; a crafted value reads as none (or within its
+    /// range) and the rest of the labels still read.
+    #[test]
+    fn a_labels_halo_and_letter_spacing_are_kept_and_old_labels_save_as_before() {
+        let base = serde_json::json!({"enabled": true, "field": "name", "size": 9.0, "color": [0, 0, 0, 255], "halo": true, "bold": false});
+        let read = |extra: serde_json::Value| {
+            let mut v = base.clone();
+            if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) {
+                o.extend(e.clone());
+            }
+            serde_json::from_value::<Labeling>(v).unwrap()
+        };
+        let old = read(serde_json::json!({}));
+        assert_eq!((old.default.halo_color, old.default.halo_width, old.default.spacing), (None, None, 0.0));
+        let saved = serde_json::to_value(&old).unwrap();
+        for k in ["halo_color", "halo_width", "spacing"] {
+            assert!(saved.get(k).is_none(), "{k} written for a label without it");
+        }
+        let l = read(serde_json::json!({"halo_color": [255, 238, 0, 255], "halo_width": 1.42, "spacing": 0.5}));
+        assert_eq!((l.default.halo_color, l.default.halo_width, l.default.spacing), (Some(Rgba::rgb(255, 238, 0)), Some(1.42), 0.5));
+        assert_eq!(serde_json::from_value::<Labeling>(serde_json::to_value(&l).unwrap()).unwrap(), l);
+        let junk = read(serde_json::json!({"halo_color": "pink", "halo_width": "wide", "spacing": [1]}));
+        assert_eq!((junk.default.halo_color, junk.default.halo_width, junk.default.spacing), (None, None, 0.0));
+        assert_eq!(junk.default.field, "name");
+        let far = read(serde_json::json!({"halo_width": 1e30, "spacing": -1e30}));
+        assert_eq!((far.default.halo_width, far.default.spacing), (Some(10.0), -5.0));
+        assert_eq!(read(serde_json::json!({"halo_width": -3})).default.halo_width, Some(0.0));
+        // The automatic colour is the one labels always had.
+        assert_eq!(l.default.halo_color_for(Rgba::rgb(0, 0, 0)), Rgba::rgb(255, 238, 0));
+        assert_eq!(old.default.halo_color_for(Rgba::rgb(0, 0, 0)), Rgba::new(255, 255, 255, 225));
+        assert_eq!(old.default.halo_color_for(Rgba::rgb(255, 255, 255)), Rgba::new(20, 22, 26, 210));
+    }
+
+    /// An offset and a background are kept; a label without them is written as it always was; a
+    /// crafted value reads as none (or within its range) and the rest of the labels still read.
+    #[test]
+    fn a_labels_offset_and_background_are_kept_and_old_labels_save_as_before() {
+        let base = serde_json::json!({"enabled": true, "field": "name", "size": 9.0, "color": [0, 0, 0, 255], "halo": true, "bold": false});
+        let read = |extra: serde_json::Value| {
+            let mut v = base.clone();
+            if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) {
+                o.extend(e.clone());
+            }
+            serde_json::from_value::<Labeling>(v).unwrap()
+        };
+        let old = read(serde_json::json!({}));
+        assert_eq!((old.default.offset, old.default.background.as_ref()), ([0.0; 2], None));
+        let saved = serde_json::to_value(&old).unwrap();
+        for k in ["offset", "background"] {
+            assert!(saved.get(k).is_none(), "{k} written for a label without it");
+        }
+        let bg = serde_json::json!({"fill": [255, 255, 255, 255], "stroke": null, "stroke_width": 0.28, "padding": [1.22, 0.28], "radius": 0.71});
+        let l = read(serde_json::json!({"offset": [5.67, -2.83], "background": bg}));
+        assert_eq!(l.default.offset, [5.67, -2.83]);
+        let want =
+            LabelBackground { fill: Some(Rgba::rgb(255, 255, 255)), stroke: None, stroke_width: 0.28, padding: [1.22, 0.28], radius: 0.71 };
+        assert_eq!(l.default.background.as_ref(), Some(&want));
+        assert_eq!(serde_json::from_value::<Labeling>(serde_json::to_value(&l).unwrap()).unwrap(), l);
+        // What a background leaves out is the default's.
+        let part = read(serde_json::json!({"background": {"radius": 2}}));
+        assert_eq!(part.default.background, Some(LabelBackground { radius: 2.0, ..LabelBackground::default() }));
+        // Crafted values: none, or within their ranges.
+        let junk = read(serde_json::json!({"offset": "far", "background": "box"}));
+        assert_eq!((junk.default.offset, junk.default.background.as_ref(), junk.default.field.as_str()), ([0.0; 2], None, "name"));
+        let far = read(
+            serde_json::json!({"offset": [1e30, -1e30], "background": {"fill": "pink", "stroke_width": 99, "padding": [-1, 1e9], "radius": "round"}}),
+        );
+        assert_eq!(far.default.offset, [200.0, -200.0]);
+        let b = far.default.background.unwrap();
+        assert_eq!((b.fill, b.stroke_width, b.padding, b.radius), (None, 10.0, [0.0, 50.0], 0.0));
+        assert!(read(serde_json::json!({"offset": [1]})).default.offset == [0.0; 2]);
+        // A background shows with a fill or an outline that shows.
+        assert!(LabelBackground::default().draws());
+        assert!(!LabelBackground { fill: None, stroke: None, ..LabelBackground::default() }.draws());
+        assert!(!LabelBackground { fill: None, stroke_width: 0.0, ..LabelBackground::default() }.draws());
+        assert!(!LabelBackground { fill: Some(Rgba::new(0, 0, 0, 0)), stroke: None, ..LabelBackground::default() }.draws());
+        // Grown with its label.
+        let g = want.scaled(2.0);
+        assert_eq!((g.stroke_width, g.padding, g.radius, g.fill), (0.56, [2.44, 0.56], 1.42, want.fill));
+    }
+
+    /// The shapes are written as they always were; a character with its family, which a crafted
+    /// file can't make long or many, or stop the rest from reading.
+    #[test]
+    fn character_markers_keep_their_font_and_shapes_their_saved_form() {
+        for m in Marker::ALL {
+            assert_eq!(serde_json::to_value(m).unwrap(), serde_json::json!(m.label()));
+            assert_eq!(serde_json::from_value::<Marker>(serde_json::json!(m.label())).unwrap(), m);
+        }
+        let old = serde_json::json!({"fill": [1, 2, 3, 255], "stroke": [0, 0, 0, 255], "stroke_width": 1.0, "size": 7.0, "marker": "Star"});
+        let s: Symbol = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(s).unwrap(), old);
+
+        let g = Marker::Char(Glyph::new('@', " DKM_Symbole "));
+        let v = serde_json::to_value(g).unwrap();
+        assert_eq!(v, serde_json::json!({"Char": {"ch": "@", "font": "DKM_Symbole"}}));
+        assert_eq!(serde_json::from_value::<Marker>(v).unwrap(), g);
+        // The label font's character isn't written a family.
+        assert_eq!(serde_json::to_value(Glyph::new('A', "")).unwrap(), serde_json::json!({"ch": "A"}));
+        for junk in [serde_json::json!(7), serde_json::json!(["Arial"]), serde_json::json!({"a": 1}), serde_json::Value::Null] {
+            let read: Marker = serde_json::from_value(serde_json::json!({"Char": {"ch": "x", "font": junk}})).unwrap();
+            assert_eq!(read, Marker::Char(Glyph::new('x', "")));
+        }
+        let long: Marker = serde_json::from_value(serde_json::json!({"Char": {"ch": "x", "font": "y".repeat(10_000)}})).unwrap();
+        let Marker::Char(g) = long else { panic!() };
+        assert_eq!(g.font.as_str().chars().count(), MAX_FONT_NAME);
+        // Names are kept once each: the same name is the same one.
+        assert!(std::ptr::eq(FontName::new("Some Family").as_str(), FontName::new("Some Family ").as_str()));
     }
 
     /// A project file is read with at most `MAX_LABEL_CLASSES` classes, and only that many count
@@ -1685,6 +2615,152 @@ mod tests {
         assert_eq!(class_breaks(&[5.0, 5.0], 4, ClassMethod::NaturalBreaks), vec![5.0]);
     }
 
+    fn close(a: &[f64], b: &[f64]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-9 * y.abs().max(1.0))
+    }
+
+    #[test]
+    fn geometric_interval_breaks_grow_by_one_ratio() {
+        // Positive values: each bound is the one before times (hi / lo)^(1/k).
+        let v = [1.0, 5.0, 40.0, 300.0, 1000.0];
+        let b = class_breaks(&v, 3, ClassMethod::GeometricInterval);
+        assert!(close(&b, &[10.0, 100.0, 1000.0]), "{b:?}");
+        // From zero (or below), the values are shifted so the minimum sits at a hundredth of the
+        // range: the widths still grow by one ratio, and the last bound is the maximum.
+        let b = class_breaks(&[-50.0, 0.0, 50.0], 2, ClassMethod::GeometricInterval);
+        assert!(close(&b, &[-51.0 + 101f64.sqrt(), 50.0]), "{b:?}");
+        let b = class_breaks(&[0.0, 100.0], 4, ClassMethod::GeometricInterval);
+        let widths: Vec<f64> = std::iter::once(b[0]).chain(b.windows(2).map(|w| w[1] - w[0])).collect();
+        assert!(widths.windows(2).all(|w| w[1] > w[0]), "{b:?}");
+        assert_eq!(b.len(), 4);
+        assert_eq!(b.last(), Some(&100.0));
+        // Far from zero the shift is not added and taken away again, so it can't round off.
+        let b = class_breaks(&[-1e16, -9_999_999_999_999_998.0], 2, ClassMethod::GeometricInterval);
+        assert!(b.iter().all(|v| v.is_finite()), "{b:?}");
+        assert_eq!(b.last(), Some(&-9_999_999_999_999_998.0));
+        // Near the largest float nothing overflows: the bounds stay finite and in order.
+        for v in [[1e308, 1.1e308], [-1e308, 1e308], [1e-308, 1e308]] {
+            let b = class_breaks(&v, 2, ClassMethod::GeometricInterval);
+            assert!(b.len() == 2 && b.iter().all(|x| x.is_finite()) && b[0] >= v[0] && b[0] < b[1], "{v:?}: {b:?}");
+        }
+    }
+
+    #[test]
+    fn standard_deviation_breaks_are_one_deviation_wide_about_the_mean() {
+        // 0..=100: mean 50, population deviation sqrt(850).
+        let v: Vec<f64> = (0..=100).map(f64::from).collect();
+        let sd = 850f64.sqrt();
+        // An even count puts a bound on the mean; an odd one centres a class on it.
+        let b = class_breaks(&v, 4, ClassMethod::StandardDeviation);
+        assert!(close(&b, &[50.0 - sd, 50.0, 50.0 + sd, 100.0]), "{b:?}");
+        let b = class_breaks(&v, 3, ClassMethod::StandardDeviation);
+        assert!(close(&b, &[50.0 - sd / 2.0, 50.0 + sd / 2.0, 100.0]), "{b:?}");
+        // Bounds past the data are dropped rather than leaving empty classes: 8 classes of one
+        // deviation would reach ±4 deviations, but the data spans less than ±2.
+        let b = class_breaks(&v, 8, ClassMethod::StandardDeviation);
+        assert!(close(&b, &[50.0 - sd, 50.0, 50.0 + sd, 100.0]), "{b:?}");
+        // A bound with no value above the one before it goes too: mean 4, deviation sqrt(24), so
+        // (4, 4 + sqrt(24)] would hold nothing between the zeros and the tens.
+        let b = class_breaks(&[0.0, 0.0, 0.0, 10.0, 10.0], 4, ClassMethod::StandardDeviation);
+        assert!(close(&b, &[4.0, 10.0]), "{b:?}");
+        // Large values: the squared deviations would overflow without scaling.
+        let b = class_breaks(&[1e160, 2e160], 2, ClassMethod::StandardDeviation);
+        assert!(close(&b, &[1.5e160, 2e160]), "{b:?}");
+        let b = class_breaks(&[-1e308, 1e308], 2, ClassMethod::StandardDeviation);
+        assert!(close(&b, &[0.0, 1e308]), "{b:?}");
+    }
+
+    #[test]
+    fn arithmetic_progression_widths_grow_by_one_step() {
+        // 0..=100 in 4 classes: widths of 1, 2, 3 and 4 tenths of the range.
+        let v: Vec<f64> = (0..=100).map(f64::from).collect();
+        let b = class_breaks(&v, 4, ClassMethod::ArithmeticProgression);
+        assert!(close(&b, &[10.0, 30.0, 60.0, 100.0]), "{b:?}");
+        // Across the whole float range nothing overflows.
+        let b = class_breaks(&[-1e308, 1e308], 3, ClassMethod::ArithmeticProgression);
+        assert!(b.len() == 3 && b.iter().all(|x| x.is_finite()) && b.windows(2).all(|w| w[0] < w[1]), "{b:?}");
+    }
+
+    #[test]
+    fn head_tail_breaks_follow_the_heavy_tail() {
+        // 1..=10 and 100: the mean is 155/11 and the head above it is [100] alone: one split.
+        let mut v: Vec<f64> = (1..=10).map(f64::from).collect();
+        v.push(100.0);
+        let b = class_breaks(&v, 5, ClassMethod::HeadTailBreaks);
+        assert!(close(&b, &[155.0 / 11.0, 100.0]), "{b:?}");
+        // A power law: each head is a small share of the values before it, so it goes on, up to
+        // the classes asked.
+        let v: Vec<f64> = (1..=1000).map(|i| 1000.0 / f64::from(i)).rev().collect();
+        let b = class_breaks(&v, 4, ClassMethod::HeadTailBreaks);
+        assert_eq!(b.len(), 4, "{b:?}");
+        assert!(b.windows(2).all(|w| w[0] < w[1]) && b.last() == Some(&1000.0), "{b:?}");
+        let few = class_breaks(&v, 2, ClassMethod::HeadTailBreaks);
+        assert_eq!(few.len(), 2, "{few:?}");
+        // Evenly spread values: the head above the mean is half of them, so it stops at one split.
+        let v: Vec<f64> = (0..=100).map(f64::from).collect();
+        let b = class_breaks(&v, 6, ClassMethod::HeadTailBreaks);
+        assert!(close(&b, &[50.0, 100.0]), "{b:?}");
+        // Large values: the mean can't overflow.
+        let b = class_breaks(&[1e308, 1e308, 1.5e308], 3, ClassMethod::HeadTailBreaks);
+        assert!(b.iter().all(|x| x.is_finite()) && b.len() == 2, "{b:?}");
+        // Nor with large values of opposite signs.
+        for v in [[-1.7e308, 1.7e308, 1.7e308], [-1e308, -1e308, 1e308]] {
+            let b = class_breaks(&v, 3, ClassMethod::HeadTailBreaks);
+            assert!(b.len() == 2 && b.iter().all(|x| x.is_finite()) && b[0] > v[0] && b[0] < b[1], "{v:?}: {b:?}");
+        }
+    }
+
+    #[test]
+    fn close_values_keep_their_classes() {
+        // Bounds closer than f64::EPSILON in absolute terms are still distinct when the values
+        // themselves are that small.
+        for m in ClassMethod::ALL {
+            let b = class_breaks(&[0.0, 1e-18], 2, m);
+            assert!(b.len() == 2 && b[0] >= 0.0 && b[0] < b[1], "{m:?}: {b:?}");
+        }
+        // And close values far from zero keep theirs too.
+        let b = class_breaks(&[1e16, 1e16 + 2.0], 2, ClassMethod::Quantile);
+        assert_eq!(b, vec![1e16, 1e16 + 2.0]);
+    }
+
+    #[test]
+    fn every_method_is_listed_named_and_read_back() {
+        for m in ClassMethod::ALL {
+            let name = format!("{m:?}");
+            let camel = format!("{}{}", name[..1].to_ascii_lowercase(), &name[1..]);
+            assert_eq!(ClassMethod::from_name(&camel), Some(m), "{camel}");
+            assert_eq!(ClassMethod::from_name(&m.label().replace(" (Jenks)", "")), Some(m), "{}", m.label());
+        }
+        assert_eq!(ClassMethod::from_name("stddev"), Some(ClassMethod::StandardDeviation));
+        assert_eq!(ClassMethod::from_name("geometric"), Some(ClassMethod::GeometricInterval));
+        assert_eq!(ClassMethod::from_name("arithmetic"), Some(ClassMethod::ArithmeticProgression));
+        assert_eq!(ClassMethod::from_name("headTail"), Some(ClassMethod::HeadTailBreaks));
+    }
+
+    #[test]
+    fn graduated_keeps_the_classes_asked() {
+        // Head/Tail Breaks finds 2 classes in evenly spread values; the 5 asked are kept, so the
+        // next method or class count starts from them.
+        let mut d = Dataset::new("t", GeometryType::Polygon, vec![Field::new("v", FieldType::Double)]);
+        for v in 0..=100 {
+            d.push(None, vec![Value::Float(f64::from(v))]);
+        }
+        let base = Symbol::default_for(GeometryType::Polygon, 0);
+        let r = Renderer::graduated(&d, &[], "v", 5, ClassMethod::HeadTailBreaks, Ramp::Ember, base).unwrap();
+        let Renderer::Graduated { breaks, .. } = &r else { panic!("graduated renderer expected") };
+        assert_eq!((breaks.len(), r.classes_asked()), (2, 5));
+        let back: Renderer = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back.classes_asked(), 5);
+        // Manual bounds ask for as many classes as they make.
+        let m = Renderer::graduated_manual(&d, &[], "v", &[10.0, 20.0], Ramp::Ember, base).unwrap();
+        assert_eq!(m.classes_asked(), 3);
+        // A project from before the count was kept asks for as many classes as it has.
+        let mut old = serde_json::to_value(&r).unwrap();
+        old["Graduated"].as_object_mut().unwrap().remove("classes");
+        let old: Renderer = serde_json::from_value(old).unwrap();
+        assert_eq!(old.classes_asked(), 2);
+    }
+
     #[test]
     fn graduated_symbols_by_value() {
         let mut d = Dataset::new("t", GeometryType::Polygon, vec![Field::new("v", FieldType::Double)]);
@@ -1756,6 +2832,7 @@ mod tests {
             ramp,
             method: ClassMethod::Quantile,
             min: 0.0,
+            classes: breaks.len(),
             class_labels: Default::default(),
             class_strokes: Default::default(),
         }

@@ -4,8 +4,13 @@
 
 use egui::{Align2, Color32, CornerRadius, Pos2, Rect, Sense, Stroke, Ui, pos2, vec2};
 use rustgis_engine::Tool;
+use rustgis_engine::analysis::{
+    network::{radius_boundary_point, radius_distance_m},
+    selection::MAX_POINTS,
+};
 use rustgis_engine::geom::{Coord, Extent, geodesic_length_m, geodesic_ring_area_m2};
 use rustgis_engine::map::layout::TextAlign;
+use rustgis_engine::map::projection::Flat;
 use rustgis_engine::map::{Camera, Globe, Projection};
 use rustgis_engine::render::rustgis_tiles::Unfinished;
 use rustgis_engine::render::{PlacedLabel, Rendered, View};
@@ -35,6 +40,8 @@ enum DragKind {
     Box,
     /// Drawing a graphic by dragging (rectangle, circle, ellipse, freehand, lasso, picture).
     Sketch,
+    SelectLasso,
+    SelectRadius,
     /// Moving or inserting a vertex with the Edit Vertices tool.
     Vertex,
     /// Moving the selected text graphic, grabbed by its text (#516): its layer id and row, and
@@ -67,6 +74,59 @@ pub struct Popup {
     /// The map it was opened on (the project's `active_map` then): layer and feature ids belong to
     /// a map, and a duplicated map has the same ones.
     pub map: usize,
+    /// The project it was opened on (`Session::opened`): answers still on their way when another
+    /// project opens are dropped.
+    pub opened: u64,
+    /// The WMS layers being asked what is at the point, whose features join the list.
+    pub asks: Vec<Ask>,
+}
+
+/// A WMS layer asked what is at a popup's point (GetFeatureInfo), its answer on the way: the
+/// request's, or first its service's capabilities (a layer from a project doesn't know its request).
+pub struct Ask {
+    layer: String,
+    /// The other layers waiting for the same capabilities: fetched and read once for all.
+    also: Vec<String>,
+    capabilities: bool,
+    /// The GetFeatureInfo request asked (none for capabilities): its answer format tells what to
+    /// ask next after the service's error.
+    request: Option<String>,
+    slot: crate::Slot<Result<Vec<u8>, String>>,
+}
+
+impl Popup {
+    /// A popup for what identify found at `at`, asking the WMS layers it lists.
+    pub fn new(info: Value, at: Coord, map: usize, opened: u64) -> Popup {
+        let mut asks: Vec<Ask> = Vec::new();
+        // The capabilities each fetch is for: layers of one service share it.
+        let mut fetched: Vec<(String, usize)> = Vec::new();
+        for a in info["featureInfo"].as_array().into_iter().flatten() {
+            let Some(layer) = a["tileLayer"].as_str().map(str::to_string) else { continue };
+            let (url, capabilities) = match (a["url"].as_str(), a["capabilities"].as_str()) {
+                (Some(u), _) => (u, false),
+                (None, Some(c)) => (c, true),
+                _ => continue,
+            };
+            if capabilities && let Some(&(_, i)) = fetched.iter().find(|(c, _)| c == url) {
+                if let Some(ask) = asks.get_mut(i) {
+                    ask.also.push(layer);
+                }
+                continue;
+            }
+            if capabilities {
+                fetched.push((url.to_string(), asks.len()));
+            }
+            let slot = crate::fetch_into_limited(url, rustgis_engine::data::ogc::MAX_INFO_BYTES);
+            let request = (!capabilities).then(|| url.to_string());
+            asks.push(Ask { layer, also: Vec::new(), capabilities, request, slot });
+        }
+        Popup { info, at, index: 0, map, opened, asks }
+    }
+}
+
+/// Whether a popup's value is a feature or pixel found, not only WMS layers still being asked.
+fn is_found(v: &Value) -> bool {
+    v.get("layer").is_some() || v.get("attributes").is_some()
 }
 
 /// A notice shown as a toast.
@@ -77,6 +137,15 @@ pub struct Toast {
     pub at: f64,
     /// Its number, for a steady id.
     pub id: u64,
+}
+
+/// A selection outline belongs to one unchanged view, not just to a tool code.
+struct SelectionGesture {
+    tool: Tool,
+    map: usize,
+    camera: Camera,
+    projection: Projection,
+    rect: Rect,
 }
 
 pub struct MapView {
@@ -119,6 +188,8 @@ pub struct MapView {
     resized_at: f64,
     drag: Option<(Pos2, DragKind)>,
     sketch: Vec<Coord>,
+    selection_gesture: Option<SelectionGesture>,
+    radius_preview: Option<(Coord, f64, Vec<Option<Pos2>>)>,
     /// A finished measurement stays on screen until the next click.
     sketch_done: bool,
     /// The next click splits the selected lines there (Editing pane › Split).
@@ -127,6 +198,10 @@ pub struct MapView {
     pub vertex: Option<(u32, usize, rustgis_engine::data::VertexId)>,
     /// The vertex being dragged with the Edit Vertices tool.
     pub vertex_drag: Option<crate::vertexedit::VertexDrag>,
+    /// Non-owning source identity for the held vertex gesture; never persisted with the project.
+    pub(crate) vertex_drag_owner: Option<crate::vertexedit::DragOwner>,
+    /// Session-only opt-in for coincident polygon moves; never saved with a project or preference.
+    pub move_shared_vertices: bool,
     /// The magnifying lens follows the pointer.
     pub magnifier: bool,
     pub popup: Option<Popup>,
@@ -195,6 +270,7 @@ pub struct MapView {
 }
 
 impl Default for MapView {
+    /// Starts with no chosen node, preview or retained gesture owner, alongside empty map caches.
     fn default() -> Self {
         MapView {
             texture: None,
@@ -215,10 +291,14 @@ impl Default for MapView {
             resized_at: -10.0,
             drag: None,
             sketch: Vec::new(),
+            selection_gesture: None,
+            radius_preview: None,
             sketch_done: false,
             split_mode: false,
             vertex: None,
             vertex_drag: None,
+            vertex_drag_owner: None,
+            move_shared_vertices: false,
             magnifier: false,
             popup: None,
             popup_rev: 0,
@@ -318,11 +398,27 @@ impl MapView {
         self.render_ms
     }
 
+    /// Drops unfinished map sketches, selection shapes and node previews without committing them.
     pub fn cancel_sketch(&mut self) {
         self.sketch.clear();
         self.sketch_done = false;
+        if self.drag.is_some_and(|(_, kind)| matches!(kind, DragKind::SelectLasso | DragKind::SelectRadius)) {
+            self.drag = None;
+        }
+        self.selection_gesture = None;
+        self.radius_preview = None;
+        self.cancel_vertex_drag();
+    }
+
+    /// Cancels a vertex preview and its pending release together, leaving other map gestures
+    /// alone. The chosen node is cleared because its row/address may now belong to another shape.
+    pub(crate) fn cancel_vertex_drag(&mut self) {
         self.vertex = None;
         self.vertex_drag = None;
+        self.vertex_drag_owner = None;
+        if self.drag.is_some_and(|(_, kind)| kind == DragKind::Vertex) {
+            self.drag = None;
+        }
     }
     pub fn sketch_len(&self) -> usize {
         self.sketch.len()
@@ -333,10 +429,13 @@ fn now(ui: &Ui) -> f64 {
     ui.input(|i| i.time)
 }
 
+/// Shows the active map workspace, discarding stale node gestures after map-tab changes and
+/// before rendering their overlays or consuming pointer releases.
 pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     crate::modelbuilder::follow_view(app);
     view_tabs(app, ui, &t);
+    crate::vertexedit::cancel_stale_drag(app);
     if app.mb.shown() {
         crate::modelbuilder::show(app, ui);
         return;
@@ -378,7 +477,7 @@ fn animate(app: &mut RustGisApp, ui: &mut Ui) {
     let e = t.min(1.0);
     let s = e * e * (3.0 - 2.0 * e);
     let c = Coord::new(a.center.x + (b.center.x - a.center.x) * s, a.center.y + (b.center.y - a.center.y) * s);
-    let sc = (a.scale.max(1.0).ln() + (b.scale.max(1.0).ln() - a.scale.max(1.0).ln()) * s).exp();
+    let sc = rustgis_engine::map::camera::scale_between(a.scale, b.scale, s);
     let m = app.session.map_mut();
     if let Some(mc) = m.to_map(c) {
         m.camera.center = mc;
@@ -1171,15 +1270,26 @@ fn tex_rect(app: &RustGisApp, cam: Camera, rect: Rect, globe_view: bool) -> Rect
     Rect::from_min_max(to_screen(0.0, 0.0), to_screen(tw, th))
 }
 
-/// Map text laid out as the map view draws it: its font, and a text graphic's style (#535), its
-/// lines aligned in their block, slanted (egui's own slant, as the fonts have no italic face)
-/// and letter-spaced. The one layout for drawing a label and for picking or dragging a text
-/// graphic, so they agree.
-fn label_job(text: &str, size: f32, bold: bool, italic: bool, spacing: f32, align: TextAlign) -> egui::text::LayoutJob {
-    let font_id = if bold { semibold(size * 1.33) } else { regular(size * 1.33) };
+/// Map text laid out as the map view draws it: its font (a label class's installed `family`, as
+/// [`crate::labelfonts::family`] gives it, and whether egui slants it), and a text graphic's
+/// style (#535), its lines aligned in their block, slanted (egui's own slant, as the interface
+/// fonts have no italic face) and letter-spaced. The one layout for drawing a label and for
+/// picking or dragging a text graphic, so they agree.
+fn label_job(
+    text: &str,
+    size: f32,
+    bold: bool,
+    italic: bool,
+    spacing: f32,
+    align: TextAlign,
+    family: Option<(egui::FontFamily, bool)>,
+) -> egui::text::LayoutJob {
+    let (font_id, italics) = match family {
+        Some((family, slanted)) => (egui::FontId::new(size * 1.33, family), slanted),
+        None => (if bold { semibold(size * 1.33) } else { regular(size * 1.33) }, italic),
+    };
     // Letter spacing in points, scaled as the size is.
-    let format =
-        egui::TextFormat { font_id, color: Color32::WHITE, italics: italic, extra_letter_spacing: spacing * 1.33, ..Default::default() };
+    let format = egui::TextFormat { font_id, color: Color32::WHITE, italics, extra_letter_spacing: spacing * 1.33, ..Default::default() };
     let mut job = egui::text::LayoutJob::single_section(text.to_owned(), format);
     job.halign = match align {
         TextAlign::Left => egui::Align::LEFT,
@@ -1197,7 +1307,27 @@ fn place_galley(anchor: Align2, at: Pos2, g: &egui::Galley) -> (Pos2, Rect) {
 }
 
 fn draw_label(p: &egui::Painter, l: &PlacedLabel, at: Pos2) {
-    let galley = p.layout_job(label_job(&l.text, l.size, l.bold, l.italic, l.spacing, l.line_align));
+    // Curved along a line: each character turned into its place, every character's halo first,
+    // so none covers the letter before it.
+    if !l.glyphs.is_empty() {
+        let inks: &[(bool, bool)] = if l.halo.is_some() { &[(true, false), (false, true)] } else { &[(false, true)] };
+        // (The label without its characters, copied for each: not the characters each time.)
+        let base = PlacedLabel { text: String::new(), align: 0.0, glyphs: Vec::new(), ..l.clone() };
+        for &(halo, text) in inks {
+            for g in &l.glyphs {
+                let one = PlacedLabel { text: g.text.clone(), angle: Some(g.angle), ..base.clone() };
+                draw_label_ink(p, &one, at + vec2(g.dx, g.dy), halo, text);
+            }
+        }
+        return;
+    }
+    draw_label_ink(p, l, at, true, true);
+}
+
+/// Draws a label (not a curved one) at `at`: its halo when `halo`, its text when `text`.
+fn draw_label_ink(p: &egui::Painter, l: &PlacedLabel, at: Pos2, halo: bool, text: bool) {
+    let family = crate::labelfonts::family(p.ctx(), l.font, l.bold, l.italic);
+    let galley = p.layout_job(label_job(&l.text, l.size, l.bold, l.italic, l.spacing, l.line_align, family));
     // Text set beside an icon is lined up by its edge, with egui's own measure of its width.
     let anchor = if l.align < -0.25 {
         Align2::LEFT_CENTER
@@ -1208,34 +1338,138 @@ fn draw_label(p: &egui::Painter, l: &PlacedLabel, at: Pos2) {
     };
     // A label turned with the map (along a street): turned about its centre, at `at`.
     if let Some(angle) = l.angle.filter(|a| a.is_finite() && a.abs() > 1e-3) {
-        let (pos, _) = place_galley(Align2::CENTER_CENTER, at, &galley);
+        let (pos, r) = place_galley(Align2::CENTER_CENTER, at, &galley);
+        if halo {
+            draw_background(p, l, r, angle);
+        }
         let shape = |offset: egui::Vec2, color: Color32| {
             egui::epaint::TextShape::new(pos + offset, galley.clone(), color)
                 .with_override_text_color(color)
                 .with_angle_and_anchor(angle, Align2::CENTER_CENTER)
         };
-        if let Some(h) = l.halo {
-            let hc = c32(h);
-            for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0), (-0.8, -0.8), (0.8, 0.8), (-0.8, 0.8), (0.8, -0.8)] {
-                p.add(shape(vec2(dx, dy), hc));
+        if let Some(h) = l.halo.filter(|h| halo && h.a() > 0) {
+            let (offsets, hc) = halo_coats(l, h);
+            for offset in offsets {
+                p.add(shape(offset, hc));
             }
         }
-        p.add(shape(egui::Vec2::ZERO, c32(l.color)));
+        if text {
+            p.add(shape(egui::Vec2::ZERO, c32(l.color)));
+        }
         return;
     }
     let (pos, r) = place_galley(anchor, at, &galley);
+    if halo {
+        draw_background(p, l, r, 0.0);
+    }
     // A selected text graphic: framed as laid out, under the text.
     if l.framed {
         let cyan = c32(rustgis_engine::render::SELECTION);
         p.rect(r.expand(3.0), 0.0, cyan.gamma_multiply(40.0 / 255.0), Stroke::new(2.0, cyan), egui::StrokeKind::Outside);
     }
-    if let Some(h) = l.halo {
-        let hc = c32(h);
-        for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0), (-0.8, -0.8), (0.8, 0.8), (-0.8, 0.8), (0.8, -0.8)] {
-            p.galley_with_override_text_color(pos + vec2(dx, dy), galley.clone(), hc);
+    if let Some(h) = l.halo.filter(|h| halo && h.a() > 0) {
+        let (offsets, hc) = halo_coats(l, h);
+        for offset in offsets {
+            p.galley_with_override_text_color(pos + offset, galley.clone(), hc);
         }
     }
-    p.galley_with_override_text_color(pos, galley, c32(l.color));
+    if text {
+        p.galley_with_override_text_color(pos, galley, c32(l.color));
+    }
+}
+
+/// Draws a label's background behind its text laid out in `text` (points), turned by `angle`
+/// (radians, clockwise) about the text's centre: the rectangle grown by its padding, its corners
+/// rounded, filled and outlined.
+fn draw_background(p: &egui::Painter, l: &PlacedLabel, text: Rect, angle: f32) {
+    if !l.glyphs.is_empty() {
+        return;
+    }
+    let Some(b) = l.background.as_ref().filter(|b| b.draws()) else { return };
+    let r = text.expand2(vec2(b.padding[0], b.padding[1]) * 1.33);
+    let points = background_outline(r, b.radius * 1.33, angle);
+    if points.len() < 3 {
+        return;
+    }
+    let fill = b.fill.map_or(Color32::TRANSPARENT, c32);
+    let stroke = match b.stroke {
+        Some(c) if b.stroke_width > 0.0 => Stroke::new(b.stroke_width * 1.33, c32(c)),
+        _ => Stroke::NONE,
+    };
+    p.add(egui::Shape::convex_polygon(points, fill, stroke));
+}
+
+/// A rectangle's outline with its corners rounded by `radius` (at most half its shorter side),
+/// turned by `angle` about its centre: the corners as a few points each.
+fn background_outline(r: Rect, radius: f32, angle: f32) -> Vec<Pos2> {
+    if !(r.is_finite() && r.width() > 0.0 && r.height() > 0.0) {
+        return Vec::new();
+    }
+    let radius = if radius.is_finite() { radius.clamp(0.0, r.width().min(r.height()) / 2.0) } else { 0.0 };
+    let steps = if radius > 0.0 { 4 } else { 0 };
+    // Each corner's centre and the angle its arc starts at, clockwise from the top left.
+    let corners = [
+        (pos2(r.min.x + radius, r.min.y + radius), std::f32::consts::PI),
+        (pos2(r.max.x - radius, r.min.y + radius), -std::f32::consts::FRAC_PI_2),
+        (pos2(r.max.x - radius, r.max.y - radius), 0.0),
+        (pos2(r.min.x + radius, r.max.y - radius), std::f32::consts::FRAC_PI_2),
+    ];
+    let (sin, cos) = angle.sin_cos();
+    let c = r.center();
+    let turn = |q: Pos2| {
+        let d = q - c;
+        pos2(c.x + d.x * cos - d.y * sin, c.y + d.x * sin + d.y * cos)
+    };
+    let mut out = Vec::with_capacity(4 * (steps + 1));
+    for (centre, start) in corners {
+        for i in 0..=steps {
+            let a = start + std::f32::consts::FRAC_PI_2 * i as f32 / steps.max(1) as f32;
+            out.push(turn(centre + vec2(a.cos(), a.sin()) * radius));
+        }
+    }
+    out
+}
+
+/// The most copies of a label's text a halo of its own width is drawn with.
+const MAX_HALO_COATS: usize = 64;
+
+/// Where a label's halo of colour `h` is drawn round its text (points), and in what colour each
+/// copy: a thin ring, or for a halo of its own width rings about 1.5 points apart out to that
+/// width (1.33 × in screen points, as the text's size), copies about a point apart round each
+/// (at most [`MAX_HALO_COATS`] in all, shared among the rings by their length), in a see-through
+/// colour shared among the rings. A halo of a few points (QGIS's usual buffer) is solid with few
+/// copies; a very wide one is approximated, and a see-through one is about one coat (copies
+/// overlap near the letters, so it is a little darker there): an export draws both exactly.
+fn halo_coats(l: &PlacedLabel, h: rustgis_engine::map::Rgba) -> (Vec<egui::Vec2>, Color32) {
+    let Some(width) = l.halo_width else {
+        let ring = [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0), (-0.8, -0.8), (0.8, 0.8), (-0.8, 0.8), (0.8, -0.8)];
+        return (ring.into_iter().map(|(x, y)| vec2(x, y)).collect(), c32(h));
+    };
+    let reach = rustgis_engine::render::halo_reach(width) * 1.33;
+    // No width, or one that isn't a number: no halo.
+    if reach.is_nan() || reach <= 0.0 {
+        return (Vec::new(), c32(h));
+    }
+    let rings = ((reach / 1.5).ceil() as usize).clamp(1, 6);
+    let step = reach / rings as f32;
+    // Ring i (outermost first) has radius reach - i·step; copies go to each by its length.
+    let radii: Vec<f32> = (0..rings).map(|i| reach - i as f32 * step).collect();
+    let total: f32 = radii.iter().sum();
+    let mut out = Vec::new();
+    for r in radii {
+        // A copy about a point apart round the ring, within its share of the budget (rounded down,
+        // so the copies stay within it; the innermost of at most six rings still gets three).
+        let share = ((MAX_HALO_COATS as f32 * r / total).floor() as usize).max(3);
+        let n = ((std::f32::consts::TAU * r).ceil() as usize).clamp(3, share);
+        out.extend((0..n).map(|k| {
+            let (sin, cos) = (std::f32::consts::TAU * k as f32 / n as f32).sin_cos();
+            vec2(r * cos, r * sin)
+        }));
+    }
+    // About one copy of each ring covers a pixel of the halo.
+    let a = f32::from(h.a()) / 255.0;
+    let each = if a < 1.0 { 1.0 - (1.0 - a).powf(1.0 / rings as f32) } else { 1.0 };
+    (out, c32(h.with_alpha((each * 255.0).round() as u8)))
 }
 
 /// The globe as seen in this view, when the map is a globe.
@@ -1313,6 +1547,7 @@ fn text_shown(
         graphics::italic(ds, row),
         graphics::letter_spacing(ds, row),
         graphics::align(ds, row),
+        None,
     );
     Some((at, job))
 }
@@ -1363,12 +1598,378 @@ fn zoom(app: &mut RustGisApp, factor: f64, x: f64, y: f64, w: f64, h: f64) {
     }
 }
 
+fn selection_tool(tool: Tool) -> bool {
+    matches!(tool, Tool::SelectPolygon | Tool::SelectLasso | Tool::SelectRadius)
+}
+
+fn cancel_changed_selection(app: &mut RustGisApp, rect: Rect) {
+    if app.map.selection_gesture.as_ref().is_some_and(|g| {
+        let map = app.session.map();
+        // Polygon vertices are lon/lat and remain valid when the view moves between clicks.
+        let view_bound = g.tool != Tool::SelectPolygon;
+        g.tool != app.session.tool
+            || g.map != app.session.project.active_map
+            || g.projection != map.projection
+            || (view_bound && (g.camera != map.camera || g.rect != rect))
+    }) {
+        app.map.cancel_sketch();
+    }
+}
+
+fn begin_selection(app: &mut RustGisApp, rect: Rect) {
+    if app.map.selection_gesture.is_none() {
+        let map = app.session.map();
+        app.map.selection_gesture = Some(SelectionGesture {
+            tool: app.session.tool,
+            map: app.session.project.active_map,
+            camera: map.camera,
+            projection: map.projection.clone(),
+            rect,
+        });
+    }
+}
+
+fn selection_error(app: &mut RustGisApp, error: String) {
+    app.map.cancel_sketch();
+    app.session.notify(error, true);
+}
+
+fn invalid_selection() -> String {
+    tl!("Selection outline is outside the supported map surface; draw a smaller area.").to_string()
+}
+
+fn selection_limit() -> String {
+    tl!("Selection outline is too complex; draw a simpler area.").to_string()
+}
+
+fn selection_coord(app: &RustGisApp, rect: Rect, point: Pos2, flat: &Flat) -> Result<Coord, String> {
+    if !rect.contains(point) {
+        return Err(invalid_selection());
+    }
+    let coord = screen_to_lonlat(app, rect, point).ok_or_else(invalid_selection)?;
+    flat.validate_selection_path(&[coord]).map_err(|_| invalid_selection())?;
+    Ok(coord)
+}
+
+/// A globe's screen edges must be sampled before converting to the command's planar space.
+fn append_selection_point(app: &RustGisApp, rect: Rect, points: &mut Vec<Coord>, end: Pos2) -> Result<(), String> {
+    let flat = Flat::of(&app.session.map().projection);
+    let start = points.last().and_then(|c| lonlat_to_screen(app, rect, *c));
+    let samples = if app.session.map().projection == Projection::Globe {
+        start.map_or(1, |p| ((end - p).length() / 3.0).ceil().max(1.0) as usize)
+    } else {
+        1
+    };
+    if samples > MAX_POINTS.saturating_sub(points.len()) {
+        return Err(selection_limit());
+    }
+    for i in 1..=samples {
+        let at = start.map_or(end, |p| p.lerp(end, i as f32 / samples as f32));
+        let coord = selection_coord(app, rect, at, &flat)?;
+        if let Some(last) = points.last() {
+            flat.validate_selection_path(&[*last, coord]).map_err(|_| invalid_selection())?;
+        }
+        if let Some(first) = points.first() {
+            flat.validate_selection_path(&[coord, *first]).map_err(|_| invalid_selection())?;
+        }
+        if points.last() != Some(&coord) {
+            points.push(coord);
+        }
+    }
+    Ok(())
+}
+
+fn add_selection_point(app: &mut RustGisApp, rect: Rect, point: Pos2, force: bool) -> Result<(), String> {
+    let near = app.map.sketch.last().and_then(|c| lonlat_to_screen(app, rect, *c)).is_some_and(|p| (p - point).length() < 3.0);
+    if near && !force {
+        return selection_coord(app, rect, point, &Flat::of(&app.session.map().projection)).map(|_| ());
+    }
+    let mut points = std::mem::take(&mut app.map.sketch);
+    let result = append_selection_point(app, rect, &mut points, point);
+    app.map.sketch = points;
+    result
+}
+
+fn selection_mode(ui: &Ui) -> &'static str {
+    ui.input(|i| {
+        if i.modifiers.shift {
+            "add"
+        } else if i.modifiers.ctrl || i.modifiers.command {
+            "remove"
+        } else {
+            "new"
+        }
+    })
+}
+
+fn finish_area_selection(app: &mut RustGisApp, ui: &Ui, rect: Rect) {
+    let mut points = std::mem::take(&mut app.map.sketch);
+    let result = (|| {
+        if let Some(first) = points.first().and_then(|c| lonlat_to_screen(app, rect, *c)) {
+            append_selection_point(app, rect, &mut points, first)?;
+        }
+        Flat::of(&app.session.map().projection).validate_selection_path(&points).map_err(|_| invalid_selection())?;
+        let coords: Vec<[f64; 2]> = points.iter().map(|c| [c.x, c.y]).collect();
+        app.run("select.byPolygon", json!({"points": coords, "mode": selection_mode(ui)})).map(|_| ())
+    })();
+    app.map.cancel_sketch();
+    if let Err(error) = result {
+        app.session.notify(error, true);
+    }
+}
+
+fn selection_interact(app: &mut RustGisApp, ui: &Ui, resp: &egui::Response, rect: Rect) {
+    let tool = app.session.tool;
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        app.map.cancel_sketch();
+        return;
+    }
+    if tool == Tool::SelectPolygon {
+        if (resp.clicked() || resp.double_clicked())
+            && let Some(point) = resp.interact_pointer_pos()
+        {
+            begin_selection(app, rect);
+            let closes = app.map.sketch.len() >= 3
+                && app.map.sketch.first().and_then(|c| lonlat_to_screen(app, rect, *c)).is_some_and(|first| (first - point).length() < 3.0);
+            if closes {
+                finish_area_selection(app, ui, rect);
+            } else if let Err(error) = add_selection_point(app, rect, point, false) {
+                selection_error(app, error);
+            } else if resp.double_clicked() {
+                finish_area_selection(app, ui, rect);
+            }
+        }
+        return;
+    }
+    // Both drag tools consume ordinary clicks and double-clicks without identifying or zooming.
+    if resp.double_clicked() {
+        app.map.cancel_sketch();
+        return;
+    }
+    if resp.drag_started_by(egui::PointerButton::Primary) {
+        let origin = ui.input(|i| i.pointer.press_origin());
+        app.map.cancel_sketch();
+        if let Some(origin) = origin {
+            begin_selection(app, rect);
+            if let Err(error) = add_selection_point(app, rect, origin, true) {
+                selection_error(app, error);
+                return;
+            }
+            let kind = if tool == Tool::SelectLasso { DragKind::SelectLasso } else { DragKind::SelectRadius };
+            app.map.drag = Some((origin, kind));
+        }
+    }
+    if !app.map.drag.is_some_and(|(_, k)| matches!(k, DragKind::SelectLasso | DragKind::SelectRadius)) {
+        return;
+    }
+    let end = resp.interact_pointer_pos().or_else(|| ui.input(|i| i.pointer.latest_pos()));
+    if let Some(end) = end {
+        let result = if tool == Tool::SelectLasso {
+            add_selection_point(app, rect, end, resp.drag_stopped())
+        } else {
+            selection_coord(app, rect, end, &Flat::of(&app.session.map().projection)).map(|coord| {
+                app.map.sketch.truncate(1);
+                app.map.sketch.push(coord);
+            })
+        };
+        if let Err(error) = result {
+            selection_error(app, error);
+            return;
+        }
+    }
+    if resp.drag_stopped() {
+        if tool == Tool::SelectLasso {
+            finish_area_selection(app, ui, rect);
+        } else {
+            let ends = app.map.sketch.first().copied().zip(app.map.sketch.get(1).copied());
+            if let Some((center, end)) = ends
+                && let Some(radius) = radius_distance_m(center, end).filter(|r| *r > 0.0)
+            {
+                let valid = match &app.map.radius_preview {
+                    Some((at, r, outline)) if *at == center && *r == radius => !outline.is_empty(),
+                    _ => radius_outline(app, rect, center, radius).is_ok(),
+                };
+                if valid {
+                    let _ =
+                        app.run("select.byRadius", json!({"lon": center.x, "lat": center.y, "radius": radius, "mode": selection_mode(ui)}));
+                } else {
+                    app.session.notify(invalid_selection(), true);
+                }
+            }
+            if let Some((center, end)) = ends
+                && center != end
+                && radius_distance_m(center, end).is_none()
+            {
+                app.session.notify(invalid_selection(), true);
+            }
+            app.map.cancel_sketch();
+        }
+    }
+}
+
+fn validate_radius(app: &RustGisApp, center: Coord, radius: f64) -> Result<(), String> {
+    if !radius.is_finite() || radius <= 0.0 || radius > 5_000_000.0 {
+        return Err(invalid_selection());
+    }
+    let mut extrema = [center; 4];
+    for (i, point) in extrema.iter_mut().enumerate() {
+        *point = radius_boundary_point(center, radius, i as f64 * std::f64::consts::FRAC_PI_2).ok_or_else(invalid_selection)?;
+    }
+    Flat::of(&app.session.map().projection).validate_selection_path(&extrema).map_err(|_| invalid_selection())
+}
+
+/// Subdivision is bounded to 64 * 2^8 intervals, independently of zoom or hostile input.
+fn radius_outline(app: &RustGisApp, rect: Rect, center: Coord, radius: f64) -> Result<Vec<Option<Pos2>>, String> {
+    validate_radius(app, center, radius)?;
+    let flat = Flat::of(&app.session.map().projection);
+    let point = |angle| -> Result<(Coord, Option<Pos2>), String> {
+        let coord = radius_boundary_point(center, radius, angle).ok_or_else(invalid_selection)?;
+        flat.validate_selection_path(&[coord]).map_err(|_| invalid_selection())?;
+        let screen = lonlat_to_screen(app, rect, coord).filter(|p| p.x.is_finite() && p.y.is_finite() && rect.contains(*p));
+        Ok((coord, screen))
+    };
+    fn interval(
+        point: &impl Fn(f64) -> Result<(Coord, Option<Pos2>), String>,
+        flat: &Flat,
+        a: f64,
+        b: f64,
+        ends: [(Coord, Option<Pos2>); 2],
+        depth: u8,
+        out: &mut Vec<Option<Pos2>>,
+    ) -> Result<(), String> {
+        let mid = point((a + b) / 2.0)?;
+        let refine = match (ends[0].1, mid.1, ends[1].1) {
+            (Some(p), Some(m), Some(q)) => (m - p.lerp(q, 0.5)).length() > 0.75,
+            (None, None, None) => false,
+            _ => true,
+        };
+        if refine && depth < 8 {
+            interval(point, flat, a, (a + b) / 2.0, [ends[0], mid], depth + 1, out)?;
+            interval(point, flat, (a + b) / 2.0, b, [mid, ends[1]], depth + 1, out)?;
+        } else {
+            flat.validate_selection_path(&[ends[0].0, mid.0, ends[1].0]).map_err(|_| invalid_selection())?;
+            if out.len() >= MAX_POINTS {
+                return Err(selection_limit());
+            }
+            // Never bridge an unresolved horizon/viewport break at the subdivision limit.
+            out.push(if mid.1.is_some() { ends[1].1 } else { None });
+        }
+        Ok(())
+    }
+    let mut out = Vec::with_capacity(65);
+    let mut start = point(0.0)?;
+    out.push(start.1);
+    for i in 0..64 {
+        let a = i as f64 * std::f64::consts::TAU / 64.0;
+        let b = (i + 1) as f64 * std::f64::consts::TAU / 64.0;
+        let end = point(b)?;
+        interval(&point, &flat, a, b, [start, end], 0, &mut out)?;
+        start = end;
+    }
+    Ok(out)
+}
+
+fn selection_readout(p: &egui::Painter, rect: Rect, t: &Tokens, text: String) {
+    let galley = p.layout_no_wrap(text, semibold(12.5), t.text);
+    let bg = Rect::from_center_size(pos2(rect.center().x, rect.min.y + 22.0), galley.size() + vec2(24.0, 12.0));
+    p.rect_filled(bg, CornerRadius::same(14), t.menu);
+    p.rect_stroke(bg, CornerRadius::same(14), Stroke::new(1.0, t.border_strong), egui::StrokeKind::Inside);
+    p.galley(bg.center() - galley.size() / 2.0, galley, t.text);
+}
+
+fn selection_preview(app: &mut RustGisApp, p: &egui::Painter, rect: Rect, t: &Tokens) {
+    let stroke = Stroke::new(2.0, t.accent);
+    if app.session.tool == Tool::SelectRadius {
+        if let Some((center, end)) = app.map.sketch.first().copied().zip(app.map.sketch.get(1).copied()) {
+            if let Some(radius) = radius_distance_m(center, end).filter(|r| *r > 0.0) {
+                if app.map.radius_preview.as_ref().is_none_or(|(at, r, _)| *at != center || *r != radius) {
+                    let outline = radius_outline(app, rect, center, radius).unwrap_or_default();
+                    app.map.radius_preview = Some((center, radius, outline));
+                }
+                if let Some((_, _, outline)) = &app.map.radius_preview {
+                    for run in outline.split(|p| p.is_none()) {
+                        let run: Vec<Pos2> = run.iter().flatten().copied().collect();
+                        if run.len() >= 2 {
+                            p.add(egui::Shape::line(run, stroke));
+                        }
+                    }
+                    let text = if outline.is_empty() {
+                        tl!("Invalid selection outline · draw a smaller radius").to_string()
+                    } else {
+                        crate::i18n::fmt(
+                            "Radius {distance} (approximate)",
+                            &[("distance", &crate::measure_units::distance(radius, app.ui.measurement_imperial))],
+                        )
+                    };
+                    selection_readout(p, rect, t, text);
+                }
+            } else if center != end {
+                selection_readout(p, rect, t, tl!("Invalid selection outline · draw a smaller radius").to_string());
+            }
+            if let (Some(a), Some(b)) = (lonlat_to_screen(app, rect, center), lonlat_to_screen(app, rect, end)) {
+                p.line_segment([a, b], stroke);
+                p.circle_filled(a, 3.5, t.accent);
+            }
+        }
+        return;
+    }
+    // Only polygon has a live endpoint. The lasso already retained the pointer this frame,
+    // so adding it again would create a duplicate release-to-first segment.
+    let live =
+        (app.session.tool == Tool::SelectPolygon).then_some(app.map.pointer_lonlat).flatten().filter(|c| app.map.sketch.last() != Some(c));
+    let flat = Flat::of(&app.session.map().projection);
+    let last = live.or_else(|| app.map.sketch.last().copied());
+    let mut valid = true;
+    if let (Some(first), Some(last)) = (app.map.sketch.first(), last) {
+        valid = flat.validate_selection_path(&[last, *first]).is_ok();
+        if let Some(live) = live {
+            valid &= app.map.sketch.last().is_none_or(|last| flat.validate_selection_path(&[*last, live]).is_ok());
+        }
+        // The closing screen edge (and polygon's live edge) obey the same globe guard as commit.
+        if app.session.map().projection == Projection::Globe {
+            for (a, b) in app.map.sketch.last().copied().zip(live).into_iter().chain(Some((last, *first))) {
+                let mut edge = vec![a];
+                valid &= lonlat_to_screen(app, rect, b).is_some_and(|end| {
+                    append_selection_point(app, rect, &mut edge, end).is_ok()
+                        && edge.len().saturating_sub(1) <= MAX_POINTS.saturating_sub(app.map.sketch.len())
+                });
+            }
+        }
+    }
+    let placed = app.map.sketch.iter().copied().chain(live).map(|c| lonlat_to_screen(app, rect, c).filter(|p| rect.contains(*p)));
+    let mut first = None;
+    let mut previous = None;
+    for at in placed {
+        if let Some(at) = at {
+            if first.is_none() {
+                first = Some(at);
+            }
+            if let Some(previous) = previous {
+                p.line_segment([previous, at], stroke);
+            }
+            if app.session.tool == Tool::SelectPolygon {
+                p.circle_filled(at, 3.5, Color32::WHITE);
+                p.circle_stroke(at, 3.5, stroke);
+            }
+        }
+        previous = at;
+    }
+    if valid {
+        if let (Some(first), Some(last)) = (first, previous) {
+            p.line_segment([last, first], stroke);
+        }
+    } else {
+        selection_readout(p, rect, t, tl!("Invalid selection outline · draw a smaller area").to_string());
+    }
+}
+
 fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect) {
     let (w, h) = (rect.width() as f64, rect.height() as f64);
     let time = now(ui);
     let hover = resp.hover_pos();
     app.map.pointer_lonlat = hover.and_then(|p| screen_to_lonlat(app, rect, p));
     let tool = app.session.tool;
+    cancel_changed_selection(app, rect);
 
     // A map tool aims with a crosshair, only over the map: the ribbon and panes keep their cursor.
     // A finished measurement keeps its points on show but waits for a new one.
@@ -1492,6 +2093,12 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
             app.map.camera_moved = true;
             app.map.last_interaction = time;
         }
+        cancel_changed_selection(app, rect);
+        return;
+    }
+    cancel_changed_selection(app, rect);
+    if selection_tool(tool) && !middle && !app.map.drag.is_some_and(|(_, k)| matches!(k, DragKind::Pan | DragKind::Turn)) {
+        selection_interact(app, ui, resp, rect);
         return;
     }
     // Drag start.
@@ -1617,6 +2224,7 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
         }
     }
+    cancel_changed_selection(app, rect);
     if resp.drag_stopped()
         && let Some((_, DragKind::Sketch)) = app.map.drag
     {
@@ -1754,8 +2362,12 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
                     Ok(v) if !v.is_null() => {
                         if let (Some(id), Some(row)) = (v["layerId"].as_u64(), v["row"].as_u64()) {
                             let _ = app.session.run("select.rows", &json!({"layer": id, "rows": [row]}));
+                        } else if !is_found(&v) {
+                            // Only WMS layers being asked: the click found nothing yet, so it clears
+                            // the selection as an empty click does.
+                            let _ = app.session.run("select.clear", &Value::Null);
                         }
-                        Some(Popup { info: v, at: c, index: 0, map: app.session.project.active_map })
+                        Some(Popup::new(v, c, app.session.project.active_map, app.session.opened))
                     }
                     _ => {
                         let _ = app.session.run("select.clear", &Value::Null);
@@ -1775,6 +2387,7 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
                 });
                 let _ = app.run("select.atPoint", json!({"lon": c.x, "lat": c.y, "tolerancePx": 5, "mode": mode}));
             }
+            Tool::SelectPolygon | Tool::SelectLasso | Tool::SelectRadius => {}
             Tool::ZoomIn => {
                 zoom(app, 2.0, (p.x - rect.min.x) as f64, (p.y - rect.min.y) as f64, w, h);
                 app.map.last_interaction = time;
@@ -2025,6 +2638,10 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
     // A dragged rectangle, circle or ellipse previews as its outline.
     let tool = app.session.tool;
     let mut previewed = false;
+    if selection_tool(tool) && !app.map.sketch.is_empty() {
+        selection_preview(app, p, rect, t);
+        previewed = true;
+    }
     if !app.map.sketch.is_empty()
         && let Some(shape) = drag_shape(tool).filter(|s| !matches!(*s, "freehand" | "lasso"))
     {
@@ -2128,6 +2745,11 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
         Tool::CreateLine => Some("Click to add vertices · double-click to finish the line"),
         Tool::CreatePolygon => Some("Click to add vertices · double-click to close the polygon"),
         Tool::Select => Some("Click or drag a box · Shift adds · Ctrl removes"),
+        Tool::SelectPolygon => {
+            Some("Click vertices · click the start or double-click to select · Shift adds · Ctrl/Cmd removes · Esc cancels")
+        }
+        Tool::SelectLasso => Some("Drag an area · release to select · Shift adds · Ctrl/Cmd removes · Esc cancels"),
+        Tool::SelectRadius => Some("Drag from the centre · release to select · Shift adds · Ctrl/Cmd removes · Esc cancels"),
         Tool::EditVertices if app.map.vertex.is_some() => {
             Some("Drag a vertex to move it · click an edge to add one · Delete removes the chosen vertex")
         }
@@ -2316,7 +2938,102 @@ fn follow_popup(app: &mut RustGisApp) {
     pp.info = info;
 }
 
+/// Adds what the WMS layers asked answer to the popup, asking a layer from a project once its
+/// service's capabilities say how; failures are told. The popup closes when nothing was found.
+fn follow_asks(app: &mut RustGisApp, ctx: &egui::Context) {
+    let (active, opened) = (app.session.project.active_map, app.session.opened);
+    let Some(pp) = &mut app.map.popup else { return };
+    if pp.asks.is_empty() {
+        return;
+    }
+    // Another map in view, or another project: the answers belong to layers no longer shown, and
+    // a layer of the same name there must not take them.
+    if pp.map != active || pp.opened != opened {
+        app.map.popup = None;
+        return;
+    }
+    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    let (lon, lat) = (pp.at.x, pp.at.y);
+    let mut landed = Vec::new();
+    pp.asks.retain_mut(|a| match a.slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        Some(r) => {
+            landed.push((a.layer.clone(), std::mem::take(&mut a.also), a.capabilities, a.request.take(), r));
+            false
+        }
+        None => true,
+    });
+    if landed.is_empty() {
+        return;
+    }
+    let mut found = Vec::new();
+    let mut next = Vec::new();
+    let exists = |app: &RustGisApp, layer: &str| app.session.map().tiles.iter().any(|t| t.name == layer);
+    for (layer, also, capabilities, request, r) in landed {
+        // Layers removed or renamed while the answer came: nothing to show, nothing to tell. The
+        // first of a service's layers still there takes the capabilities for the rest.
+        let mut group = std::iter::once(layer).chain(also).filter(|l| exists(app, l));
+        let Some(layer) = group.next() else { continue };
+        let also: Vec<String> = group.collect();
+        // The fetch's failure, or an answer that isn't text, is told here; the command tells its
+        // own errors (naming the layer).
+        let text = match r.and_then(|bytes| rustgis_engine::data::ogc::answer_text(&bytes).map(std::borrow::Cow::into_owned)) {
+            Ok(text) => text,
+            Err(e) => {
+                app.session.notify(crate::i18n::fmt("{layer}: {e}", &[("layer", &layer), ("e", &e)]), true);
+                continue;
+            }
+        };
+        let mut replies = Vec::new();
+        if capabilities {
+            let p = json!({"layer": layer, "lon": lon, "lat": lat, "capabilities": text, "request": true});
+            replies.push((layer, app.session.run("identify.featureInfo", &p)));
+            // The service's other layers learned their requests from the same capabilities.
+            if replies.iter().all(|(_, r)| r.is_ok()) {
+                for other in also {
+                    let p = json!({"layer": other, "lon": lon, "lat": lat, "request": true});
+                    let r = app.session.run("identify.featureInfo", &p);
+                    replies.push((other, r));
+                }
+            }
+        } else {
+            // With the request and the point: the service's error in one answer format asks again
+            // in the next.
+            let p = json!({"layer": layer, "text": text, "url": request, "lon": lon, "lat": lat});
+            replies.push((layer.clone(), app.session.run("identify.featureInfo", &p)));
+        }
+        for (layer, r) in replies {
+            let Ok(v) = r else { continue };
+            if let Some(url) = v["url"].as_str() {
+                let slot = crate::fetch_into_limited(url, rustgis_engine::data::ogc::MAX_INFO_BYTES);
+                next.push(Ask { layer, also: Vec::new(), capabilities: false, request: Some(url.to_string()), slot });
+            }
+            found.extend(v["results"].as_array().cloned().unwrap_or_default());
+        }
+    }
+    let Some(pp) = &mut app.map.popup else { return };
+    pp.asks.extend(next);
+    if !found.is_empty() {
+        let mut all: Vec<Value> = match pp.info["results"].as_array() {
+            Some(r) => r.clone(),
+            None if is_found(&pp.info) => vec![pp.info.clone()],
+            None => Vec::new(),
+        };
+        all.extend(found);
+        if let Some(mut info) = all.first().cloned() {
+            if let Value::Object(o) = &mut info {
+                o.remove("featureInfo");
+                o.insert("results".into(), Value::Array(all));
+            }
+            pp.info = info;
+        }
+    }
+    if pp.asks.is_empty() && !is_found(&pp.info) {
+        app.map.popup = None;
+    }
+}
+
 fn popup(app: &mut RustGisApp, ui: &mut Ui, rect: Rect) {
+    follow_asks(app, ui.ctx());
     follow_popup(app);
     let Some(pp) = &app.map.popup else { return };
     let t = Tokens::get(ui.ctx());
@@ -2331,12 +3048,20 @@ fn popup(app: &mut RustGisApp, ui: &mut Ui, rect: Rect) {
     let mut zoom = false;
     // The feature shown, as its layer id and feature id (a raster pixel has neither).
     let shown = info["layerId"].as_u64().and_then(|id| u32::try_from(id).ok()).zip(info["fid"].as_u64());
-    let layer = info["layer"].as_str().unwrap_or("").to_string();
+    // Only WMS layers being asked so far: their names.
+    let waiting = !is_found(&info);
+    let layer = if waiting {
+        pp.asks.iter().map(|a| a.layer.as_str()).collect::<Vec<_>>().join(", ")
+    } else {
+        info["layer"].as_str().unwrap_or("").to_string()
+    };
     let mut attrs = info["attributes"].as_object().cloned().unwrap_or_default();
     // A picture value (a photo's thumbnail) shows as the picture, not as its text.
     let picture_key = attrs.iter().find(|(_, v)| v.as_str().is_some_and(is_picture)).map(|(k, _)| k.clone());
     let picture = picture_key.and_then(|k| attrs.remove(&k)).and_then(|v| v.as_str().map(|s| picture_texture(app, ui.ctx(), s)));
-    let title = if info["raster"].as_bool() == Some(true) {
+    let title = if waiting {
+        tl!("Asking the map service…").to_string()
+    } else if info["raster"].as_bool() == Some(true) {
         tl!("Pixel").to_string()
     } else {
         {
@@ -2379,40 +3104,40 @@ fn popup(app: &mut RustGisApp, ui: &mut Ui, rect: Rect) {
                     .corner_radius(CornerRadius { nw: 10, ne: 10, sw: 0, se: 0 })
                     .inner_margin(egui::Margin::symmetric(12, 8))
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.label(egui::RichText::new(&title).font(semibold(14.0)));
-                                ui.label(egui::RichText::new(&layer).size(11.0).color(t.text_dim));
-                            });
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                                if ui.add(egui::Button::new(tl!("×")).frame(false)).clicked() {
-                                    close = true;
+                        // Lay out controls first; the title and layer share only the width left.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                            if ui.add(egui::Button::new(tl!("×")).frame(false)).clicked() {
+                                close = true;
+                            }
+                            // A feature (not a raster pixel): zoom to it.
+                            if shown.is_some() {
+                                let (r, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
+                                let ink = if resp.hovered() { t.text } else { t.icon };
+                                crate::icons::paint(ui.painter(), r, "zoom_sel", ink, t.accent);
+                                if resp.on_hover_text(tl!("Zoom To")).clicked() {
+                                    zoom = true;
                                 }
-                                // A feature (not a raster pixel): zoom to it.
-                                if shown.is_some() {
-                                    let (r, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
-                                    let ink = if resp.hovered() { t.text } else { t.icon };
-                                    crate::icons::paint(ui.painter(), r, "zoom_sel", ink, t.accent);
-                                    if resp.on_hover_text(tl!("Zoom To")).clicked() {
-                                        zoom = true;
-                                    }
+                            }
+                            // Several features identified: step through them.
+                            if results > 1 {
+                                if ui.add_enabled(index + 1 < results, egui::Button::new("›").frame(false)).clicked() {
+                                    step = Some(index + 1);
                                 }
-                                // Several features identified: step through them.
-                                if results > 1 {
-                                    if ui.add_enabled(index + 1 < results, egui::Button::new("›").frame(false)).clicked() {
-                                        step = Some(index + 1);
-                                    }
-                                    let n = (index + 1).to_string();
-                                    let total = results.to_string();
-                                    ui.label(
-                                        egui::RichText::new(crate::i18n::fmt("{n} of {total}", &[("n", &n), ("total", &total)]))
-                                            .size(11.0)
-                                            .color(t.text_dim),
-                                    );
-                                    if ui.add_enabled(index > 0, egui::Button::new("‹").frame(false)).clicked() {
-                                        step = Some(index.saturating_sub(1));
-                                    }
+                                let n = (index + 1).to_string();
+                                let total = results.to_string();
+                                ui.label(
+                                    egui::RichText::new(crate::i18n::fmt("{n} of {total}", &[("n", &n), ("total", &total)]))
+                                        .size(11.0)
+                                        .color(t.text_dim),
+                                );
+                                if ui.add_enabled(index > 0, egui::Button::new("‹").frame(false)).clicked() {
+                                    step = Some(index.saturating_sub(1));
                                 }
+                            }
+                            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                ui.add(egui::Label::new(egui::RichText::new(&title).font(semibold(14.0))).truncate()).on_hover_text(&title);
+                                ui.add(egui::Label::new(egui::RichText::new(&layer).size(11.0).color(t.text_dim)).truncate())
+                                    .on_hover_text(&layer);
                             });
                         });
                     });
@@ -2777,7 +3502,7 @@ pub fn confirm_delete(app: &mut RustGisApp, ctx: &egui::Context) {
         Deletion::Map(n) => crate::i18n::fmt("Delete the map {name}?", &[("name", n)]),
         Deletion::Layout(n) => crate::i18n::fmt("Delete the layout {name}?", &[("name", n)]),
     };
-    let undo = crate::widgets::shortcut_text(app, "edit.undo");
+    let undo = crate::widgets::shortcut_text(ctx, app, "edit.undo");
     let mut decision = None;
     egui::Modal::new(egui::Id::unique("confirm_delete")).show(ctx, |ui| {
         ui.set_width(360.0);
@@ -2944,6 +3669,98 @@ mod tile_redraw_tests {
 }
 
 #[cfg(test)]
+mod halo_tests {
+    use super::*;
+    use rustgis_engine::map::Rgba;
+
+    #[test]
+    fn a_backgrounds_outline_is_its_rectangle_rounded_and_turned() {
+        let r = Rect::from_min_max(pos2(10.0, 20.0), pos2(50.0, 30.0));
+        // Square: its four corners, clockwise from the top left.
+        assert_eq!(background_outline(r, 0.0, 0.0), vec![r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()]);
+        // Rounded: five points a corner, all within it, the corners themselves cut off.
+        let round = background_outline(r, 3.0, 0.0);
+        assert_eq!(round.len(), 20);
+        assert!(round.iter().all(|p| r.expand(1e-3).contains(*p)));
+        assert!(!round.contains(&r.left_top()));
+        // A radius past half the shorter side is held to it.
+        let most = background_outline(r, 99.0, 0.0);
+        assert!(most.iter().all(|p| r.expand(1e-3).contains(*p)));
+        // Turned a quarter about its centre: as tall as it was wide.
+        let turned = background_outline(r, 0.0, std::f32::consts::FRAC_PI_2);
+        let b = Rect::from_points(&turned);
+        assert!((b.width() - 10.0).abs() < 1e-3 && (b.height() - 40.0).abs() < 1e-3 && (b.center() - r.center()).length() < 1e-3, "{b:?}");
+        // Nothing for a rectangle of no size or no number.
+        assert!(background_outline(Rect::from_min_max(pos2(0.0, 0.0), pos2(0.0, 5.0)), 0.0, 0.0).is_empty());
+        assert!(background_outline(Rect::from_min_max(pos2(0.0, 0.0), pos2(f32::NAN, 5.0)), 0.0, 0.0).is_empty());
+        assert_eq!(background_outline(r, f32::NAN, 0.0).len(), 4);
+    }
+
+    fn label(halo_width: Option<f32>) -> PlacedLabel {
+        PlacedLabel {
+            text: "A".into(),
+            x: 0.0,
+            y: 0.0,
+            size: 10.0,
+            color: Rgba::rgb(0, 0, 0),
+            halo: Some(Rgba::rgb(255, 255, 255)),
+            halo_width,
+            bold: false,
+            icon: None,
+            align: 0.0,
+            framed: false,
+            italic: false,
+            spacing: 0.0,
+            font: None,
+            line_align: TextAlign::Left,
+            angle: None,
+            collide: Default::default(),
+            glyphs: Vec::new(),
+            background: None,
+        }
+    }
+
+    #[test]
+    fn a_halos_copies_reach_its_width_and_stay_few_and_one_coat_see_through() {
+        // The thin halo as it always was: eight copies a point round, in its own colour.
+        let (thin, c) = halo_coats(&label(None), Rgba::new(255, 255, 255, 225));
+        assert_eq!((thin.len(), c), (8, Color32::from_rgba_unmultiplied(255, 255, 255, 225)));
+        for w in [0.5, 1.42, 3.0, 10.0, 1e9] {
+            let (offsets, _) = halo_coats(&label(Some(w)), Rgba::rgb(255, 255, 255));
+            let far = offsets.iter().map(|o| o.length()).fold(0.0, f32::max);
+            let reach = rustgis_engine::render::halo_reach(w) * 1.33;
+            assert!((far - reach).abs() < 1e-3 && offsets.len() <= MAX_HALO_COATS, "{w}: {far} of {reach}, {}", offsets.len());
+        }
+        assert!(halo_coats(&label(Some(0.0)), Rgba::rgb(255, 255, 255)).0.is_empty(), "no width, no halo");
+        // QGIS's usual buffer (0.5 mm, 1.42 pt) is solid: neighbouring copies on a ring are well
+        // under a pixel apart. On every ring, at any width, the copies stand evenly round it.
+        // ... with few copies: about as many as the thin halo's two or three times over.
+        assert!(halo_coats(&label(Some(1.42)), Rgba::rgb(255, 255, 255)).0.len() <= 24);
+        for w in [1.42, 3.0, 10.0] {
+            let (offsets, _) = halo_coats(&label(Some(w)), Rgba::rgb(255, 255, 255));
+            let mut rings: Vec<(f32, Vec<egui::Vec2>)> = Vec::new();
+            for o in offsets {
+                match rings.iter_mut().find(|(r, _)| (r - o.length()).abs() < 1e-3) {
+                    Some((_, ring)) => ring.push(o),
+                    None => rings.push((o.length(), vec![o])),
+                }
+            }
+            for (r, ring) in &rings {
+                let gap = std::f32::consts::TAU * r / ring.len() as f32;
+                let next = (ring[1] - ring[0]).length();
+                assert!((next - 2.0 * r * (gap / (2.0 * r)).sin()).abs() < 1e-3, "{w}: uneven ring {r}");
+                if w < 2.0 {
+                    assert!(gap <= 1.0, "{w}: ring {r} has gaps of {gap}");
+                }
+            }
+        }
+        // Half see-through, shared among its rings: each copy fainter, about one coat in all.
+        let (offsets, c) = halo_coats(&label(Some(3.0)), Rgba::new(255, 0, 0, 128));
+        assert!(offsets.len() > 8 && c.a() < 128 && c.a() > 0, "{c:?}");
+    }
+}
+
+#[cfg(test)]
 mod picture_tests {
     #[test]
     fn large_pictures_are_refused_before_decoding() {
@@ -2965,16 +3782,15 @@ mod picture_tests {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_globe_visibility_preview_drops_the_old_labels() {
-        let mut app = RustGisApp::with_sample();
-        app.run("map.body", json!({"name": "moon", "basemap": false})).expect("Moon");
-        app.run("map.projection", json!({"type": "globe"})).expect("globe");
-        let mut h = egui_kittest::Harness::builder()
-            .with_accessibility_check(false)
-            .with_size(vec2(900.0, 550.0))
-            .with_max_steps(10_000)
-            .build_ui_state(
+    fn selection_harness() -> egui_kittest::Harness<'static, RustGisApp> {
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.run("layer.template", json!({"template": "points", "name": "Points"})).unwrap();
+        for point in [[0.5, 0.5], [2.0, 2.0], [2.5, 0.5], [4.0, 4.0]] {
+            app.run("edit.addFeature", json!({"layer": "Points", "geometry": {"type": "Point", "coordinates": point}})).unwrap();
+        }
+        app.run("select.clear", Value::Null).unwrap();
+        let mut h =
+            egui_kittest::Harness::builder().with_size(vec2(1400.0, 860.0)).with_step_dt(0.016).with_max_steps(10_000).build_ui_state(
                 |ui, app: &mut RustGisApp| {
                     let ctx = ui.ctx().clone();
                     app.logic(&ctx);
@@ -2982,6 +3798,206 @@ mod tests {
                 },
                 app,
             );
+        h.step();
+        h.state_mut().run("map.zoomToExtent", json!({"extent": [-1, -1, 5, 5]})).unwrap();
+        for _ in 0..5 {
+            h.step();
+        }
+        assert!(h.state().map.view_rect.is_some());
+        h
+    }
+
+    fn selection_screen(h: &egui_kittest::Harness<'_, RustGisApp>, point: [f64; 2]) -> Pos2 {
+        lonlat_to_screen(h.state(), h.state().map.view_rect.unwrap().0, Coord::new(point[0], point[1])).unwrap()
+    }
+
+    fn selection_pointer(h: &mut egui_kittest::Harness<'_, RustGisApp>, at: Pos2, pressed: Option<bool>, modifiers: egui::Modifiers) {
+        h.event(egui::Event::ModifiersChanged(modifiers));
+        h.event(egui::Event::PointerMoved(at));
+        if let Some(pressed) = pressed {
+            h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers });
+        }
+        h.step();
+    }
+
+    fn selection_click(h: &mut egui_kittest::Harness<'_, RustGisApp>, point: [f64; 2]) {
+        let at = selection_screen(h, point);
+        selection_pointer(h, at, Some(true), egui::Modifiers::NONE);
+        selection_pointer(h, at, Some(false), egui::Modifiers::NONE);
+    }
+
+    fn selection_rows(h: &egui_kittest::Harness<'_, RustGisApp>) -> Vec<usize> {
+        h.state().session.map().layer_by_name("Points").unwrap().selection.clone()
+    }
+
+    #[test]
+    fn selection_tools_polygon_menu_repeat_and_fixed_default() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = selection_harness();
+        h.get_by_label("Select options").click();
+        h.run();
+        h.get_by_label("Select by Polygon").click();
+        h.run();
+        assert_eq!(h.state().session.tool, Tool::SelectPolygon);
+        let camera = h.state().session.map().camera;
+        let layers = h.state().session.map().layers.len();
+        for _ in 0..2 {
+            for point in [[0., 0.], [3., 0.], [3., 1.], [1., 1.], [1., 3.], [0., 3.]] {
+                selection_click(&mut h, point);
+            }
+            selection_click(&mut h, [0., 0.]);
+            assert_eq!(selection_rows(&h), vec![0, 2]);
+            assert_eq!(h.state().session.tool, Tool::SelectPolygon);
+            assert!(h.state().map.sketch.is_empty());
+            assert!(h.state().map.selection_gesture.is_none());
+            assert_eq!(h.state().session.map().camera, camera);
+            assert_eq!(h.state().session.map().layers.len(), layers);
+            assert_eq!(h.state().session.map().layer_by_name("Points").unwrap().dataset.features.len(), 4);
+        }
+        h.get_by_label("Select").click();
+        h.run();
+        assert_eq!(h.state().session.tool, Tool::Select);
+        selection_click(&mut h, [2., 2.]);
+        assert_eq!(selection_rows(&h), vec![1]);
+    }
+
+    #[test]
+    fn selection_tools_polygon_survives_camera_and_viewport_changes() {
+        let mut h = selection_harness();
+        h.state_mut().run("tool.set", json!({"tool": "selectPolygon"})).unwrap();
+        for point in [[0., 0.], [3., 0.], [3., 1.]] {
+            selection_click(&mut h, point);
+        }
+        let sketch = h.state().map.sketch.clone();
+        h.state_mut().session.map_mut().camera.center.x += 1000.0;
+        h.step();
+        assert_eq!(h.state().map.sketch, sketch, "camera movement preserves polygon vertices");
+        assert!(h.state().map.selection_gesture.is_some());
+
+        let rect = h.state().map.view_rect.unwrap().0;
+        cancel_changed_selection(h.state_mut(), rect.translate(vec2(8.0, 0.0)));
+        assert_eq!(h.state().map.sketch, sketch, "viewport movement preserves polygon vertices");
+        assert!(h.state().map.selection_gesture.is_some());
+
+        for point in [[1., 1.], [1., 3.], [0., 3.], [0., 0.]] {
+            selection_click(&mut h, point);
+        }
+        assert_eq!(selection_rows(&h), vec![0, 2]);
+        assert!(h.state().map.sketch.is_empty());
+        assert!(h.state().map.selection_gesture.is_none());
+    }
+
+    #[test]
+    fn selection_tools_lasso_release_and_modifiers() {
+        let mut h = selection_harness();
+        h.state_mut().run("tool.set", json!({"tool": "selectLasso"})).unwrap();
+        let points = [[0., 0.], [3., 0.], [3., 1.], [1., 1.], [1., 3.], [0., 3.]];
+        for modifiers in [
+            egui::Modifiers::NONE,
+            egui::Modifiers { shift: true, ..egui::Modifiers::NONE },
+            egui::Modifiers { ctrl: true, command: true, ..egui::Modifiers::NONE },
+        ] {
+            let at = selection_screen(&h, points[0]);
+            selection_pointer(&mut h, at, Some(true), modifiers);
+            for point in &points[1..5] {
+                let at = selection_screen(&h, *point);
+                selection_pointer(&mut h, at, None, modifiers);
+            }
+            // The final corner appears only in the release frame.
+            let at = selection_screen(&h, points[5]);
+            selection_pointer(&mut h, at, Some(false), modifiers);
+            assert_eq!(selection_rows(&h), if modifiers.ctrl { vec![] } else { vec![0, 2] });
+            assert!(h.state().map.sketch.is_empty());
+            assert!(h.state().map.drag.is_none());
+            assert_eq!(h.state().session.tool, Tool::SelectLasso);
+        }
+    }
+
+    #[test]
+    fn selection_tools_radius_release_metric_and_plain_clicks() {
+        let mut h = selection_harness();
+        h.state_mut().run("tool.set", json!({"tool": "selectRadius"})).unwrap();
+        let camera = h.state().session.map().camera;
+        for _ in 0..2 {
+            let center = selection_screen(&h, [0.5, 0.5]);
+            selection_pointer(&mut h, center, Some(true), egui::Modifiers::NONE);
+            let intermediate = selection_screen(&h, [3., 0.5]);
+            selection_pointer(&mut h, intermediate, None, egui::Modifiers::NONE);
+            let preview = h.state().map.radius_preview.as_ref().expect("live radius outline");
+            assert!(!preview.2.is_empty());
+            let sketch = &h.state().map.sketch;
+            let expected = radius_distance_m(sketch[0], sketch[1]).unwrap();
+            assert!((preview.1 - expected).abs() < 0.01);
+            let end = selection_screen(&h, [1.5, 0.5]);
+            selection_pointer(&mut h, end, Some(false), egui::Modifiers::NONE);
+            assert_eq!(selection_rows(&h), vec![0]);
+            assert_eq!(h.state().session.tool, Tool::SelectRadius);
+            assert!(h.state().map.radius_preview.is_none());
+        }
+        for tool in ["selectLasso", "selectRadius"] {
+            h.state_mut().run("tool.set", json!({"tool": tool})).unwrap();
+            selection_click(&mut h, [2., 2.]);
+            selection_click(&mut h, [2., 2.]);
+            assert_eq!(selection_rows(&h), vec![0]);
+            assert_eq!(h.state().session.map().camera, camera);
+        }
+    }
+
+    #[test]
+    fn selection_tools_cancelled_drag_cannot_commit_on_release() {
+        let mut h = selection_harness();
+        h.state_mut().run("select.rows", json!({"layer": "Points", "rows": [3]})).unwrap();
+        for tool in ["selectLasso", "selectRadius"] {
+            for cancel in ["same", "direct", "camera", "projection", "escape"] {
+                h.state_mut().run("tool.set", json!({"tool": tool})).unwrap();
+                let start = selection_screen(&h, [0., 0.]);
+                let end = selection_screen(&h, [3., 3.]);
+                selection_pointer(&mut h, start, Some(true), egui::Modifiers::NONE);
+                selection_pointer(&mut h, end, None, egui::Modifiers::NONE);
+                assert!(h.state().map.selection_gesture.is_some());
+                assert!(h.state_mut().run("tool.set", json!({"tool": "not-a-tool"})).is_err());
+                assert!(h.state().map.selection_gesture.is_some());
+                match cancel {
+                    "same" => {
+                        h.state_mut().run("tool.set", json!({"tool": tool})).unwrap();
+                    }
+                    "direct" => h.state_mut().session.tool = Tool::Select,
+                    "camera" => h.state_mut().session.map_mut().camera.center.x += 1.0,
+                    "projection" => {
+                        h.state_mut().run("map.projection", json!({"type": "robinson"})).unwrap();
+                    }
+                    _ => h.event(egui::Event::Key {
+                        key: egui::Key::Escape,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }),
+                }
+                h.step();
+                selection_pointer(&mut h, end, Some(false), egui::Modifiers::NONE);
+                assert_eq!(selection_rows(&h), vec![3], "{tool}: {cancel}");
+                assert!(h.state().map.selection_gesture.is_none());
+                assert!(h.state().map.drag.is_none());
+                h.state_mut().run("map.projection", json!({"type": "mercator"})).unwrap();
+                h.step();
+            }
+        }
+    }
+
+    #[test]
+    fn a_globe_visibility_preview_drops_the_old_labels() {
+        let mut app = RustGisApp::with_sample();
+        app.run("map.body", json!({"name": "moon", "basemap": false})).expect("Moon");
+        app.run("map.projection", json!({"type": "globe"})).expect("globe");
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(900.0, 550.0)).with_max_steps(10_000).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
         let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while h.state().map.key.is_none() || h.state().map.drawing() {
             assert!(std::time::Instant::now() < end, "exact globe frame did not arrive");
@@ -2999,12 +4015,8 @@ mod tests {
     /// the map is drawn once at it.
     #[test]
     fn a_pane_drag_draws_the_map_once_it_stops() {
-        let mut h = egui_kittest::Harness::builder()
-            .with_accessibility_check(false)
-            .with_size(vec2(1200.0, 700.0))
-            .with_step_dt(1.0 / 60.0)
-            .with_max_steps(10_000)
-            .build_ui_state(
+        let mut h =
+            egui_kittest::Harness::builder().with_size(vec2(1200.0, 700.0)).with_step_dt(1.0 / 60.0).with_max_steps(10_000).build_ui_state(
                 |ui, app: &mut RustGisApp| {
                     let ctx = ui.ctx().clone();
                     app.logic(&ctx);

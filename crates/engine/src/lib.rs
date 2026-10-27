@@ -10,6 +10,10 @@ pub mod connections;
 pub mod geometry_calc;
 pub mod model;
 pub mod project;
+pub mod s3_connections;
+pub mod s3_keys;
+#[cfg(test)]
+mod s3_saved_tests;
 pub mod sample;
 pub mod sources;
 #[cfg(test)]
@@ -273,6 +277,9 @@ pub enum Tool {
     #[default]
     Explore,
     Select,
+    SelectPolygon,
+    SelectLasso,
+    SelectRadius,
     ZoomIn,
     Measure,
     MeasureArea,
@@ -305,6 +312,9 @@ impl Tool {
         match self {
             Tool::Explore => "explore",
             Tool::Select => "select",
+            Tool::SelectPolygon => "selectPolygon",
+            Tool::SelectLasso => "selectLasso",
+            Tool::SelectRadius => "selectRadius",
             Tool::ZoomIn => "zoomIn",
             Tool::Measure => "measure",
             Tool::MeasureArea => "measureArea",
@@ -322,6 +332,9 @@ impl Tool {
         [
             Tool::Explore,
             Tool::Select,
+            Tool::SelectPolygon,
+            Tool::SelectLasso,
+            Tool::SelectRadius,
             Tool::ZoomIn,
             Tool::Measure,
             Tool::MeasureArea,
@@ -337,6 +350,9 @@ impl Tool {
         match self {
             Tool::Explore => "Explore",
             Tool::Select => "Select",
+            Tool::SelectPolygon => "Select by Polygon",
+            Tool::SelectLasso => "Select by Lasso",
+            Tool::SelectRadius => "Select by Radius",
             Tool::ZoomIn => "Zoom In",
             Tool::Measure => "Measure Distance",
             Tool::MeasureArea => "Measure Area",
@@ -400,8 +416,9 @@ pub struct Notice {
 
 const UNDO_LIMIT: usize = 40;
 
-/// An undo or redo step: the project before it, the layout open then, its label and who made it.
-type Step = (Project, Option<usize>, &'static str, Option<String>);
+/// An undo or redo step: the project before it, the layout open then, its label, who made it,
+/// and which state of the project it is ([`Session::dirty`]).
+type Step = (Project, Option<usize>, &'static str, Option<String>, u64);
 
 /// What a project holds in the session beside itself: what [`Session::clear_history`] forgets
 /// when another project starts, and what opening one sets (its file, layer, tool…). When another
@@ -420,7 +437,8 @@ struct PutAside {
     /// The projection those cameras are in: without it, the extent history given back would be
     /// taken for another projection's and cleared.
     history_projection: String,
-    dirty: bool,
+    state: u64,
+    saved: Option<u64>,
     trusted_tasks: std::collections::HashSet<String>,
     trusted_models: std::collections::HashSet<String>,
     trusted_notebooks: std::collections::HashSet<String>,
@@ -459,15 +477,27 @@ struct PutAside {
 pub struct Session {
     pub project: Project,
     pub path: Option<PathBuf>,
-    pub dirty: bool,
+    /// Which state of the project is open: a new one after each change, an earlier one again
+    /// after undo. Each is given once in a session (`states` counts them).
+    state: u64,
+    states: u64,
+    /// The state last saved, or opened from its file; `None` when no state of the open project is
+    /// (recovered work). The project has unsaved changes while another is open ([`Session::dirty`]).
+    saved: Option<u64>,
     /// Favourite, recent and saved data sources (kept with the app's preferences, not the
     /// project).
     pub sources: sources::Sources,
     /// Saved connections (`connection.*`): kept with the app's preferences, not the project; never a secret.
     pub connections: connections::Connections,
-    /// The database logins of this run: the system's secret store (desktop app only), passwords
-    /// given and read, which saved connection each database uses, and the logins to ask for. Never
-    /// saved; see [`connections::DatabaseLogins`].
+    /// The runtime token of each saved S3 connection's login in this session, by saved id (see
+    /// `rustgis_tiles::s3::connect_saved`): given on the first successful login, kept after.
+    pub(crate) s3_bindings: std::collections::BTreeMap<String, String>,
+    /// Project sources that read an S3 bucket through a saved connection and wait for the user to
+    /// choose which (see [`s3_connections`]); none is fetched meanwhile.
+    pub s3_pending: Vec<s3_connections::PendingS3>,
+    /// This run's connection credential store (desktop only), plus database passwords, selections
+    /// and login requests. S3 uses the same store through `DatabaseLogins::secret_store`.
+    /// Never saved; see [`connections::DatabaseLogins`].
     pub database_logins: connections::DatabaseLogins,
     /// How rasters added from now on are drawn (`raster.setDefaultStyle`; kept with the app's
     /// preferences, not the project).
@@ -519,6 +549,9 @@ pub struct Session {
     /// Tasks made in this session (lower-cased names). Others came from files, and their steps
     /// may not touch files when run.
     pub trusted_tasks: std::collections::HashSet<String>,
+    /// A task is executing: its steps may not start another task, even through scripts.
+    /// Kept across project replacement until the active call returns; never part of undo.
+    pub(crate) task_running: bool,
     /// Models made in this session (lower-cased names); the steps of others may not touch files.
     pub trusted_models: std::collections::HashSet<String>,
     /// What the last model run did, node by node (`model::RunReport`), kept even when the run
@@ -581,7 +614,7 @@ pub struct Session {
     /// them (it keeps nothing between calls). Not saved with the project: a plugin's state
     /// command reads what it needs from the map when the panel opens.
     pub plugin_panels: std::collections::BTreeMap<String, rustgis_plugins::PanelState>,
-    /// Data downloads of this project under way (Add Data › From URL), by id.
+    /// Data downloads of this project under way (Home › Add › Add Data › From URL), by id.
     downloading: Vec<u64>,
     /// Downloads that landed, waiting for `layer.addDownload`.
     pub(crate) downloaded: Vec<(u64, Vec<u8>)>,
@@ -721,9 +754,13 @@ impl Session {
         Session {
             project,
             path: None,
-            dirty: false,
+            state: 0,
+            states: 0,
+            saved: Some(0),
             sources: sources::Sources::default(),
             connections: connections::Connections::default(),
+            s3_bindings: std::collections::BTreeMap::new(),
+            s3_pending: Vec::new(),
             database_logins: connections::DatabaseLogins::default(),
             raster_defaults: rustgis_map::RasterDefaults::default(),
             registry: Registry { commands: cmd::all() },
@@ -744,6 +781,7 @@ impl Session {
             keep_tool: false,
             active_layout: None,
             trusted_tasks: Default::default(),
+            task_running: false,
             trusted_models: Default::default(),
             model_run: None,
             project_starts: 0,
@@ -879,6 +917,18 @@ impl Session {
         cmd::tiles::follow_style_view(self, web_time::Duration::ZERO)
     }
 
+    /// Runs command `id` as a part of the one running now (a command made of others): its
+    /// changes are in that command's one undo step, not a step of their own. A part that fails
+    /// (or panics) is undone by its own `run`, which restores what it started from; the parts
+    /// before it stay until the command made of them fails too, whose `run` restores the project
+    /// as the whole command found it. The stacks are put back on every return.
+    pub(crate) fn run_part(&mut self, id: &str, params: &Value) -> CmdResult {
+        let (undo, redo) = (std::mem::take(&mut self.undo), std::mem::take(&mut self.redo));
+        let res = self.run(id, params);
+        (self.undo, self.redo) = (undo, redo);
+        res
+    }
+
     /// Runs a command by id. Mutating commands snapshot the project for undo; an error or a
     /// panic restores it.
     pub fn run(&mut self, id: &str, params: &Value) -> CmdResult {
@@ -956,6 +1006,7 @@ impl Session {
     /// and restored if `f` fails or panics.
     pub(crate) fn guarded(&mut self, label: &'static str, mutates: bool, f: impl FnOnce(&mut Session) -> CmdResult) -> CmdResult {
         let snapshot = mutates.then(|| self.project.clone());
+        let state = self.state;
         // The merge key asked for applies to this command only, whatever it does; and to a
         // command run by itself, not to those it runs.
         let merge = if self.depth == 0 { self.merge.take() } else { None };
@@ -1017,7 +1068,7 @@ impl Session {
                 // back to before the first of them. Only a command run by itself merges.
                 let key = merge;
                 if key.is_none() || key != self.merged || self.undo.is_empty() {
-                    self.undo.push((snap, open_layout, label, self.actor.clone()));
+                    self.undo.push((snap, open_layout, label, self.actor.clone(), state));
                     if self.undo.len() > UNDO_LIMIT {
                         self.undo.remove(0);
                     }
@@ -1026,7 +1077,7 @@ impl Session {
                     self.merged = key;
                 }
                 self.redo.clear();
-                self.dirty = true;
+                self.state = self.new_state();
             }
             (Err(_), Some(snap)) => {
                 // The project as it was before the command, so the layout open then, whatever
@@ -1039,6 +1090,7 @@ impl Session {
                     self.give_back(opened);
                 }
                 self.opened = opened;
+                self.state = state;
                 if let Some(c) = counts {
                     self.edit_counts = c;
                 }
@@ -1095,7 +1147,8 @@ impl Session {
             forward: take(&mut self.forward),
             last_camera: self.last_camera.take(),
             history_projection: self.history_projection.clone(),
-            dirty: std::mem::replace(&mut self.dirty, false),
+            state: self.state,
+            saved: self.saved,
             trusted_tasks: take(&mut self.trusted_tasks),
             trusted_models: take(&mut self.trusted_models),
             trusted_notebooks: take(&mut self.trusted_notebooks),
@@ -1140,7 +1193,8 @@ impl Session {
             forward,
             last_camera,
             history_projection,
-            dirty,
+            state,
+            saved,
             trusted_tasks,
             trusted_models,
             trusted_notebooks,
@@ -1172,7 +1226,8 @@ impl Session {
         } = *a;
         (self.undo, self.redo, self.back, self.forward, self.last_camera) = (undo, redo, back, forward, last_camera);
         self.history_projection = history_projection;
-        (self.dirty, self.project_starts, self.history_from_file) = (dirty, project_starts, history_from_file);
+        (self.state, self.saved) = (state, saved);
+        (self.project_starts, self.history_from_file) = (project_starts, history_from_file);
         (self.trusted_tasks, self.trusted_models, self.trusted_notebooks) = (trusted_tasks, trusted_models, trusted_notebooks);
         (self.active_layer, self.table_layer, self.table_standalone, self.tool) = (active_layer, table_layer, table_standalone, tool);
         (self.layer_selection, self.layer_selection_of) = (layer_selection, layer_selection_of);
@@ -1246,30 +1301,63 @@ impl Session {
     pub fn clear_history(&mut self) {
         drop(self.take_project_state());
         self.project_starts = self.project_starts.wrapping_add(1);
+        // A state of its own: undo back past a replacement made within a command (a task's step)
+        // reaches a state of the project before, which isn't this one's saved state.
+        self.state = self.new_state();
+        self.saved = Some(self.state);
+    }
+
+    /// Whether the project has changes that aren't saved: it is in another state than the one
+    /// last saved or opened. Undo or redo back to that state leaves none.
+    pub fn dirty(&self) -> bool {
+        self.saved != Some(self.state)
+    }
+
+    /// Which state the project is in: another after each change, an earlier one after undo. A
+    /// front end compares it to tell whether the project changed since it last looked.
+    pub fn state(&self) -> u64 {
+        self.state
+    }
+
+    /// The project as it is now is saved (written to its file, or downloaded in the browser).
+    pub fn mark_saved(&mut self) {
+        self.saved = Some(self.state);
+    }
+
+    /// The project has changes that aren't saved, whatever undo does (work recovered after a
+    /// crash: no state of it is in a file).
+    pub fn mark_unsaved(&mut self) {
+        self.saved = None;
+    }
+
+    /// A state of the project not given before in this session, for a change just made.
+    fn new_state(&mut self) -> u64 {
+        self.states = self.states.wrapping_add(1);
+        self.states
     }
 
     pub(crate) fn undo(&mut self) -> bool {
         self.merged = None;
-        let Some((p, saved, label, actor)) = self.undo.pop() else { return false };
+        let Some((p, saved, label, actor, state)) = self.undo.pop() else { return false };
         let (open, was) = (self.open_layout_name(), self.active_layout);
         let cur = std::mem::replace(&mut self.project, p);
         self.project.keep_table_ids(&cur);
         self.reopen_layout(open, saved);
         self.keep_time_position(&cur);
-        self.redo.push((cur, was, label, actor));
+        self.redo.push((cur, was, label, actor, std::mem::replace(&mut self.state, state)));
         self.touch_all_geometry();
         true
     }
 
     pub(crate) fn redo(&mut self) -> bool {
         self.merged = None;
-        let Some((p, saved, label, actor)) = self.redo.pop() else { return false };
+        let Some((p, saved, label, actor, state)) = self.redo.pop() else { return false };
         let (open, was) = (self.open_layout_name(), self.active_layout);
         let cur = std::mem::replace(&mut self.project, p);
         self.project.keep_table_ids(&cur);
         self.reopen_layout(open, saved);
         self.keep_time_position(&cur);
-        self.undo.push((cur, was, label, actor));
+        self.undo.push((cur, was, label, actor, std::mem::replace(&mut self.state, state)));
         self.touch_all_geometry();
         true
     }

@@ -46,15 +46,23 @@ pub struct RasterLayer {
     /// The pixels; `None` when the source couldn't be read.
     #[serde(skip)]
     pub data: Option<Arc<Raster>>,
+    /// The last reload failure; transient, like the decoded pixels.
+    #[serde(skip)]
+    pub error: Option<String>,
     /// Statistics of the pixels the style's mask leaves, worked out on the first draw.
     #[serde(skip)]
     masked: MaskedStats,
+    /// A remote reload shared with render snapshots, never serialized.
+    #[serde(skip)]
+    opening: Option<RasterRead>,
 }
 
 /// The renderer bands' statistics without the masked pixels, and what they were worked out for:
 /// the mask, the renderer's bands and the pixels (held weakly, so their address isn't reused).
 #[derive(Clone, Default)]
 struct MaskedStats(Arc<Mutex<Option<(RasterMask, Vec<usize>, Weak<Raster>, Arc<Vec<BandStats>>)>>>);
+
+type RasterRead = Arc<Mutex<Option<Result<Arc<Raster>, String>>>>;
 
 impl std::fmt::Debug for RasterLayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -67,6 +75,45 @@ impl std::fmt::Debug for RasterLayer {
 }
 
 impl RasterLayer {
+    /// Reads a replacement without silently changing the renderer or resetting its style.
+    pub fn relinked(&self, path: &str, subdataset: Option<&str>) -> Result<RasterLayer, String> {
+        if self.embedded.is_some() {
+            return Err("the raster's data is kept in the project: there's no file to repair".into());
+        }
+        let sub = subdataset.or(self.subdataset.as_deref());
+        let r = rustgis_data::raster::read_path_with(std::path::Path::new(path), sub, self.crs.as_deref())
+            .and_then(|r| placed(r, self.placement))
+            .map_err(|e| format!("{path}: {e}"))?;
+        let need = self.style.renderer.bands().into_iter().max().map_or(1, |b| b.saturating_add(1));
+        if r.band_count() < need {
+            return Err(format!(
+                "{path} has {} band(s); the layer's style draws band {need}: choose a raster with at least {need} bands",
+                r.band_count()
+            ));
+        }
+        if matches!(self.style.renderer, RasterRenderer::Colormap) && !matches!(r.color, ColorHint::Palette(_)) {
+            return Err(format!(
+                "{path} has no color palette; the layer's Colormap style uses the file's palette: choose a raster with a color palette"
+            ));
+        }
+        let mut style = self.style.clone();
+        style.repair(&r);
+        Ok(RasterLayer {
+            path: Some(path.into()),
+            file_name: None,
+            embedded: None,
+            subdataset: sub.map(String::from),
+            crs: self.crs.clone(),
+            time_zarr: None,
+            placement: self.placement,
+            style,
+            data: Some(Arc::new(r)),
+            error: None,
+            masked: MaskedStats::default(),
+            opening: None,
+        })
+    }
+
     /// A raster read from a file on disk.
     pub fn from_path(raster: Raster, path: impl Into<String>) -> RasterLayer {
         let style = RasterStyle::default_for(&raster);
@@ -80,7 +127,9 @@ impl RasterLayer {
             placement: None,
             style,
             data: Some(Arc::new(raster)),
+            error: None,
             masked: MaskedStats::default(),
+            opening: None,
         }
     }
 
@@ -97,7 +146,9 @@ impl RasterLayer {
             placement: None,
             style,
             data: Some(Arc::new(raster)),
+            error: None,
             masked: MaskedStats::default(),
+            opening: None,
         }
     }
 
@@ -105,6 +156,40 @@ impl RasterLayer {
     /// layer that follows the time slider is left to the engine, which reads the step shown.
     pub fn reload(&mut self) -> Result<(), String> {
         if self.time_zarr.is_some() {
+            return Ok(());
+        }
+        self.opening = None;
+        self.error = None;
+        if self.embedded.is_none()
+            && let Some(path) = self
+                .path
+                .as_deref()
+                .filter(|p| rustgis_data::s3_address::is_wrapper(p) || p.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("s3://")))
+        {
+            let name = rustgis_data::s3_address::inner(path).split(['?', '#']).next().unwrap_or("raster.tif").to_string();
+            let placement = self.placement;
+            let slot = Arc::new(Mutex::new(None));
+            let land = slot.clone();
+            self.data = None;
+            self.opening = Some(slot);
+            rustgis_data::source::remote::fetch_whole(
+                path,
+                Box::new(move |result| {
+                    let result = result
+                        .map_err(|e| match e {
+                            rustgis_data::source::remote::Failed::Other(message) => message,
+                            _ => "The raster could not be downloaded.".to_string(),
+                        })
+                        .and_then(|bytes| {
+                            rustgis_data::raster::read_bytes(&name, &bytes)
+                                .and_then(|r| placed(r, placement))
+                                .map(Arc::new)
+                                .map_err(|e| e.to_string())
+                        });
+                    *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+                    crate::source::landed();
+                }),
+            );
             return Ok(());
         }
         let r = if let Some(bytes) = &self.embedded {
@@ -115,15 +200,7 @@ impl RasterLayer {
             return Err("the raster has no source".into());
         };
         // A scan goes back where it was laid (a GeoTIFF opened `as` a scan is one again).
-        let r = r.and_then(|mut r| {
-            if let Some(bbox) = self.placement {
-                if r.georeferenced {
-                    r = r.into_scan()?;
-                }
-                r.place(bbox)?;
-            }
-            Ok(r)
-        });
+        let r = r.and_then(|r| placed(r, self.placement));
         match r {
             Ok(r) => {
                 self.style.repair(&r);
@@ -131,10 +208,26 @@ impl RasterLayer {
                 Ok(())
             }
             Err(e) => {
+                self.error = Some(e.to_string());
                 self.data = None;
                 Err(e.to_string())
             }
         }
+    }
+
+    /// Installs a completed remote read; each render copy can observe the same shared result.
+    pub(crate) fn poll_reload(&mut self) -> bool {
+        let Some(slot) = self.opening.as_ref() else { return false };
+        let Some(result) = slot.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return true };
+        self.opening = None;
+        match result {
+            Ok(raster) => {
+                self.style.repair(&raster);
+                self.data = Some(raster);
+            }
+            Err(error) => self.error = Some(error),
+        }
+        false
     }
 
     /// Statistics of the renderer's bands (one per band, in its order) without the pixels the
@@ -161,6 +254,17 @@ impl RasterLayer {
         }
         Some(stats)
     }
+}
+
+/// Reapplies a scan's placement to pixels read again, without copying their bands.
+fn placed(mut raster: Raster, placement: Option<[f64; 4]>) -> rustgis_data::Result<Raster> {
+    if let Some(bbox) = placement {
+        if raster.georeferenced {
+            raster = raster.into_scan()?;
+        }
+        raster.place(bbox)?;
+    }
+    Ok(raster)
 }
 
 /// The most steps a Zarr layer following the time slider lists (as the slider itself does).
@@ -445,7 +549,7 @@ impl RasterRenderer {
 
 /// How a newly added single-band raster of continuous values is drawn: a colour ramp stretch with
 /// these settings (`raster.setDefaultStyle`). The app keeps them with its preferences, not the
-/// project; the default is an inverted grey stretch clipping 0.5 % at each end.
+/// project; the default is a black-to-white grey stretch clipping 0.5 % at each end.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RasterDefaults {
@@ -458,7 +562,7 @@ pub struct RasterDefaults {
 
 impl Default for RasterDefaults {
     fn default() -> Self {
-        RasterDefaults { ramp: Ramp::Greys, invert: true, stretch: Stretch::default(), resampling: Resampling::Nearest }
+        RasterDefaults { ramp: Ramp::gray(), invert: false, stretch: Stretch::default(), resampling: Resampling::Nearest }
     }
 }
 
@@ -922,6 +1026,8 @@ impl RasterLayer {
     pub fn legend(&self) -> Vec<RasterLegend> {
         let Some(r) = &self.data else { return Vec::new() };
         let band_name = |b: usize| r.bands.get(b).map(|b| b.name.clone()).unwrap_or_default();
+        // A class's name in the file (GDAL's category names), or else its value.
+        let class_label = |b: usize, v: f64| r.bands.get(b).and_then(|b| b.class_name(v)).map_or_else(|| fmt_num(v), str::to_owned);
         // The first renderer band's statistics, without the masked pixels.
         let masked = self.masked_stats();
         let stats = |band: usize| masked.as_ref().and_then(|m| m.first()).or_else(|| r.bands.get(band).map(|b| &b.stats));
@@ -956,17 +1062,17 @@ impl RasterLayer {
                     })
                     .collect()
             }
-            RasterRenderer::UniqueValues { values, .. } => values
+            RasterRenderer::UniqueValues { band, values, .. } => values
                 .iter()
                 .filter(|(v, _)| !mask.hides(*v as f32))
-                .map(|(v, c)| RasterLegend::Class { color: *c, label: fmt_num(*v) })
+                .map(|(v, c)| RasterLegend::Class { color: *c, label: class_label(*band, *v) })
                 .collect(),
             RasterRenderer::Colormap => {
                 let ColorHint::Palette(p) = &r.color else { return Vec::new() };
                 let cats = r.bands.first().and_then(|b| b.stats.categories.clone()).unwrap_or_default();
                 cats.iter()
                     .filter(|v| !mask.hides(**v as f32))
-                    .filter_map(|v| p.get(*v as usize).map(|c| RasterLegend::Class { color: Rgba(*c), label: fmt_num(*v) }))
+                    .filter_map(|v| p.get(*v as usize).map(|c| RasterLegend::Class { color: Rgba(*c), label: class_label(0, *v) }))
                     .collect()
             }
         }
@@ -978,6 +1084,34 @@ mod tests {
     use rustgis_data::raster::{Crs, GeoTransform};
 
     use super::*;
+
+    /// The legend names a class as the file does (#889), and gives the value of one it doesn't.
+    #[test]
+    fn legend_labels_classes_with_their_names() {
+        let gt = GeoTransform { origin_x: 10.0, origin_y: 50.0, pixel_width: 0.5, pixel_height: -0.5 };
+        let mut palette = vec![[0, 0, 0, 0]; 256];
+        palette[1..4].copy_from_slice(&[[239, 235, 221, 255], [255, 231, 160, 255], [253, 190, 110, 255]]);
+        let mut r =
+            Raster::new("slope", 3, 1, vec![vec![1.0, 2.0, 3.0]], gt, Crs::LonLat, None, ColorHint::Palette(palette), "UInt8").unwrap();
+        r.bands[0].classes = vec!["no data".into(), "0-5 %".into(), String::new(), "15-30 %".into()];
+        let labels = |rl: &RasterLayer| -> Vec<String> {
+            rl.legend()
+                .into_iter()
+                .map(|e| match e {
+                    RasterLegend::Class { label, .. } => label,
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        let mut rl = RasterLayer::from_path(r.clone(), "slope.tif");
+        rl.style.renderer = RasterRenderer::Colormap;
+        assert_eq!(labels(&rl), ["0-5 %", "2", "15-30 %"]);
+        rl.style.renderer = unique_values(&r, 0, Ramp::Harbour);
+        assert_eq!(labels(&rl), ["0-5 %", "2", "15-30 %"]);
+        r.bands[0].classes.clear();
+        rl.data = Some(Arc::new(r));
+        assert_eq!(labels(&rl), ["1", "2", "3"], "no names: the values, as before");
+    }
 
     /// A following layer's dates are its steps from `offset` on, one each: repair keeps them as
     /// they are when they are in order, and follows none rather than the wrong step otherwise.
@@ -1018,7 +1152,7 @@ mod tests {
         let c = Colorizer::new(&s, &r, None);
         let lo = c.color(&[0.0], None).unwrap();
         let hi = c.color(&[6.0], None).unwrap();
-        assert!(lo[0] < hi[0], "inverted greys: low is dark ({lo:?} vs {hi:?})");
+        assert!(lo[0] < hi[0], "grey: low is dark ({lo:?} vs {hi:?})");
         assert_eq!(c.color(&[f32::NAN], None), None);
         assert_eq!(c.color(&[], None), None);
 

@@ -81,8 +81,8 @@ The same World Atlas data, styled the same way, in each app.
   FlatGeobuf, PMTiles and Zarr are read in place by RustGIS's own readers, over HTTP byte ranges
   and from `s3://` buckets, on the desktop and in the browser alike. QGIS reads all of these too,
   through GDAL on the desktop.
-- **A ribbon interface.** Tabs follow the order of the work (Home, Data, Style, Edit, Analyze,
-  View, Publish), with Command Search (++ctrl+k++) to find any command or tool by name. People
+- **A ribbon interface.** Tabs follow the order of the work (Home, Data, Style, Labeling, Edit,
+  Analyze, View, Publish), with Command Search (++ctrl+k++) to find any command or tool by name. People
   coming from ArcGIS Pro often find it familiar; people who know QGIS's toolbars may not want it,
   which is a matter of taste.
 - **A permissive licence.** RustGIS is Apache-2.0, so its crates can be embedded in proprietary
@@ -153,7 +153,7 @@ The same World Atlas data, styled the same way, in each app.
 | **Scripting** | Engine commands: CLI, Python package, notebooks, Script pane, MCP; UI-only commands stay in the app | PyQGIS, `qgis_process`, Python console |
 | **Plugins** | Sandboxed WebAssembly; unsandboxed desktop/CLI process and Python plugins; registry | Python, thousands in the official repository |
 | **AI** | Built-in assistant using engine commands and project undo; MCP server | Through plugins |
-| **Server and mobile** | Static web build you can host | QGIS Server; QField and Mergin Maps |
+| **Server and mobile** | Static web build or Dockerfile you can host | QGIS Server; QField and Mergin Maps |
 | **Project file** | `.rgis` (open JSON) | `.qgs` / `.qgz` (open XML) |
 
 ## RustGIS for QGIS users
@@ -163,7 +163,7 @@ Most QGIS ideas have a counterpart under a different name:
 | In QGIS | In RustGIS |
 |---|---|
 | Layers panel | Layers pane (left) |
-| Browser panel, Data Source Manager | Browser pane, **Home › Add Data**, the Data Sources pane |
+| Browser panel, Data Source Manager | Browser pane, **Home › Add › Data Sources**, the Data Sources pane |
 | Processing Toolbox | Tools pane (**Analyze › Tools**), or Command Search (++ctrl+k++) |
 | Graphical Modeler | ModelBuilder: a node canvas of inputs, tools and outputs, which can also build a model from your history |
 | `qgis_process` | `rustgis-cli run --cmd 'gp.run={…}'` |
@@ -173,7 +173,7 @@ Most QGIS ideas have a counterpart under a different name:
 | Field Calculator | Calculate Field |
 | Print Layout, Atlas | Layouts, Map Series |
 | Plugin Manager | **Plugins › Plugin Manager** |
-| Project (`.qgz`) | Project (`.rgis`), or a package (`.rgispkg`) with its data inside |
+| Project (`.qgz`) | Project (`.rgis`), or a package (`.rgispkg`) with its data inside; a QGIS project opens as a map |
 
 The [User Guide](../user-guide/index.md) walks through the interface, and
 [Getting Started](../getting-started.md) is a short tour.
@@ -192,8 +192,11 @@ between them without conversion:
 - **Web maps**: MapLibre styles and OGC API Features collections exported from RustGIS can be
   served and opened anywhere, QGIS included.
 
-RustGIS does not open QGIS project files (`.qgz`) or full QGIS layer styles; move the data
-across and restyle it.
+- **Projects and layer styles**: RustGIS opens QGIS projects (`.qgs`, `.qgz`) as maps and
+  applies QGIS layer styles (`.qml`), carrying over the layers, their order and visibility,
+  renderers, symbols, labels and reference scales, and listing what it draws differently; see
+  [QGIS projects and styles](../user-guide/workspace.md#qgis-projects-and-styles). It doesn't
+  write them back.
 
 A common split is to do heavy editing, PROJ-dependent work and detailed cartography in QGIS,
 and use RustGIS where a light install, the browser, scripting by command id or the AI Assistant

@@ -12,18 +12,129 @@
 //! it (shots then catch the map mid-drag; `{"release": true}` lets go; `"button": "secondary"`; `"ctrl": true` holds Ctrl
 //! drags with the right button),
 //! `{"rclick": [x, y]}` right-clicks at (x, y) (the map's menu),
+//! `{"pointer":[x,y],"pressed":true|false,"shift":bool,"ctrl":bool}` moves the primary
+//! pointer and optionally presses/releases it, stepping one frame; omit `pressed` for motion.
 //! `{"scroll": [x, y, dy]}` turns the mouse wheel by `dy` points over (x, y) (negative zooms
 //! out) and runs one frame (shots then catch the map mid-zoom),
 //! `{"plugin": path}` loads a `.rgplugin` or a plugin folder for the run (as `rustgis-cli run
 //! --plugin` does), and `{"testPlugin": "panel"}` the plugin tests use, with a panel,
 //! `{"titlebar": {"left_inset": 80, "height": 34}}`
 //! draws the header as a macOS unified title bar (`null` turns it off), and
-//! `{"width": w, "height": h}` on the first line sets the size (default
-//! 1480×900 at 2×; `"dt": seconds` there sets each frame's length, default 0.25, and a
-//! short one such as 0.016 catches the map mid-motion). The window opens the World Atlas sample.
+//! `{"width": w, "height": h}` on the first line sets the size (default 1480×900),
+//! and `"pixelsPerPoint": scale` sets the output scale (default 2). The scale must be finite and
+//! positive, with physical dimensions from 1 pixel through the GPU's maximum 2D texture size.
+//! `"dt": seconds` sets each frame's length, default 0.25; a short one such as 0.016 catches the map mid-motion.
+//! The window opens the World Atlas sample.
+//! `"recovery": "/abs/dir"` on the first line gives the run that recovery folder, as the desktop
+//! app has one (Settings › Autosave; a copy left there is offered by the recovery dialog).
+//!
+//! Add `"ribbonSplit": true` to the first line for a compact reusable split-button showcase
+//! instead of the app. Its "Disable arrows", "Disable enclosing UI", and "Long two-line labels"
+//! checkboxes are script-clickable. `{"cmd":"ui.language","params":{"code":"de"}}` changes the
+//! language (untranslated strings fall back to English); `{"dark":true}` changes theme. The
+//! three checkboxes precede the buttons in Tab order; click "Select options" to open its menu.
+//! Shots retain pointer hover from the last click. No selection initially disables "Zoom To"
+//! but leaves "Zoom options" enabled.
 
 use egui_kittest::kittest::Queryable;
-use rustgis_ui_egui::RustGisApp;
+use rustgis_ui_egui::{RustGisApp, big_split_menu, i18n, theme};
+use serde_json::{Value, json};
+
+#[derive(Default)]
+struct RibbonSplitShowcase {
+    disable_arrows: bool,
+    disable_enclosing_ui: bool,
+    long_labels: bool,
+    fonts_installed: bool,
+    applied_dark: Option<bool>,
+}
+
+fn split_tool_menu(ui: &mut egui::Ui, app: &mut RustGisApp) {
+    for (label, tool) in [("Pan", "explore"), ("Measure Distance", "measure")] {
+        if ui.button(i18n::t(label)).clicked() {
+            if let Err(e) = app.run("tool.set", json!({"tool": tool})) {
+                eprintln!("tool.set: {e}");
+            }
+            ui.close();
+        }
+    }
+}
+
+impl RibbonSplitShowcase {
+    fn show(&mut self, ui: &mut egui::Ui, app: &mut RustGisApp) {
+        if !self.fonts_installed {
+            theme::install_fonts(ui.ctx(), &[], None);
+            self.fonts_installed = true;
+        }
+        if self.applied_dark != Some(app.ui.dark) {
+            let tokens = if app.ui.dark { theme::Tokens::dark() } else { theme::Tokens::light() };
+            theme::apply(ui.ctx(), &tokens);
+            self.applied_dark = Some(app.ui.dark);
+        }
+        i18n::set_current(app.chosen_lang());
+        ui.heading("Ribbon split buttons");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.disable_arrows, "Disable arrows");
+            ui.checkbox(&mut self.disable_enclosing_ui, "Disable enclosing UI");
+            ui.checkbox(&mut self.long_labels, "Long two-line labels");
+        });
+        ui.add_space(8.0);
+        let tokens = theme::Tokens::get(ui.ctx());
+        egui::Frame::new().fill(tokens.ribbon).inner_margin(12.0).show(ui, |ui| {
+            ui.add_enabled_ui(!self.disable_enclosing_ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    let select_checked = app.session.tool.code() == "select";
+                    big_split_menu(
+                        ui,
+                        app,
+                        "select",
+                        if self.long_labels { "Select Features\nwith a rectangle" } else { "Select" },
+                        "Click or drag a box to select features. Shift adds, Ctrl removes.",
+                        "tool.set",
+                        json!({"tool": "select"}),
+                        select_checked,
+                        "Select options",
+                        "Choose an alternative map tool.",
+                        !self.disable_arrows,
+                        split_tool_menu,
+                    );
+                    ui.add_space(20.0);
+                    big_split_menu(
+                        ui,
+                        app,
+                        "zoom_sel",
+                        if self.long_labels { "Zoom To\nselected features" } else { "Zoom To" },
+                        "Zoom to the selected features.",
+                        "select.zoomTo",
+                        Value::Null,
+                        false,
+                        "Zoom options",
+                        "Choose a map tool even when nothing is selected.",
+                        !self.disable_arrows,
+                        split_tool_menu,
+                    );
+                });
+            });
+        });
+        ui.add_space(8.0);
+        ui.label(format!("Current tool: {} ({})", i18n::t(app.session.tool.label()), app.session.tool.code()));
+        ui.label("Select always runs selection; either options menu can switch to Pan or Measure Distance.");
+        ui.label("Zoom To needs selected features; its options remain available without a selection.");
+    }
+}
+
+/// Matches the renderer's rounded physical target size and the active device's texture limit.
+fn screenshot_scale(size: egui::Vec2, value: f64, max_dimension: u32) -> Result<f32, String> {
+    let scale = value as f32;
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err("pixelsPerPoint must be finite, positive, and representable as f32".into());
+    }
+    let physical = size * scale;
+    if [physical.x, physical.y].into_iter().any(|v| !v.is_finite() || v.round() < 1.0 || v.round() > max_dimension as f32) {
+        return Err(format!("scaled width and height must each round to 1..={max_dimension} pixels"));
+    }
+    Ok(scale)
+}
 
 fn main() {
     let path = std::env::args().nth(1).expect("usage: ui_shot script.jsonl");
@@ -32,8 +143,15 @@ fn main() {
         script.lines().filter(|l| !l.trim().is_empty()).map(|l| serde_json::from_str(l).expect("json line")).collect();
     let w = lines.iter().find_map(|l| l.get("width").and_then(|v| v.as_f64())).unwrap_or(1480.0) as f32;
     let h = lines.iter().find_map(|l| l.get("height").and_then(|v| v.as_f64())).unwrap_or(900.0) as f32;
+    let pixels_per_point = lines.iter().find_map(|l| l.get("pixelsPerPoint").and_then(|v| v.as_f64())).unwrap_or(2.0);
     let dt = lines.iter().find_map(|l| l.get("dt").and_then(|v| v.as_f64())).unwrap_or(0.25) as f32;
+    let ribbon_split = lines.first().and_then(|l| l.get("ribbonSplit")).and_then(Value::as_bool).unwrap_or(false);
+    let mut split_showcase = RibbonSplitShowcase::default();
     let mut app = RustGisApp::with_sample();
+    if let Some(dir) = lines.first().and_then(|l| l.get("recovery")).and_then(Value::as_str) {
+        let store = rustgis_ui_egui::FolderStore::open(std::path::Path::new(dir)).expect("recovery folder");
+        app = app.with_services(rustgis_ui_egui::Services { recovery: Some(Box::new(store)), ..Default::default() });
+    }
     // One shared wgpu render state: the app's GPU map backend and the harness's renderer must
     // live on the same device for the map's paint callback to be valid.
     let rs = {
@@ -47,19 +165,29 @@ fn main() {
         ))
         .expect("render state")
     };
+    let pixels_per_point = match screenshot_scale(egui::vec2(w, h), pixels_per_point, rs.device.limits().max_texture_dimension_2d) {
+        Ok(scale) => scale,
+        Err(error) => {
+            eprintln!("invalid screenshot settings: {error}");
+            std::process::exit(2);
+        }
+    };
     app.set_render_state(Some(rs.clone()));
     let mut harness = egui_kittest::Harness::builder()
-        .with_accessibility_check(false)
         .with_size(egui::vec2(w, h))
-        .with_pixels_per_point(2.0)
+        .with_pixels_per_point(pixels_per_point)
         .with_max_steps(10_000)
         .with_step_dt(dt)
         .renderer(egui_kittest::wgpu::WgpuTestRenderer::from_render_state(rs))
         .build_ui_state(
-            |ui, app: &mut RustGisApp| {
-                let ctx = ui.ctx().clone();
-                app.logic(&ctx);
-                app.ui(ui);
+            move |ui, app: &mut RustGisApp| {
+                if ribbon_split {
+                    split_showcase.show(ui, app);
+                } else {
+                    let ctx = ui.ctx().clone();
+                    app.logic(&ctx);
+                    app.ui(ui);
+                }
             },
             app,
         );
@@ -165,6 +293,31 @@ fn main() {
             for _ in 0..3 {
                 harness.step();
             }
+        } else if let Some(d) = l.get("pointer").and_then(Value::as_array) {
+            let Some((x, y)) = d.first().and_then(Value::as_f64).zip(d.get(1).and_then(Value::as_f64)) else {
+                eprintln!("pointer takes [x, y]");
+                continue;
+            };
+            let pos = egui::pos2(x as f32, y as f32);
+            if held != egui::PointerButton::Primary
+                && let Some(previous) = harness.ctx.input(|i| i.pointer.latest_pos())
+            {
+                harness.event(egui::Event::PointerButton { pos: previous, button: held, pressed: false, modifiers: held_mods });
+            }
+            held = egui::PointerButton::Primary;
+            let ctrl = l.get("ctrl").and_then(Value::as_bool).unwrap_or(false);
+            held_mods = egui::Modifiers {
+                shift: l.get("shift").and_then(Value::as_bool).unwrap_or(false),
+                ctrl,
+                command: ctrl,
+                ..egui::Modifiers::NONE
+            };
+            harness.event(egui::Event::ModifiersChanged(held_mods));
+            harness.event(egui::Event::PointerMoved(pos));
+            if let Some(pressed) = l.get("pressed").and_then(Value::as_bool) {
+                harness.event(egui::Event::PointerButton { pos, button: held, pressed, modifiers: held_mods });
+            }
+            harness.step();
         } else if let Some(d) = l.get("drag").and_then(|v| v.as_array()) {
             let n: Vec<f32> = d.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect();
             let [x, y, dx, dy] = n[..] else {
@@ -260,5 +413,29 @@ fn main() {
                 harness.step();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::screenshot_scale;
+    use egui::vec2;
+
+    #[test]
+    fn screenshot_scale_rejects_invalid_values_and_target_sizes() {
+        for scale in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX, 1e-300, 1e-30, 8.01] {
+            assert!(screenshot_scale(vec2(1024.0, 512.0), scale, 8192).is_err(), "{scale}");
+        }
+        assert!(screenshot_scale(vec2(512.0, 1024.0), 8.01, 8192).is_err());
+    }
+
+    #[test]
+    fn screenshot_scale_accepts_default_and_rounded_renderer_boundaries() {
+        assert_eq!(screenshot_scale(vec2(1366.0, 768.0), 2.0, 8192), Ok(2.0));
+        assert_eq!(screenshot_scale(vec2(1024.0, 512.0), 8.0, 8192), Ok(8.0));
+        assert_eq!(screenshot_scale(vec2(1.0, 1.0), 0.5, 8192), Ok(0.5));
+        assert!(screenshot_scale(vec2(1.0, 1.0), 0.49, 8192).is_err());
+        assert_eq!(screenshot_scale(vec2(8192.25, 512.0), 1.0, 8192), Ok(1.0));
+        assert!(screenshot_scale(vec2(8192.5, 512.0), 1.0, 8192).is_err());
     }
 }

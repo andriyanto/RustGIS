@@ -502,6 +502,27 @@ pub fn paint(painter: &Painter, r: Rect, name: &str, ink: Color32, accent: Color
             p.polygon_shape(&[(2.0, 4.0), (16.0, 3.0), (20.0, 14.0), (9.0, 20.0)], 110);
             p.circle(16.0, 16.0, 6.0, Some(Color32::WHITE), Some((1.3, red)));
         }
+        "intersect" => {
+            // Two overlapping polygons, only their shared part filled.
+            p.rect(9.0, 9.0, 6.0, 6.0, Some(accent), None, 0.0);
+            p.rect(3.0, 3.0, 12.0, 12.0, None, Some((1.3, ink)), 0.0);
+            p.rect(9.0, 9.0, 12.0, 12.0, None, Some((1.3, ink)), 0.0);
+        }
+        "identity" => {
+            // Intersect's squares, the input's square all kept: its part outside lighter.
+            p.rect(3.0, 3.0, 12.0, 12.0, Some(p.tint(60)), None, 0.0);
+            p.rect(9.0, 9.0, 6.0, 6.0, Some(accent), None, 0.0);
+            p.rect(3.0, 3.0, 12.0, 12.0, None, Some((1.3, ink)), 0.0);
+            p.rect(9.0, 9.0, 12.0, 12.0, None, Some((1.3, ink)), 0.0);
+        }
+        "union" => {
+            // Both squares kept, their shared part marked.
+            p.rect(3.0, 3.0, 12.0, 12.0, Some(p.tint(60)), None, 0.0);
+            p.rect(9.0, 9.0, 12.0, 12.0, Some(p.tint(60)), None, 0.0);
+            p.rect(9.0, 9.0, 6.0, 6.0, Some(accent), None, 0.0);
+            p.rect(3.0, 3.0, 12.0, 12.0, None, Some((1.3, ink)), 0.0);
+            p.rect(9.0, 9.0, 12.0, 12.0, None, Some((1.3, ink)), 0.0);
+        }
         "dissolve" => {
             p.polygon_shape(&[(2.0, 6.0), (12.0, 3.0), (22.0, 6.0), (20.0, 19.0), (4.0, 19.0)], 110);
             p.line(&[(12.0, 3.5), (12.0, 18.5)], 1.0, ink.gamma_multiply(0.35));
@@ -1225,6 +1246,9 @@ pub const ALL: &[&str] = &[
     "buffer",
     "clip",
     "erase",
+    "intersect",
+    "identity",
+    "union",
     "dissolve",
     "hull",
     "centroid",

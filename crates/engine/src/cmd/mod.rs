@@ -1,9 +1,11 @@
 //! Every command, grouped by ribbon tab.
 
+pub mod arcgis;
 pub mod catalogs;
 pub mod clipboard;
 pub mod connections;
 pub mod cube;
+pub mod cube_catalog;
 pub mod deeplearning;
 pub mod design;
 pub mod directions;
@@ -30,7 +32,9 @@ pub mod plugins;
 pub mod portals;
 pub mod presentation;
 pub mod project;
+pub mod qgis;
 pub mod raster;
+pub mod repair;
 pub mod report;
 pub mod s3;
 pub mod search;
@@ -56,6 +60,7 @@ use crate::{CommandSpec, Session};
 pub fn all() -> Vec<CommandSpec> {
     let mut v = Vec::new();
     v.extend(project::commands());
+    v.extend(qgis::commands());
     v.extend(navigate::commands());
     v.extend(geocode::commands());
     v.extend(directions::commands());
@@ -69,8 +74,10 @@ pub fn all() -> Vec<CommandSpec> {
     v.extend(group::commands());
     v.extend(layer_copy::commands());
     v.extend(raster::commands());
+    v.extend(repair::commands());
     v.extend(zarr::commands());
     v.extend(cube::commands());
+    v.extend(cube_catalog::commands());
     v.extend(select::commands());
     v.extend(edit::commands());
     v.extend(clipboard::commands());
@@ -101,6 +108,7 @@ pub fn all() -> Vec<CommandSpec> {
     v.extend(webdata::commands());
     v.extend(embeddings::commands());
     v.extend(earthdata::commands());
+    v.extend(arcgis::commands());
     v.extend(nldi::commands());
     v.extend(time::commands());
     v

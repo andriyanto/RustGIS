@@ -13,18 +13,14 @@ fn harness_with_services(services: Services) -> egui_kittest::Harness<'static, R
     app.run("layer.template", json!({"template": "lines", "name": "Paths"})).unwrap();
     app.run("edit.addFeature", json!({"geometry": {"type": "LineString", "coordinates": [[0, 0], [0, 0.001]]}})).unwrap();
     app.run("select.rows", json!({"layer": "Paths", "rows": [0]})).unwrap();
-    egui_kittest::Harness::builder()
-        .with_accessibility_check(false)
-        .with_size(egui::vec2(1800.0, 1000.0))
-        .with_max_steps(64)
-        .build_ui_state(
-            |ui, app: &mut RustGisApp| {
-                let ctx = ui.ctx().clone();
-                app.logic(&ctx);
-                app.ui(ui);
-            },
-            app,
-        )
+    egui_kittest::Harness::builder().with_size(egui::vec2(1800.0, 1000.0)).with_max_steps(64).build_ui_state(
+        |ui, app: &mut RustGisApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        app,
+    )
 }
 
 fn first_x_metres(h: &egui_kittest::Harness<'_, RustGisApp>) -> f64 {
@@ -237,6 +233,10 @@ fn distance_controls_follow_display_units_and_keep_metre_command_values() {
     for _ in 0..3 {
         h.step();
     }
+    // The distances are in the pane's Range tab (#858).
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Range").click();
+    h.step();
+    h.step();
     assert!(painted_text(&h).iter().any(|s| s == "1.0 km"));
     h.state_mut().run("ui.measurementUnits", json!({"units": "imperial"})).unwrap();
     h.step();
@@ -244,7 +244,7 @@ fn distance_controls_follow_display_units_and_keep_metre_command_values() {
     assert!(text.iter().any(|s| s == "3281 ft") && text.iter().any(|s| s == "62.1 mi"), "{text:?}");
 
     h.state_mut().run("ui.pane.labeling", json!({})).unwrap();
-    h.state_mut().run("ui.tab", json!({"tab": "Style"})).unwrap();
+    h.state_mut().run("ui.tab", json!({"tab": "Labeling"})).unwrap();
     for _ in 0..3 {
         h.step();
     }

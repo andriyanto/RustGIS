@@ -212,6 +212,16 @@ pub trait FeatureSource: Send + Sync {
         Err(DataError::Format("this provider does not support chunk traversal".into()))
     }
     fn info(&self) -> &SourceInfo;
+    /// Whether features were left out of every read because the coordinate system the source
+    /// declares can't place them, so that defining its projection again can't bring them back.
+    fn lost_to_crs(&self) -> bool {
+        false
+    }
+    /// How many features the source left out when it was opened (and from every read), for a
+    /// whole read's `ReadReport::skipped` to count with what reads skip.
+    fn skipped_at_open(&self) -> usize {
+        0
+    }
     /// Reads the features a request asks for. A source read by its web address fails with
     /// [`remote::NEED`] until the bytes the read needs are fetched: run it with
     /// [`remote::drive`] (see [`FeatureSource::remote`]).
@@ -321,9 +331,11 @@ pub fn open_shared(file_name: &str, bytes: std::sync::Arc<Vec<u8>>, layer: Optio
     }
 }
 
-/// Whether a web address names a file read in place by range: a FlatGeobuf or a GeoParquet.
+/// Whether a web address names a file read in place by range: a FlatGeobuf or a GeoParquet. An
+/// address read through a saved S3 connection ([`crate::s3_address`]) is judged by the address it
+/// wraps.
 pub fn is_remote_name(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
+    let lower = crate::s3_address::inner(url).to_ascii_lowercase();
     let path = lower.split(['?', '#']).next().unwrap_or(&lower);
     // `s3://` too: the app's fetchers check it and read it from its bucket's web address (signed
     // only for a connection that serves the bucket, see rustgis_tiles::s3).
@@ -449,6 +461,14 @@ impl FeatureSource for Fetching {
         self.0.info()
     }
 
+    fn lost_to_crs(&self) -> bool {
+        self.0.lost_to_crs()
+    }
+
+    fn skipped_at_open(&self) -> usize {
+        self.0.skipped_at_open()
+    }
+
     fn read(&self, req: &Request) -> Result<Batch> {
         read_blocking(&self.0, req)
     }
@@ -471,9 +491,12 @@ pub fn materialize(src: &dyn FeatureSource) -> Result<(Dataset, ReadReport)> {
     ds.crs = info.coordinate_system();
     // A streamed Shapefile skips unconvertible shapes rather than retaining empty geometry.
     // Once materialized, it must still direct CRS repairs back to the original file.
-    ds.crs_incomplete = info.format == "Shapefile" && batch.skipped > 0;
+    ds.crs_incomplete = (info.format == "Shapefile" && batch.skipped > 0) || src.lost_to_crs();
     ds.features = batch.features.into();
-    let mut report = ReadReport { skipped: batch.skipped, messages: info.notes.iter().map(|n| format!("{}: {n}", info.name)).collect() };
+    let mut report = ReadReport {
+        skipped: batch.skipped + src.skipped_at_open(),
+        messages: info.notes.iter().map(|n| format!("{}: {n}", info.name)).collect(),
+    };
     if !batch.complete {
         report.messages.push(format!("{}: read a sample of {} of {} features", info.name, ds.features.len(), batch.matched));
     }
@@ -537,6 +560,21 @@ impl Reproject {
             },
         };
         Reproject { crs: if t.is_some() { crs } else { Crs::LonLat }, t }
+    }
+
+    /// From a coordinate system already known to convert (`None` for longitude/latitude).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn known(found: Option<(Crs, Transformer)>) -> Reproject {
+        match found {
+            Some((crs, t)) => Reproject { crs, t: Some(t) },
+            None => Reproject { crs: Crs::LonLat, t: None },
+        }
+    }
+
+    /// What converts to longitude/latitude (`None` when coordinates are taken as they are).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn transformer(&self) -> Option<&Transformer> {
+        self.t.as_ref()
     }
 
     /// Whether coordinates are taken as they are.

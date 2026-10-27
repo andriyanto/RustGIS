@@ -41,6 +41,9 @@ pub fn commands() -> Vec<C> {
         C::new("raster.georeference", "Georeference", "Analyze › Alignment", georeference).params(
             r#"{"layer": raster, "points"?: [[column, row, lon, lat], …] (two or more; with "transform": [column, row, x, y, on?]), "extent"?: [minLon, minLat, maxLon, maxLat], "transform"?: "similarity"|"affine"|"projective"|"polynomial2"|"polynomial3"|"spline" (fits the points and warps the raster onto a north-up grid covering the warped image; without it the points and extent only shift and scale the grid), "pointsCrs"?: EPSG code or "EPSG:n" of the points' x and y (default 4326), "crs"?: the output's (default pointsCrs), "resampling"?: "nearest"|"bilinear"|"cubic" (default bilinear), "cellSize"?: output units (default about the source pixel's size on the ground), "name"?: new layer for the result (default replaces the layer's raster), "path"?: "*.tif" (also writes the warp as a cloud-optimised GeoTIFF)}"#,
         ),
+        C::new("raster.project", "Project Raster", "Analyze › Alignment", project_raster).params(
+            r#"{"layer": raster, "crs"?: EPSG code or "EPSG:n" of the output (default the layer's), "cellSize"?: number or [x, y] in the output's units (default about the layer's pixel there), "origin"?: [x, y] a cell corner falls on (default [0, 0], so grids of the same cellSize line up), "extent"?: polygon layer (its selected or all features' bounds) | [west, south, east, north] in degrees | "view" (default the layer's footprint), "grid"?: raster layer whose coordinate system, cells and extent are taken exactly (instead of crs, cellSize, origin and extent), "resampling"?: "nearest" (default) | "bilinear" | "cubic" | "average" (the mean of the pixels whose centres fall in a cell) | "mode" (their most frequent value, the least of those tied), "name"?: new layer (default "<layer> projected"), "path"?: GeoTIFF to write it to}"#,
+        ),
         // A fit is a measurement of the points, not a project change: no undo step.
         C::new("raster.gcpFit", "Control Point Fit", "Analyze › Alignment", gcp_fit).view().params(
             r#"{"points": [[column, row, x, y, on?], …] (on: 1/0 or true/false, default on), "transform"?: "similarity"|"affine"|"projective"|"polynomial2"|"polynomial3"|"spline" (default: similarity under 3 points, else affine), "compare"?: bool (fit every transform and recommend one; transform and leaveOneOut are then ignored), "leaveOneOut"?: bool (default true)}"#,
@@ -70,7 +73,7 @@ pub fn commands() -> Vec<C> {
             r#"{"layer": raster, "index": "ndvi"|"ndwi"|"savi"|"nbr"|"ndbi"|"evi", "red"?, "green"?, "blue"?, "nir"?, "swir"?: band numbers, "name"?: output}"#,
         ),
         C::new("raster.process", "Process", "Analyze › Imagery Tools", process)
-            .params(r#"{"layer": raster, "operation": "clip"|"resample", "extent"?: [minLon, minLat, maxLon, maxLat] (clip; the view when omitted), "polygon"?: polygon layer (clip to its selected or all polygons; cells outside become no-data), "factor"?: n (resample: n×n pixels become one), "name"?: output}"#),
+            .params(r#"{"layer": raster, "operation": "clip"|"resample", "extent"?: [minLon, minLat, maxLon, maxLat] (clip; the view when omitted), "polygon"?: polygon layer (clip to its selected or all polygons; cells outside become no-data), "selectedOnly"?: bool (clip to selected polygons when true, all when false), "factor"?: n (resample: n×n pixels become one), "name"?: output}"#),
         C::new("raster.mosaic", "Mosaic Rasters", "Analyze › Imagery Tools", raster_mosaic).params(
             r#"{"inputs": [raster layer or file path, …] (two or more, in one coordinate system and cell size; where they overlap the first wins), "name"?: output, "path"?: GeoTIFF to write the mosaic to}"#,
         ),
@@ -321,6 +324,130 @@ fn warp_to_fit(s: &mut Session, p: &Value, layer: &str, r: &Raster) -> CmdResult
     Ok(info)
 }
 
+/// What an `extent` that isn't one is told.
+const EXTENT: &str = "extent is a polygon layer's name, [west, south, east, north] in degrees, or \"view\"";
+
+/// `raster.project`: the layer on a grid of another coordinate system, cell size, origin and
+/// extent, or on another raster's grid, each cell sampled at its centre or taken from every
+/// pixel whose centre falls in it (see `rustgis_analysis::warp::project`). A new layer.
+fn project_raster(s: &mut Session, p: &Value) -> CmdResult {
+    let r = raster(s, p)?;
+    r.require_coordinates()?;
+    let method = match p.get("resampling") {
+        None | Some(Value::Null) => warp::Method::Sample(warp::Resampling::Nearest),
+        Some(v) => v.as_str().and_then(warp::Method::parse).ok_or("resampling is nearest, bilinear, cubic, average or mode")?,
+    };
+    // A grid named as anything but a raster layer's name is refused rather than ignored.
+    let template = match p.get("grid") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.as_str().ok_or("grid is a raster layer's name")?),
+    };
+    let grid = match template {
+        Some(template) => {
+            if ["crs", "cellSize", "origin", "extent"].iter().any(|k| p.get(*k).is_some_and(|v| !v.is_null())) {
+                return Err(
+                    "grid takes that raster's coordinate system, cells and extent: leave out crs, cellSize, origin and extent".into()
+                );
+            }
+            let t = raster_named(s, template)?;
+            t.require_coordinates()?;
+            warp::Grid::of(&t)
+        }
+        None => {
+            let crs = crs_param(p, "crs")?.unwrap_or(r.crs);
+            let (footprint, pixel) = warp::footprint_in(&r, crs)?;
+            let positive = |v: &Value| v.as_f64().filter(|c| c.is_finite() && *c > 0.0);
+            let bad_cell = "cellSize is a positive number, or [x, y], in the output's units";
+            let cell = match p.get("cellSize") {
+                None | Some(Value::Null) => (pixel, pixel),
+                Some(Value::Array(a)) => match a.as_slice() {
+                    [x, y] => (positive(x).ok_or(bad_cell)?, positive(y).ok_or(bad_cell)?),
+                    _ => return Err(bad_cell.into()),
+                },
+                Some(v) => positive(v).map(|c| (c, c)).ok_or(bad_cell)?,
+            };
+            let origin = match p.get("origin") {
+                None | Some(Value::Null) => (0.0, 0.0),
+                Some(v) => {
+                    // Every entry a number: one that isn't refuses the origin rather than drop out.
+                    let n: Option<Vec<f64>> = v.as_array().map(|a| a.iter().map(Value::as_f64).collect()).unwrap_or_default();
+                    match n.as_deref().unwrap_or_default() {
+                        [x, y] if x.is_finite() && y.is_finite() => (*x, *y),
+                        _ => return Err("origin is [x, y] in the output's units".into()),
+                    }
+                }
+            };
+            let bounds = match p.get("extent") {
+                None | Some(Value::Null) => footprint,
+                Some(Value::String(l)) if l != "view" => {
+                    let layer = s.map().layer_by_name(l).filter(|l| l.raster.is_none()).ok_or_else(|| format!("no vector layer '{l}'"))?;
+                    let rows: Vec<usize> =
+                        if layer.selection.is_empty() { (0..layer.dataset.features.len()).collect() } else { layer.selection.clone() };
+                    let e = rows
+                        .iter()
+                        .filter_map(|row| layer.dataset.features.get(*row).and_then(|f| f.geometry.as_ref()))
+                        .fold(Extent::EMPTY, |e, g| e.union(&g.extent()));
+                    if e.is_empty() {
+                        return Err(format!("{l} has no features to take an extent from"));
+                    }
+                    warp::bounds_in([e.min_x, e.min_y, e.max_x, e.max_y], crs)?
+                }
+                Some(v @ (Value::Array(_) | Value::String(_))) => {
+                    let area = super::catalogs::area(s, &json!({"bbox": v})).map_err(|e| e.replacen("bbox", "extent", 1))?;
+                    if area[0] > area[2] {
+                        return Err("an extent across the antimeridian: give it one side at a time".into());
+                    }
+                    warp::bounds_in(area, crs)?
+                }
+                // A number, a flag or an object isn't an extent: refused, not read as the view.
+                Some(_) => return Err(EXTENT.into()),
+            };
+            warp::Grid::snapped(crs, bounds, cell, origin)?
+        }
+    };
+    let path = match p.get("path") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.as_str().filter(|t| is_tif(t)).ok_or("path is a *.tif or *.tiff file")?.to_string()),
+    };
+    let out_name = name(p, format!("{} projected", r.name));
+    let out = warp::project(&r, &grid, method, out_name.clone())?;
+    let mut info = json!({
+        "name": out_name, "crs": grid.crs.label(), "resampling": method.used_on(&r).id(), "width": out.width, "height": out.height, "bands": out.band_count(),
+        "cellSize": [grid.cell_x, grid.cell_y], "corner": [grid.min_x, grid.max_y],
+    });
+    if let Some((fw, fh)) = r.overview {
+        let note =
+            format!("{}: projected at reduced resolution, from its {} × {} overview of the {fw} × {fh} raster", r.name, r.width, r.height);
+        s.notify(note, false);
+        info["projectedFromOverview"] = json!({"width": r.width, "height": r.height, "of": [fw, fh]});
+    }
+    let e = out.extent();
+    info["extent"] = json!([e.min_x, e.min_y, e.max_x, e.max_y]);
+    // A file written is the layer's source; without one the pixels are kept in the project.
+    let rl = match &path {
+        Some(path) => {
+            let cog =
+                rustgis_data::raster::cogwrite::write_file(&out, 0, std::path::Path::new(path)).map_err(|e| format!("{path}: {e}"))?;
+            info["path"] = json!(path);
+            info["cog"] = json!({"overviews": cog.levels.len().saturating_sub(1), "bigTiff": cog.big, "bytes": cog.bytes});
+            RasterLayer::from_path(out, path.clone())
+        }
+        None => layer_of(out)?,
+    };
+    let v = super::raster::add_raster(s, &out_name, rl)?;
+    if let (Some(o), Some(i)) = (info.as_object_mut(), v.as_object()) {
+        for (k, val) in i {
+            o.entry(k.clone()).or_insert_with(|| val.clone());
+        }
+    }
+    // The name the layer got (another may hold the one asked for: "… projected (2)").
+    let id = v.get("layer").and_then(Value::as_u64).and_then(|id| u32::try_from(id).ok());
+    if let Some(name) = id.and_then(|id| s.map().layer(id)).map(|l| l.name.clone()) {
+        info["name"] = json!(name);
+    }
+    Ok(info)
+}
+
 fn is_tif(path: &str) -> bool {
     std::path::Path::new(path)
         .extension()
@@ -519,6 +646,29 @@ fn index(s: &mut Session, p: &Value) -> CmdResult {
     add(s, rasterops::derive(&r, &name(p, format!("{}_{idx}", r.name)), vec![out])?, false)
 }
 
+/// Processes a raster via clipping or resampling.
+///
+/// ### Polygon Clipping Semantics (`operation: "clip"`, `"polygon": "<layer>"`)
+/// - **Selection Propagation (`selectedOnly`)**:
+///   - When `Some(true)`: Clips strictly using features currently selected in the polygon layer.
+///     If the selection is empty, returns an actionable error (`"<layer>: no features are selected"`).
+///   - When `Some(false)`: Clips using all features in the polygon layer, ignoring any selection.
+///   - When omitted (`None` or `null`): For backward compatibility, clips to the selection if non-empty,
+///     otherwise clips using all features.
+///   - Non-boolean values are rejected with an explicit validation error.
+/// - **Per-Zone and Overlap Semantics**:
+///   - Every polygon geometry (including multipart geometries) is already WGS 84 lon/lat.
+///   - Polygon exterior rings and interior holes are strictly validated; invalid or failed holes reject
+///     the containing polygon rather than distorting the boundary.
+///   - Polygons are combined into a composite scanline mask over the raster. Holes cut out cells using the
+///     even-odd rule within each polygon. Where multiple polygons overlap, their coverage is combined
+///     (union: any cell falling inside at least one polygon is retained).
+///   - The raster is cropped to the tight bounding box of valid selected polygons, and cells outside the
+///     polygons receive NoData.
+/// - **Partial Failure Reporting**:
+///   - Features with invalid geometry are skipped and reported in the result messages.
+///   - Polygon parts that cannot be projected onto the raster grid are reported separately.
+///   - If all features fail, the operation fails and reports the specific failure cause of the first feature.
 fn process(s: &mut Session, p: &Value) -> CmdResult {
     let r = raster(s, p)?;
     match ps(p, "operation").ok_or("operation is required")? {
@@ -531,20 +681,73 @@ fn process(s: &mut Session, p: &Value) -> CmdResult {
                 .layer_by_name(pl)
                 .filter(|l| l.geometry_type() == GeometryType::Polygon)
                 .ok_or_else(|| format!("no polygon layer '{pl}'"))?;
-            // The selected polygons, or all of them.
-            let rows: Vec<usize> = if l.selection.is_empty() { (0..l.dataset.features.len()).collect() } else { l.selection.clone() };
-            let polygons: Vec<Vec<Vec<Coord>>> = rows
-                .iter()
-                .filter_map(|row| match l.dataset.features.get(*row).and_then(|f| f.geometry.as_ref()) {
-                    Some(Geometry::Polygon(polys)) => Some(polys.iter().cloned()),
-                    _ => None,
-                })
-                .flatten()
-                .collect();
-            let (cols, rows, mask) =
-                rasterops::polygon_mask(&r, &polygons).ok_or_else(|| format!("no cell of {} falls inside {pl}", r.name))?;
+            let rows: Vec<usize> = match p.get("selectedOnly") {
+                Some(Value::Bool(true)) => {
+                    if l.selection.is_empty() {
+                        return Err(format!("{pl}: no features are selected"));
+                    }
+                    l.selection.clone()
+                }
+                Some(Value::Bool(false)) => (0..l.dataset.features.len()).collect(),
+                None | Some(Value::Null) => {
+                    // Backward-compatible default: if features are selected, clip to selection; otherwise clip all.
+                    if l.selection.is_empty() { (0..l.dataset.features.len()).collect() } else { l.selection.clone() }
+                }
+                Some(_) => {
+                    return Err("parameter 'selectedOnly' must be a boolean (true or false)".into());
+                }
+            };
+            if rows.is_empty() {
+                return Err(format!("{pl}: has no features to clip by"));
+            }
+            let mut polygons: Vec<Vec<Vec<Coord>>> = Vec::new();
+            let mut failed_features = Vec::new();
+            for &row in &rows {
+                let Some(f) = l.dataset.features.get(row) else { continue };
+                match &f.geometry {
+                    Some(Geometry::Polygon(polys)) => match rasterops::transform_feature_polygons_to_lonlat(polys, None) {
+                        Ok(transformed) => {
+                            polygons.extend(transformed);
+                        }
+                        Err(e) => {
+                            failed_features.push((f.id, e));
+                        }
+                    },
+                    _ => {
+                        failed_features
+                            .push((f.id, rasterops::PolygonTransformError::InvalidExterior("missing or non-polygon geometry".into())));
+                    }
+                }
+            }
+            if polygons.is_empty() {
+                if let Some((first_id, first_err)) = failed_features.first() {
+                    return Err(format!("{pl}: has no valid polygon geometries (feature {first_id}: {first_err})"));
+                }
+                return Err(format!("{pl}: has no valid polygon geometries"));
+            }
+            if !failed_features.is_empty() {
+                log::warn!("{pl}: {} feature(s) failed polygon validation during clipping", failed_features.len());
+            }
+            let mut failed_parts = Vec::new();
+            let (cols, rows, mask) = rasterops::polygon_mask_with_failures(&r, &polygons, &mut failed_parts).ok_or_else(|| {
+                format!("no cell of {} falls inside {pl} ({} polygon part(s) failed raster projection)", r.name, failed_parts.len())
+            })?;
             let out = clip_window(&r, cols, rows, Some(&mask), name(p, format!("{}_clip", r.name)))?;
-            add(s, out, false)
+            let mut result = add(s, out, false)?;
+            let mut messages = Vec::new();
+            if !failed_features.is_empty() {
+                messages.push(format!("{pl}: skipped {} feature(s) with invalid polygon geometry", failed_features.len()));
+            }
+            if !failed_parts.is_empty() {
+                messages.push(format!(
+                    "{pl}: skipped {} polygon part(s) that could not be projected onto the raster grid; valid parts were retained",
+                    failed_parts.len()
+                ));
+            }
+            if !messages.is_empty() {
+                result["messages"] = json!(messages);
+            }
+            Ok(result)
         }
         "clip" => {
             // Before the extent is placed on the raster's coordinates.

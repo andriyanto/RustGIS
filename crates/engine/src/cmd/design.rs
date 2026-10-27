@@ -12,6 +12,9 @@ use serde_json::{Value as Json, json};
 use super::{b, f, need_feature_layer, ps};
 use crate::{CmdResult, CommandSpec as C, Session};
 
+mod shared_vertex;
+mod snap_vertex;
+
 /// One edited feature: its state before (none for an insert) and its row after (none for a
 /// delete).
 pub(crate) struct Change {
@@ -206,6 +209,8 @@ pub(crate) fn apply(s: &mut Session, id: u32, changes: Vec<Change>) -> Result<()
     Ok(())
 }
 
+/// Registers data-design and editing commands, including opt-in exact-coordinate polygon moves.
+/// Feature edits share `apply` for rules, archives and counts inside the session transaction.
 pub fn commands() -> Vec<C> {
     vec![
         // Data design.
@@ -273,7 +278,7 @@ pub fn commands() -> Vec<C> {
                 .iter()
                 .filter_map(|(id, c)| s.map().layer(*id).map(|l| json!({"layer": l.name, "added": c.added, "modified": c.modified, "deleted": c.deleted})))
                 .collect();
-            Ok(json!({"unsaved": s.dirty, "layers": rows}))
+            Ok(json!({"unsaved": s.dirty(), "layers": rows}))
         })
         .view(),
         C::new("edit.template", "Manage Templates", "Edit › Manage Edits", template).when(need_feature_layer).params(
@@ -359,6 +364,9 @@ pub fn commands() -> Vec<C> {
             r#"{"layer"?, "row": number, "action": "move"|"insert"|"delete", "part"?: number, "ring"?: number, "index": number (insert: the vertex the new one follows), "lon"?, "lat"?}"#,
         ),
         C::new("edit.merge", "Merge", "Edit › Features › Modify", merge).when(need_editable_selection),
+        C::new("edit.moveSharedVertex", "Move Shared Vertex", "Edit › Features › Modify", shared_vertex::run).when(need_editable).params(
+            r#"{"layer"?, "row": number, "part"?: number, "ring"?: number, "index": number, "lon": degrees, "lat": degrees}"#,
+        ),
         C::new("edit.explode", "Explode", "Edit › Features › Modify", explode).when(need_editable_selection),
         C::new("edit.split", "Split", "Edit › Features › Modify", split).when(need_editable_selection).params(r#"{"lon", "lat"}"#),
         C::new("edit.traverse", "Traverse", "Edit › Features › Modify", traverse).when(need_editable).params(
@@ -1063,13 +1071,41 @@ fn snap(s: &mut Session, p: &Json) -> CmdResult {
 
 /// Where a point at `c` (longitude/latitude) snaps to, and to what, if anywhere. Read-only, for
 /// drawing the snap marker without running a command (projected shapes are cached on the way).
+///
+/// Point features and MultiPoint members are vertex targets only, never edges or line ends.
+/// Vertices and line ends take priority over edges. Equal distances keep the original layer,
+/// row and member order.
 pub fn snap_at(s: &mut Session, c: Coord) -> Option<(Coord, &'static str)> {
     snap_except(s, c, None)
 }
 
 /// [`snap_at`], leaving out one feature (layer id, row): a vertex being dragged doesn't snap to
 /// the shape it is changing.
+/// Use [`snap_vertex_except`] when the source node is known and its other parts should remain targets.
 pub fn snap_except(s: &mut Session, c: Coord, skip: Option<(u32, usize)>) -> Option<(Coord, &'static str)> {
+    snap_excluding(s, c, skip, None)
+}
+
+/// Snaps while moving one source vertex, excluding that node and its incident edges instead of
+/// its whole feature. Other line/polygon parts remain targets. Polygon closing copies alias the
+/// first node; a closed line's two endpoints remain distinct, as in `Geometry::move_vertex`.
+/// Invalid addresses are ignored. Point/multipoint targets retain the existing snapping policy.
+/// Moving a point or multipoint still excludes its whole feature, as with [`snap_except`].
+pub fn snap_vertex_except(s: &mut Session, c: Coord, skip: Option<(u32, usize, rustgis_data::VertexId)>) -> Option<(Coord, &'static str)> {
+    let skip = skip.filter(|(id, row, v)| {
+        s.map().layer(*id).and_then(|l| l.dataset.features.get(*row)).and_then(|f| f.geometry.as_ref()).and_then(|g| g.vertex(*v)).is_some()
+    });
+    snap_excluding(s, c, None, skip)
+}
+
+/// Shares the original layer/row ordering, scale rules and distance selection between legacy
+/// feature exclusion and source-node exclusion. Only the addressed row needs source identities.
+fn snap_excluding(
+    s: &mut Session,
+    c: Coord,
+    skip: Option<(u32, usize)>,
+    vertex: Option<(u32, usize, rustgis_data::VertexId)>,
+) -> Option<(Coord, &'static str)> {
     let sn = s.map().editing.snapping;
     if !sn.enabled {
         return None;
@@ -1092,9 +1128,16 @@ pub fn snap_except(s: &mut Session, c: Coord, skip: Option<(u32, usize)>) -> Opt
             continue;
         }
         let id = l.id;
-        for (row, g) in l.projected_in(&flat, &key).iter().enumerate() {
+        l.projected_in(&flat, &key);
+        for (row, g) in l.projected_cache().iter().enumerate() {
             let Some(g) = g.as_ref().filter(|_| skip != Some((id, row))) else { continue };
             if !g.extent().padded(0.0, tol).contains(m) {
+                continue;
+            }
+            if let Some((_, _, v)) = vertex.filter(|(layer, source_row, _)| *layer == id && *source_row == row) {
+                if let Some(source) = l.dataset.features.get(row).and_then(|f| f.geometry.as_ref()) {
+                    snap_vertex::consider(source, v, &flat, sn, m, &mut consider);
+                }
                 continue;
             }
             let paths: Vec<&Vec<Coord>> = match g {
@@ -1102,8 +1145,15 @@ pub fn snap_except(s: &mut Session, c: Coord, skip: Option<(u32, usize)>) -> Opt
                 Geometry::Polygon(polys) => polys.iter().flatten().collect(),
                 _ => Vec::new(),
             };
-            if let Geometry::Point(pt) = g {
-                consider((pt.x - m.x).powi(2) + (pt.y - m.y).powi(2), *pt, "vertex");
+            if sn.vertex {
+                let points: &[Coord] = match g {
+                    Geometry::Point(pt) => std::slice::from_ref(pt),
+                    Geometry::MultiPoint(points) => points,
+                    _ => &[],
+                };
+                for pt in points {
+                    consider((pt.x - m.x).powi(2) + (pt.y - m.y).powi(2), *pt, "vertex");
+                }
             }
             for path in paths {
                 if sn.end && matches!(g, Geometry::Line(_)) {

@@ -35,7 +35,7 @@ sample again. **Settings › Start-up › Start With** chooses what opens next t
    adds a web tile layer, and its **Celestial Bodies** take the map to the Moon or Mars.
    Right-drag (or ++ctrl++-drag) turns and tilts the map; click the north arrow to reset it.
 6. **Share.** **Publish › Export Map** saves a PNG with labels and a scale bar. **Home › New
-   Layout** offers page sizes and **Publication Layout** presets for sheets and figures.
+   Layout** offers page sizes and **Publication Layout** presets for sheets (in one of six styles) and figures.
    Choose a page size for a page with a map frame, legend, north arrow and scale bar.
    **Project › Save As** writes a `.rgis` project.
 
@@ -45,18 +45,16 @@ sample again. **Settings › Start-up › Start With** chooses what opens next t
 
 ## Your own data
 
-**Home › Add Data › Data…** (or drop files on the window) opens GeoJSON, GeoPackage,
-GeoParquet, FlatGeobuf, KML/KMZ, GPX, GeoTIFF, ASCII grids and more. Shapefiles work in the
-browser too: pick or drop the `.shp` and `.dbf` together, with `.shx` and `.prj` if available,
-or use a ZIP containing them. Use **Add Data › Delimited Text…** to choose a CSV's coordinate
-columns or WKT geometry and coordinate system.
+**Home › Add › Add Data** opens data files directly; its arrow offers other ways to add data,
+including delimited text, URLs and services. Shapefiles work in the browser too: pick or drop
+the `.shp` and `.dbf` together, with `.shx` and `.prj` if available, or use a ZIP containing
+them. **Home › Add › Data Sources** opens saved data connections and recent sources.
 
-**Project › New › Map** starts a blank project. **Home › Web Data** finds public satellite
-imagery, Overture Maps, OpenStreetMap, NASA Earthdata, open-data portals and more
-(see [Web Data](user-guide/web-data.md)). **Home › Add Data › Connections…** opens saved data
-connections; desktop database connections include PostGIS, MySQL/MariaDB and SQL Server/Azure SQL.
-See [Data](user-guide/data.md) and [Supported Data Formats](user-guide/data-formats.md) for
-format and platform limits.
+**Project › New › Map** starts a blank project. **Home › Add › Web Data** finds public satellite imagery,
+Overture Maps, OpenStreetMap, NASA Earthdata, open-data portals and more
+(see [Web Data](user-guide/web-data.md)). Desktop database connections include PostGIS,
+MySQL/MariaDB and SQL Server/Azure SQL. See [Data](user-guide/data.md) and
+[Supported Data Formats](user-guide/data-formats.md) for format and platform limits.
 
 ## Ask the AI Assistant
 

@@ -4,7 +4,7 @@ use std::path::Path;
 
 use rustgis_data::{GeometryType, photo};
 use rustgis_map::symbology::{ClassRef, ClassStyle, LABEL_SIZE, MAX_STROKES};
-use rustgis_map::{ClassMethod, LineCap, LineJoin, LineStroke, Marker, Ramp, Renderer, Rgba};
+use rustgis_map::{ClassMethod, Glyph, LineCap, LineJoin, LineMark, LineMarkers, LineStroke, Marker, Placements, Ramp, Renderer, Rgba};
 use serde_json::{Value, json};
 
 use super::{b, f, need_feature_layer, need_layer, ps, uint};
@@ -21,27 +21,27 @@ pub fn commands() -> Vec<C> {
         C::new("info.fileLayers", "List Layers in File", "Home › Add › Add Data", file_layers)
             .view()
             .params(r#"{"path": string}"#),
-        C::new("info.fileColumns", "List Columns in File", "Home › Add › Delimited Text", file_columns).view().params(
+        C::new("info.fileColumns", "List Columns in File", "Home › Add › Add Data › Delimited Text", file_columns).view().params(
             r#"{"path": "a delimited text file (CSV, TSV, TXT) or a spreadsheet", "delimiter"?: ","|";"|"\\t"|"|", "layer"?: "a spreadsheet's sheet (the first by default)"}"#,
         ),
         C::new("layer.addSql", "Add Data From SQL", "Home › Add", add_sql).params(
             r#"{"sql": "one DuckDB SELECT; DuckDB Spatial's ST_ functions, read_parquet('…'), web addresses", "name"?: string, "database"?: "a .duckdb file or a PostgreSQL connection (postgres:host=… dbname=…) whose tables the query names", "password"?: "the connection's, kept for this session only", "crs"?: "EPSG:… of a geometry that doesn't say", "stream"?: bool, "ran"?: "a result the app ran (the SQL pane)"}"#,
         ),
-        C::new("layer.addDatabase", "Add Data From Database", "Home › Add", add_database).params(
+        C::new("layer.addDatabase", "Add Data From Database", "Home › Add › Add Data", add_database).params(
             r#"{"database": "postgres:host=… dbname=… user=… (or a postgresql:// address; PostGIS tables are read live), a mysql://user@host:port/database address (MySQL or MariaDB, read live; mariadb:// too), an mssql://user@host:1433/database address (SQL Server or Azure SQL, read live; ?encrypt=strict|false, ?trust-server-certificate=true for a self-signed certificate, ?instance=NAME; on Windows DOMAIN\\user or no user signs in with Windows), or a .duckdb file", "password"?: "kept for this session only, never saved", "layer"?: "a table, as table or schema.table (table:column for one of several geometry columns; default: every table with a geometry column)", "crs"?: "EPSG:… of a geometry that doesn't say", "name"?: string, "stream"?: bool}"#,
         ),
-        C::new("info.databaseTables", "List Database Tables", "Home › Add › Add Data From Database", database_tables)
+        C::new("info.databaseTables", "List Database Tables", "Home › Add › Add Data › Database", database_tables)
             .view()
             .params(r#"{"database": "as layer.addDatabase", "password"?: string}"#),
         C::new("layer.defineProjection", "Define Projection", "Layers", define_projection)
             .when(need_feature_layer)
             .params(r#"{"layer"?: name|id, "crs": "EPSG:… or WKT; reinterpret native coordinates, without rewriting the source file"}"#),
         C::new("layer.loadAll", "Load All Features", "Layers", load_all).when(need_streamed).params(r#"{"layer"?: name|id}"#),
-        C::new("layer.addUrl", "Add Data From URL", "Home › Add", add_url).params(
+        C::new("layer.addUrl", "Add Data From URL", "Home › Add › Add Data", add_url).params(
             r#"{"url": "https://…/data.geojson|.csv|.parquet|.fgb|.gpkg|.zip|.kml|.kmz|.gpx|.tif|.jp2 (JPEG 2000: desktop, through GDAL) (the format from the address, else the contents) | a .pmtiles archive", "name"?: text, "layer"?: "one layer of a zip, KML or GPX", "zoom"?: "bool: true zooms to what was added; false keeps the view of a GeoParquet or FlatGeobuf read in place (zoomed to only when the map was empty)", "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData), "whole"?: "bool: download a cloud-optimised GeoTIFF whole (as a raster layer) instead of reading it in place", "start"?, "end"?, "unit"?, "interval"?, "dates"?: "a GeoTIFF address with date placeholders ({date:YYYY}, {YYYY}{MM}{DD}), one file per date: the dates it spans and steps through (as time.set), turning the time slider on"}"#,
         ),
         C::new("layer.addDownload", "Add Downloaded Data", "Home › Add", add_download)
-            .params(r#"{"id": a download the app finished (Add Data › From URL), "url": its address, "name"?: text, "layer"?: text, "zoom"?: bool, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData), "service"?: bool (a service's features: their axes and paging are checked), "coverage"?: bool (a WCS coverage: a GeoTIFF, else the service's error)}"#),
+            .params(r#"{"id": a download the app finished (Home › Add › Add Data › From URL), "url": its address, "name"?: text, "layer"?: text, "zoom"?: bool, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData), "service"?: bool (a service's features: their axes and paging are checked), "coverage"?: bool (a WCS coverage: a GeoTIFF, else the service's error)}"#),
         C::new("layer.addEncodedPolyline", "Add Encoded Polyline", "Home › Add", add_encoded_polyline).params(
             r#"{"polyline": "encoded polyline text" | [texts] (one line each), "precision"?: 5 (Google) | 6 (OSRM, Valhalla), "name"?: text}"#,
         ),
@@ -109,7 +109,7 @@ pub fn commands() -> Vec<C> {
         .when(need_layer),
         C::new("layer.symbology", "Symbology", "Style › Drawing", symbology)
             .when(need_feature_layer)
-            .params(r#"{"layer"?, "type": "single"|"unique"|"graduated"|"proportional", "field"?, "classes"?: 1..12, "method"?: "naturalBreaks"|"equalInterval"|"quantile", "ramp"?: string}"#),
+            .params(r#"{"layer"?, "type": "single"|"unique"|"graduated"|"proportional", "field"?, "classes"?: 1..12, "method"?: "naturalBreaks"|"equalInterval"|"quantile"|"geometricInterval"|"standardDeviation"|"arithmeticProgression"|"headTailBreaks"|"manual", "breaks"?: [numbers] (manual: the classes' upper bounds, closed by the field's largest value), "ramp"?: string}"#),
         C::new("layer.ramp", "Color Scheme", "Style › Drawing", |s, p| {
             let r = s.ramp(s_req(p, "ramp")?)?;
             with(s, p, |l| match &mut l.raster {
@@ -175,10 +175,38 @@ pub fn commands() -> Vec<C> {
         .when(need_feature_layer)
         .params(r##"{"layer"?, "color"?: "#RRGGBB"|"#RRGGBBAA", "width"?: number}"##),
         C::new("layer.lineStrokes", "Line Strokes", "Style › Drawing", line_strokes)
-            .when(need_lines)
+            .when(need_lines_or_points)
             .params(
-                r##"{"layer"?, "strokes": [{"color"?: "#RRGGBB"|"#RRGGBBAA"|null (null: the renderer's line colour), "width"?: points|null (null: the renderer's width), "offset"?: points (positive: right of the line's direction, negative: left), "cap"?: "round"|"flat"|"square", "join"?: "round"|"miter"|"bevel", "level"?: 0..255|null (with layer.strokeLevels: the level it draws at; null: its place in the stack)}] (drawn bottom first; [] goes back to the single stroke, or for a class to the layer's strokes), "value"?: text|number (a Unique Values class's own strokes), "index"?: number (a Graduated Colors class's, 0 = the lowest), "other"?: true (Unique Values' <all other values>)}"##,
+                r##"{"layer"?, "strokes": [{"color"?: "#RRGGBB"|"#RRGGBBAA"|null (null: the renderer's line colour), "width"?: points|null (null: the renderer's width), "offset"?: points (positive: right of the line's direction, negative: left), "cap"?: "round"|"flat"|"square", "join"?: "round"|"miter"|"bevel", "level"?: 0..255|null (with layer.strokeLevels: the level it draws at; null: its place in the stack), "dash"?: [points, …]|null (dash, gap, … in turn, at most 8; null: solid), "markers"?: {"mark"?: "circle"|"square"|"triangle"|"diamond"|"star"|"character"|"hash" (a mark across the line), "char"?: text (a character of a font as the marker instead of a shape), "font"?: text (the installed family it is drawn from; none: the label font), "size"?: points (a marker's size, a hash mark's length; default 4), "at"?: "interval"|"vertices"|"innerVertices"|"first"|"last"|"middle"|"segmentMiddles" or a list of them (default "interval"), "interval"?: points (default 12), "offsetAlong"?: points (from the start, back from the end, on from the middle), "rotate"?: bool (turned with the line; default true), "averageAngle"?: points (the stretch of line a marker at an interval turns with; 0: its segment), "angle"?: degrees clockwise (a hash mark at 0 crosses the line square), "outline"?: "#RRGGBB"|"#RRGGBBAA" (the markers' outline, as wide as the stroke)}|null (markers or hash marks along the line in the stroke's colour, instead of a line; cap, join and dash don't apply)}] (drawn bottom first; [] goes back to the single stroke, or for a class to the layer's strokes; on a point layer they are its marks: each stroke's markers drawn at the point in place of the symbol's, "offsetAlong" shifting a mark right and "offset" down, both turned with its "angle", and "rotate" turning it by layer.markerRotation's field), "value"?: text|number (a Unique Values class's own strokes), "index"?: number (a Graduated Colors class's, 0 = the lowest), "other"?: true (Unique Values' <all other values>)}"##,
             ),
+        C::new("layer.markerRotation", "Marker Rotation", "Style › Drawing", |s, p| {
+            let field = match p.get("field") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(f)) if f.is_empty() => None,
+                Some(Value::String(f)) => Some(f.clone()),
+                Some(_) => return Err("field is a field's name, or null for none".into()),
+            };
+            let counterclockwise = match p.get("counterclockwise") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(b)) => *b,
+                Some(_) => return Err("counterclockwise is true or false".into()),
+            };
+            let id = s.layer_id(p)?;
+            let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
+            if l.geometry_type() != GeometryType::Point || l.graphics {
+                return Err("this works on point layers".into());
+            }
+            if let Some(f) = &field {
+                let fi = l.dataset.field_index(f).ok_or_else(|| format!("no field named '{f}'"))?;
+                if !l.dataset.fields.get(fi).is_some_and(|fd| fd.ty.is_numeric()) {
+                    return Err(format!("'{f}' is not a numeric field"));
+                }
+            }
+            l.marker_rotation = field.map(|field| rustgis_map::MarkerRotation { field, counterclockwise });
+            Ok(Value::Null)
+        })
+        .when(need_points)
+        .params(r#"{"layer"?, "field": numeric field name|null (each point's marker turned by the angle in it, in degrees; null: not turned), "counterclockwise"?: bool (the angles run counterclockwise, as in mathematics; default clockwise, as on a compass)}"#),
         C::new("layer.strokeLevels", "Stroke Levels", "Style › Drawing", |s, p| {
             let on = b(p, "on").ok_or("on is true or false")?;
             let id = s.layer_id(p)?;
@@ -194,10 +222,24 @@ pub fn commands() -> Vec<C> {
         C::new("layer.marker", "Marker", "Style › Drawing", |s, p| {
             let shape = ps(p, "shape").map(|n| Marker::ALL.into_iter().find(|m| m.label().eq_ignore_ascii_case(n)).ok_or("unknown marker shape")).transpose()?;
             let size = f(p, "size").map(|v| v.clamp(1.0, 80.0) as f32);
+            let (ch, font) = (character(p)?, ps(p, "font"));
+            if shape.is_some() && ch.is_some() {
+                return Err("give a shape or a char, not both".into());
+            }
             with(s, p, |l| {
                 l.renderer.map_symbols(|sym| {
                     if let Some(m) = shape {
                         sym.marker = m;
+                    }
+                    let was = match sym.marker {
+                        Marker::Char(g) => Some(g),
+                        _ => None,
+                    };
+                    // A new character keeps the family of the one before; a family alone changes a character's.
+                    match (ch, was, font) {
+                        (Some(c), _, _) => sym.marker = Marker::Char(Glyph::new(c, font.unwrap_or(was.map_or("", |g| g.font.as_str())))),
+                        (None, Some(g), Some(fam)) => sym.marker = Marker::Char(Glyph::new(g.ch, fam)),
+                        _ => {}
                     }
                     if let Some(sz) = size {
                         sym.size = sz;
@@ -206,7 +248,7 @@ pub fn commands() -> Vec<C> {
             })
         })
         .when(need_feature_layer)
-        .params(r#"{"layer"?, "shape"?: "circle"|"square"|"triangle"|"diamond"|"star", "size"?: number}"#),
+        .params(r#"{"layer"?, "shape"?: "circle"|"square"|"triangle"|"diamond"|"star", "char"?: text (a character of a font as the marker, its first; sized by the font's em), "font"?: text (the installed family the character is drawn from; "" or one not installed: the label font), "size"?: number}"#),
         C::new("layer.transparency", "Transparency", "Style › Effects", |s, p| {
             let t = f(p, "value").ok_or("value (0–100) is required")?.clamp(0.0, 100.0) as f32;
             with(s, p, |l| l.transparency = t)
@@ -266,13 +308,13 @@ pub fn commands() -> Vec<C> {
         }).params(r#"{"layer"?, "on"?: bool (toggles when omitted)}"#)
         .view()
         .when(need_layer),
-        C::new("labels.enable", "Label", "Style › Labels", |s, p| {
+        C::new("labels.enable", "Label", "Labeling › Labels", |s, p| {
             let on = b(p, "on");
             with(s, p, |l| l.labels.enabled = on.unwrap_or(!l.labels.enabled))
         })
         .when(need_feature_layer)
         .params(r#"{"layer"?, "on"?: bool}"#),
-        C::new("labels.field", "Label Field", "Style › Label Class", |s, p| {
+        C::new("labels.field", "Label Field", "Labeling › Label Class", |s, p| {
             let name = s_req(p, "field")?.to_string();
             let id = s.layer_id(p)?;
             let fname = s.map().layer(id).and_then(|l| l.dataset.field_index(&name).and_then(|i| l.dataset.fields.get(i)).map(|f| f.name.clone()));
@@ -284,11 +326,55 @@ pub fn commands() -> Vec<C> {
             })
         }).params(r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "field": name}"#)
         .when(need_feature_layer),
-        C::new("labels.style", "Text Symbol", "Style › Text Symbol", |s, p| {
+        C::new("labels.style", "Text Symbol", "Labeling › Text Symbol", |s, p| {
             let size = f(p, "size").map(|v| v.clamp(*LABEL_SIZE.start(), *LABEL_SIZE.end()) as f32);
             let color = s.get_color(p, "color")?;
-            let (halo, bold) = (b(p, "halo"), b(p, "bold"));
+            let (halo, bold, italic) = (b(p, "halo"), b(p, "bold"), b(p, "italic"));
+            // A family by name, whether or not this machine has it: the project may be drawn on
+            // one that does. Blank goes back to the label font.
+            let font = ps(p, "font").map(rustgis_map::symbology::font_name);
+            // A halo's own colour ("" or null: one standing out from the text), its width in points
+            // (null: the thin halo), and the letter spacing.
+            let halo_color = match p.get("haloColor") {
+                None => None,
+                Some(Value::Null) => Some(None),
+                Some(Value::String(c)) if c.trim().is_empty() => Some(None),
+                Some(_) => Some(Some(s.get_color(p, "haloColor")?.ok_or("haloColor must be #RRGGBB or #RRGGBBAA")?)),
+            };
+            let hw = rustgis_map::symbology::HALO_WIDTH;
+            let sp = (rustgis_map::layout::MIN_LETTER_SPACING, rustgis_map::layout::MAX_LETTER_SPACING);
+            let halo_width = match p.get("haloWidth") {
+                None => None,
+                Some(Value::Null) => Some(None),
+                Some(_) => {
+                    let w = f(p, "haloWidth").ok_or("haloWidth must be a number of points, or null")?;
+                    Some(Some(w.clamp(*hw.start(), *hw.end()) as f32))
+                }
+            };
+            let spacing = match p.get("spacing") {
+                None => None,
+                Some(_) => Some(f(p, "spacing").ok_or("spacing must be a number of points")?.clamp(sp.0, sp.1) as f32),
+            };
+            let background = match p.get("background") {
+                None => None,
+                Some(v) => Some(super::labels::background_change(v)?),
+            };
             super::labels::with_class(s, p, |c| {
+                if let Some(change) = &background {
+                    c.background = change(c.background.clone());
+                }
+                if let Some(v) = halo_color {
+                    c.halo_color = v;
+                }
+                if let Some(v) = halo_width {
+                    c.halo_width = v;
+                }
+                if let Some(v) = spacing {
+                    c.spacing = v;
+                }
+                if let Some(name) = font.clone() {
+                    c.font = name;
+                }
                 if let Some(v) = size {
                     c.size = v;
                 }
@@ -301,10 +387,13 @@ pub fn commands() -> Vec<C> {
                 if let Some(bb) = bold {
                     c.bold = bb;
                 }
+                if let Some(it) = italic {
+                    c.italic = it;
+                }
             })
         })
         .when(need_feature_layer)
-        .params(r##"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "size"?: number, "color"?: "#RRGGBB"|"#RRGGBBAA", "halo"?: bool, "bold"?: bool}"##),
+        .params(r##"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "size"?: number, "color"?: "#RRGGBB"|"#RRGGBBAA", "halo"?: bool, "haloColor"?: "#RRGGBB"|"#RRGGBBAA"|"" (""/null: white or dark, whichever stands out from the text), "haloWidth"?: points 0-10|null (null: the thin halo), "spacing"?: points between letters (-5 to 50), "bold"?: bool, "italic"?: bool, "font"?: installed family name (labels.fonts lists them; "" is the label font), "background"?: false|null (none) | true (white, a thin dark outline) | {"fill"?: "#RRGGBB"|"#RRGGBBAA"|"" ("": none), "stroke"?: colour|"" (the outline; "": none), "strokeWidth"?: points 0-10, "padding"?: [across, up and down] points 0-50, "radius"?: corner radius in points 0-50} (a rectangle behind the text; what isn't given is kept, or the default's)}"##),
         C::new("layer.definitionQuery", "Definition Query", "Data › Definition Query", |s, p| {
             let q = ps(p, "where").map(str::trim).unwrap_or("").to_string();
             let id = s.layer_id(p)?;
@@ -369,6 +458,22 @@ fn need_polygons(s: &Session) -> Option<&'static str> {
 }
 
 /// A line layer is active.
+fn need_lines_or_points(s: &Session) -> Option<&'static str> {
+    match s.active_layer.and_then(|id| s.map().layer(id)) {
+        Some(l) if matches!(l.geometry_type(), GeometryType::Polyline | GeometryType::Point) && !l.graphics => None,
+        Some(_) => Some("this works on line and point layers"),
+        None => Some("select a layer in the Layers pane first"),
+    }
+}
+
+fn need_points(s: &Session) -> Option<&'static str> {
+    match s.active_layer.and_then(|id| s.map().layer(id)) {
+        Some(l) if l.geometry_type() == GeometryType::Point && !l.graphics => None,
+        Some(_) => Some("this works on point layers"),
+        None => Some("select a layer in the Layers pane first"),
+    }
+}
+
 fn need_lines(s: &Session) -> Option<&'static str> {
     match s.active_layer.and_then(|id| s.map().layer(id)) {
         Some(l) if l.geometry_type() == GeometryType::Polyline && !l.graphics => None,
@@ -423,12 +528,42 @@ fn line_strokes(s: &mut Session, p: &Value) -> CmdResult {
                     .ok_or_else(|| format!("stroke {}: level is a whole number from 0 to 255", i + 1))?,
             ),
         };
-        strokes.push(LineStroke { color, width: num("width")?, offset: num("offset")?.unwrap_or(0.0), cap, join, level }.clamped());
+        let bad_dash = || {
+            format!(
+                "stroke {}: dash is a list of 1 to {} lengths in points (dash, gap, …), each 0 to {}, not all 0",
+                i + 1,
+                rustgis_map::symbology::MAX_DASH_STEPS,
+                rustgis_map::symbology::MAX_DASH_STEP
+            )
+        };
+        // A pattern out of range is an error here, so a script learns of it; a project file's is
+        // brought into range instead (`de_dash`), so a hand-edited file still opens.
+        let dash = match o.get("dash") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(a)) => {
+                let steps: Vec<f32> =
+                    a.iter().map(|v| v.as_f64().map(|x| x.clamp(-1e6, 1e6) as f32)).collect::<Option<_>>().ok_or_else(bad_dash)?;
+                Some(rustgis_map::symbology::Dash::new(&steps).ok_or_else(bad_dash)?)
+            }
+            Some(_) => return Err(bad_dash()),
+        };
+        let markers = match o.get("markers") {
+            None | Some(Value::Null) => None,
+            Some(m) => Some(line_markers(m).map_err(|e| format!("stroke {}: markers: {e}", i + 1))?),
+        };
+        strokes.push(
+            LineStroke { color, width: num("width")?, offset: num("offset")?.unwrap_or(0.0), cap, join, level, dash, markers }.clamped(),
+        );
     }
     let id = s.layer_id(p)?;
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
-    if l.geometry_type() != GeometryType::Polyline || l.graphics {
-        return Err("this works on line layers".into());
+    let points = l.geometry_type() == GeometryType::Point;
+    if !(points || l.geometry_type() == GeometryType::Polyline) || l.graphics {
+        return Err("this works on line and point layers".into());
+    }
+    // A point draws marks only: a line stroke would draw nothing there.
+    if let Some(i) = strokes.iter().position(|st| st.markers.is_none()).filter(|_| points) {
+        return Err(format!("stroke {}: a point layer's strokes are markers", i + 1));
     }
     let n = strokes.len();
     match class {
@@ -436,6 +571,88 @@ fn line_strokes(s: &mut Session, p: &Value) -> CmdResult {
         None => l.line_strokes = strokes,
     }
     Ok(json!({"strokes": n}))
+}
+
+/// A character marker's `char` (its first character), if given.
+fn character(p: &Value) -> Result<Option<char>, String> {
+    match p.get("char") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(c)) => c.chars().next().map(Some).ok_or_else(|| "char is a character".into()),
+        Some(_) => Err("char is a character".into()),
+    }
+}
+
+/// A stroke's `markers`: what it draws along the line instead of a line, and where.
+fn line_markers(v: &Value) -> Result<LineMarkers, String> {
+    let o = v.as_object().ok_or("an object, such as {\"mark\": \"circle\", \"interval\": 12}")?;
+    let num = |k: &str| -> Result<Option<f32>, String> {
+        match o.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => {
+                v.as_f64().filter(|x| x.is_finite()).map(|x| Some(x.clamp(-1e6, 1e6) as f32)).ok_or_else(|| format!("{k} is a number"))
+            }
+        }
+    };
+    let d = LineMarkers::default();
+    let mark = match o.get("mark") {
+        None | Some(Value::Null) => d.mark,
+        Some(Value::String(m)) if m.trim().eq_ignore_ascii_case("hash") => LineMark::Hash,
+        // Its `char` says which.
+        Some(Value::String(m)) if m.trim().eq_ignore_ascii_case("character") => {
+            if character(v)?.is_none() {
+                return Err("a character mark needs its char".into());
+            }
+            d.mark
+        }
+        Some(Value::String(m)) => LineMark::Marker(
+            Marker::ALL.into_iter().find(|s| s.label().eq_ignore_ascii_case(m.trim())).ok_or_else(|| format!("unknown mark '{m}'"))?,
+        ),
+        Some(_) => return Err("mark is \"circle\", \"square\", \"triangle\", \"diamond\", \"star\", \"character\" or \"hash\"".into()),
+    };
+    // A character of a font instead of a shape.
+    let mark = match (character(v)?, o.get("font")) {
+        (Some(_), _) if mark == LineMark::Hash => return Err("hash marks take no char".into()),
+        // As `layer.marker`: a shape named with a char is a mistake, not the char.
+        (Some(_), _) if o.get("mark").and_then(Value::as_str).is_some_and(|m| !m.trim().eq_ignore_ascii_case("character")) => {
+            return Err("give a shape or a char, not both".into());
+        }
+        (Some(c), font) => LineMark::Marker(Marker::Char(Glyph::new(c, font.and_then(Value::as_str).unwrap_or_default()))),
+        (None, _) => mark,
+    };
+    let bad_at = || format!("at is a placement or a list of them: {}", Placements::all_codes());
+    let at = match o.get("at") {
+        None | Some(Value::Null) => d.at,
+        Some(Value::String(c)) => Placements::from_code(c).ok_or_else(bad_at)?,
+        Some(Value::Array(a)) if !a.is_empty() && a.len() <= 16 => a
+            .iter()
+            .map(|c| c.as_str().and_then(Placements::from_code).ok_or_else(bad_at))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .fold(Placements::NONE, Placements::with),
+        Some(_) => return Err(bad_at()),
+    };
+    let rotate = match o.get("rotate") {
+        None | Some(Value::Null) => d.rotate,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err("rotate is true or false".into()),
+    };
+    let outline = match o.get("outline") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(c)) => Some(Rgba::from_hex(c).ok_or("outline must be #RRGGBB or #RRGGBBAA")?),
+        Some(_) => return Err("outline must be #RRGGBB or #RRGGBBAA".into()),
+    };
+    Ok(LineMarkers {
+        mark,
+        size: num("size")?.unwrap_or(d.size),
+        at,
+        interval: num("interval")?.unwrap_or(d.interval),
+        offset_along: num("offsetAlong")?.unwrap_or(d.offset_along),
+        rotate,
+        average_angle: num("averageAngle")?.unwrap_or(d.average_angle),
+        angle: num("angle")?.unwrap_or(d.angle),
+        outline,
+    }
+    .clamped())
 }
 
 pub(crate) fn s_req<'a>(p: &'a Value, k: &str) -> Result<&'a str, String> {
@@ -721,7 +938,7 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
     // So is an MBTiles archive, read in place a tile at a time.
     if rustgis_data::mbtiles::is_mbtiles_name(path) {
         if cfg!(target_arch = "wasm32") {
-            return Err(format!("{path}: in the web app, add the MBTiles file from this computer (Home › Add Data)"));
+            return Err(format!("{path}: in the web app, add the MBTiles file from this computer (Home › Add › Add Data)"));
         }
         let full = std::path::absolute(path).map(|p| p.display().to_string()).map_err(|e| format!("{path}: {e}"))?;
         // Read now, so a file that isn't an archive is said at once rather than when it draws.
@@ -1375,7 +1592,8 @@ pub fn database_param(p: &Value) -> Option<rustgis_data::source::duckdb::Databas
 pub fn sql_database_param(p: &Value) -> Result<Option<rustgis_data::source::duckdb::Database>, String> {
     match database_param(p) {
         Some(rustgis_data::source::duckdb::Database::Mysql(_) | rustgis_data::source::duckdb::Database::Sqlserver(_)) => {
-            Err("SQL queries don't run on MySQL, MariaDB or SQL Server databases: add their tables with Add Data › Database…".into())
+            Err("SQL queries don't run on MySQL, MariaDB or SQL Server databases: add their tables with Home › Add › Add Data › Database…"
+                .into())
         }
         db => Ok(db),
     }
@@ -1934,6 +2152,8 @@ fn add_layer_file(s: &mut Session, path: &str) -> CmdResult {
 /// Adds a layer from a layer file's JSON.
 pub(crate) fn add_layer_text(s: &mut Session, text: &str) -> CmdResult {
     let mut layer: rustgis_map::Layer = serde_json::from_str(text).map_err(|e| format!("not a RustGIS layer file: {e}"))?;
+    // A binding in a file is no authority to use a login here.
+    crate::s3_connections::clear_bindings(layer.addresses_mut());
     // A fresh id and a unique name in this map; the rest goes through project repair.
     let base = layer.name.clone();
     let mut i = 1;
@@ -1948,6 +2168,7 @@ pub(crate) fn add_layer_text(s: &mut Session, text: &str) -> CmdResult {
     // Only the database the added layer reads can change here.
     let keys: Vec<_> = s.map().layer(id).and_then(|l| l.source.as_ref()).map(super::connections::layer_keys).unwrap_or_default();
     super::connections::resolve_keys(s, &keys);
+    crate::s3_connections::resolve_project_s3(s);
     super::connections::note_waiting(s);
     s.active_layer = Some(id);
     Ok(json!({"layer": id}))
@@ -2145,10 +2366,12 @@ pub fn url_file_name(url: &str, bytes: &[u8]) -> Result<String, String> {
 /// Downloads data from a web address and adds it (the command line, MCP and the assistant; the
 /// app downloads off the frame and adds the bytes). In the browser, where nothing may wait, the
 /// request is kept for the app ([`Session::request_url`]), which downloads and adds it as its own
-/// Add Data › From URL does, so a plugin, a script or the assistant can add data by address too.
+/// Home › Add › Add Data › From URL does, so a plugin, a script or the assistant can add data by address too.
 pub(crate) fn add_url(s: &mut Session, p: &Value) -> CmdResult {
     let url = ps(p, "url").map(str::trim).filter(|u| !u.is_empty()).ok_or("url is required")?;
-    let lower = url.to_ascii_lowercase();
+    // An address read through a saved S3 connection is judged by the address it wraps; the whole
+    // address stays what is fetched and kept.
+    let lower = rustgis_data::s3_address::inner(url).to_ascii_lowercase();
     if !(lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("s3://")) {
         return Err(format!("{url}: give an http://, https:// or s3:// address (Add Data opens files)"));
     }
@@ -2254,6 +2477,7 @@ fn add_remote(s: &mut Session, p: &Value, url: &str, src: Box<dyn rustgis_data::
 
 /// Whether a web address names a GeoTIFF (by its path's extension).
 pub fn is_tiff_url(url: &str) -> bool {
+    let url = rustgis_data::s3_address::inner(url);
     let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
     path.ends_with(".tif") || path.ends_with(".tiff")
 }
@@ -2650,7 +2874,20 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
         Some(n) => Some(s.ramp(n).or_else(|e| current.filter(|r| r.name().eq_ignore_ascii_case(n.trim())).ok_or(e))?),
         None => current,
     };
-    let method = ps(p, "method").and_then(ClassMethod::from_name).unwrap_or_default();
+    // Manual bounds, as typed; "breaks" alone means manual.
+    let typed = match p.get("breaks") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(a)) => Some(a.iter().map(|v| v.as_f64().ok_or("breaks are numbers")).collect::<Result<Vec<f64>, _>>()?),
+        Some(_) => return Err("breaks are a list of numbers".into()),
+    };
+    let method = match ps(p, "method").and_then(ClassMethod::from_name) {
+        Some(m) if m != ClassMethod::Manual && typed.is_some() => {
+            return Err(format!("breaks go with the manual method, not {}", m.label()));
+        }
+        Some(m) => m,
+        None if typed.is_some() => ClassMethod::Manual,
+        None => ClassMethod::default(),
+    };
     let classes = f(p, "classes").map(|c| c.clamp(1.0, 12.0) as usize).unwrap_or(5);
     let l = s.map().layer(id).ok_or("no such layer")?;
     let g = l.geometry_type();
@@ -2692,7 +2929,17 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
         "single" | "singlesymbol" => Renderer::Single(base),
         "unique" | "uniquevalues" => Renderer::unique(&l.dataset, &rows()?, &field(false)?, ramp.unwrap_or(Ramp::Harbour), base)?,
         "graduated" | "graduatedcolors" => {
-            Renderer::graduated(&l.dataset, &rows()?, &field(true)?, classes, method, ramp.unwrap_or(Ramp::Ember), base)?
+            let (field, ramp) = (field(true)?, ramp.unwrap_or(Ramp::Ember));
+            // Manual with no bounds keeps the layer's current ones on the same field, so switching
+            // to it changes nothing.
+            let kept = match &l.renderer {
+                Renderer::Graduated { field: f, breaks, .. } if *f == field => Some(breaks.clone()),
+                _ => None,
+            };
+            match (method, typed.or(kept)) {
+                (ClassMethod::Manual, Some(b)) => Renderer::graduated_manual(&l.dataset, &rows()?, &field, &b, ramp, base)?,
+                _ => Renderer::graduated(&l.dataset, &rows()?, &field, classes, method, ramp, base)?,
+            }
         }
         "proportional" | "proportionalsymbols" => {
             if g != GeometryType::Point {

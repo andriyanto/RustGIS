@@ -350,7 +350,7 @@ fn rerun(d: &DuckdbOrigin) -> rustgis_data::Result<std::path::PathBuf> {
         // own PostgreSQL credentials (PGPASSWORD, ~/.pgpass) to whatever host the file says.
         (Some(_), Some(duckdb::Database::Postgres(_))) => {
             return Err(rustgis_data::DataError::Format(
-                "the table's result is no longer in the cache: add it again (Add Data › Database…)".into(),
+                "the table's result is no longer in the cache: add it again (Home › Add › Add Data › Database…)".into(),
             ));
         }
         (Some(t), Some(db)) => duckdb::convert_table_of(&db, &duckdb::find_table_of(&db, t)?, d.crs.as_deref())?,
@@ -372,9 +372,9 @@ fn rerun(d: &DuckdbOrigin) -> rustgis_data::Result<std::path::PathBuf> {
 fn database_open_error(e: rustgis_data::DataError) -> rustgis_data::DataError {
     match e {
         rustgis_data::DataError::Login(message) => {
-            rustgis_data::DataError::Login(format!("{message} (connect again with Add Data › Database…, giving its password)"))
+            rustgis_data::DataError::Login(format!("{message} (connect again with Home › Add › Add Data › Database…, giving its password)"))
         }
-        e => rustgis_data::DataError::Format(format!("{e} (connect again with Add Data › Database…, giving its password)")),
+        e => rustgis_data::DataError::Format(format!("{e} (connect again with Home › Add › Add Data › Database…, giving its password)")),
     }
 }
 
@@ -462,7 +462,7 @@ struct Pending {
 type Opening = Arc<Mutex<Option<Result<Arc<dyn FeatureSource>, String>>>>;
 
 /// Tells the app something landed (a read, or a source opened by its address).
-fn landed() {
+pub(crate) fn landed() {
     GENERATION.fetch_add(1, Ordering::Relaxed);
     if let Some(w) = waker().lock().ok().and_then(|w| w.clone()) {
         w();
@@ -482,6 +482,77 @@ pub enum Polled {
 }
 
 impl SourceLayer {
+    /// The original local file, excluding embedded data, databases and query results.
+    pub fn linked_file(&self) -> Option<&str> {
+        if self.embedded.is_some() || self.postgis.is_some() || self.mysql.is_some() || self.sqlserver.is_some() {
+            return None;
+        }
+        let p = if let Some(g) = &self.gdal {
+            Some(g.path.as_str())
+        } else if let Some(d) = &self.duckdb {
+            if d.sql.is_some() || d.table.is_none() { None } else { d.database.as_deref() }
+        } else {
+            self.path.as_deref()
+        };
+        p.filter(|p| crate::paths::is_local(p))
+    }
+
+    /// Opens a replacement with fresh handles, windows, caches and selection.
+    pub fn relinked(&self, path: &str, table: Option<&str>) -> Result<SourceLayer, String> {
+        if self.embedded.is_some() || self.postgis.is_some() || self.mysql.is_some() || self.sqlserver.is_some() {
+            return Err("the layer reads a database or data kept in the project: there's no file to repair".into());
+        }
+        let mut new =
+            SourceLayer { shapefile_crs: self.shapefile_crs, limit: self.limit, byte_budget: self.byte_budget, ..Default::default() };
+        if let Some(g) = &self.gdal {
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = g;
+                return Err("GDAL files are repaired in the desktop app".into());
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let layer = table.unwrap_or(&g.layer);
+                let fresh = rustgis_data::source::gdal::convert_one(std::path::Path::new(path), layer, g.family, g.crs.as_deref())
+                    .map_err(|e| format!("{path}: {e}"))?
+                    .ok_or_else(|| format!("{path}: {layer} has no features"))?;
+                new.path = Some(fresh.display().to_string());
+                new.gdal = Some(GdalOrigin { path: path.into(), layer: layer.into(), ..g.clone() });
+            }
+        } else if let Some(d) = &self.duckdb {
+            if d.sql.is_some() || d.table.is_none() {
+                return Err("a layer from a DuckDB query is read again by running the query (Add Data From SQL), not repaired".into());
+            }
+            #[cfg(target_arch = "wasm32")]
+            return Err("DuckDB files are repaired in the desktop app".into());
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let d =
+                    DuckdbOrigin { database: Some(path.into()), table: table.map(String::from).or_else(|| d.table.clone()), ..d.clone() };
+                new.path = Some(rerun(&d).map_err(|e| format!("{path}: {e}"))?.display().to_string());
+                new.duckdb = Some(d);
+            }
+        } else {
+            new.path = Some(path.into());
+            new.table = table.map(String::from).or_else(|| self.table.clone());
+            if path.to_ascii_lowercase().ends_with(".gpkg")
+                && let Ok(layers) = rustgis_data::source::layers(std::path::Path::new(path))
+            {
+                let list = layers.join(", ");
+                if new.table.is_none() && layers.len() > 1 {
+                    return Err(format!("{path} holds several tables ({list}): choose one (\"table\")"));
+                }
+                if let Some(t) = &new.table
+                    && !layers.contains(t)
+                {
+                    return Err(format!("{path} has no table '{t}' (it has {list}): choose one (\"table\")"));
+                }
+            }
+        }
+        new.open().map_err(|e| format!("{path}: {e}"))?;
+        Ok(new)
+    }
+
     /// A source capable of a complete, ordered render traversal.
     pub fn chunk_source(&self) -> Option<Arc<dyn FeatureSource>> {
         self.handle.as_ref().filter(|h| h.streams_chunks()).cloned()
@@ -744,6 +815,19 @@ impl SourceLayer {
 
     pub fn is_pending(&self) -> bool {
         self.pending.is_some() || self.opening.is_some()
+    }
+
+    /// Opens the source afresh, forgetting a failed or never-started open (and the window read
+    /// from the old one): a source by its web address read again once what signs it has changed
+    /// (its address, or the login behind it). Its symbology and place in the project stay.
+    pub fn reopen(&mut self) -> Result<(), String> {
+        self.handle = None;
+        self.opening = None;
+        self.pending = None;
+        self.error = None;
+        self.login = false;
+        self.reset();
+        self.open()
     }
 
     /// Forgets the window, so the next view reads again (after the source changes).

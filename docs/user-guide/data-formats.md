@@ -15,8 +15,8 @@ not every EPSG code; azimuthal equidistant systems such as Equi7 need the deskto
 
 | Format | Extensions or source | How to add it | Notes |
 | --- | --- | --- | --- |
-| GeoJSON | `.geojson`, `.json` | Home › Add Data, or drop the file | Features with typed attributes; a `GeometryCollection` keeps its first readable member. Desktop FeatureCollections larger than 32 MiB use an in-place reader; layers with more than 100,000 features stream a view at a time. Other GeoJSON files load whole, up to 256 MiB. |
-| Delimited text | `.csv`, `.tsv`, `.txt` | Add Data, or Add Data › Delimited Text… to choose the columns from the file's header | Comma, semicolon, tab or pipe separated (found from the header, or `"delimiter"`); `info.fileColumns` lists the columns and the ones found. Points from x/y columns (named like longitude/latitude or easting/northing, or chosen with `"x"` and `"y"`), or any geometry from a WKT/EWKT column (named like `wkt` or `geometry`, or `"wkt"`). Coordinates in another system are converted from `"crs"` (`EPSG:2263`, or WKT) or an EWKT `SRID=`; without either, coordinates outside longitude/latitude are pointed out. A file without coordinates opens as a standalone table. |
+| GeoJSON | `.geojson`, `.json` | Home › Add › Add Data, or drop the file | Features with typed attributes; a `GeometryCollection` keeps its first readable member. A FeatureCollection's legacy `crs` member (`{"type": "name", "properties": {"name": "urn:ogc:def:crs:EPSG::28992"}}`) is honoured for EPSG codes (`EPSG:28992`, `urn:ogc:def:crs:EPSG::28992`, `urn:ogc:def:crs:EPSG:6.6:28992`) and for `CRS84`: a projected or other non-WGS 84 system converts the coordinates to longitude/latitude and the layer keeps it as its coordinate system (Layer properties, export in it, Define Projection); `CRS84` and `EPSG:4326` are longitude/latitude already, so the coordinates stay as they are and the layer has no other coordinate system. Coordinates are x/y (easting/northing, or longitude/latitude) whatever the EPSG axis order. A `crs` that isn't understood (a `link`, WKT or PROJ text, any other name, an unknown code) is named in a notice and the coordinates are read as longitude/latitude. A feature whose coordinates can't be converted, or convert to beyond ±180.5° longitude or ±90.5° latitude (the declared system doesn't fit the numbers), is left out and counted in a notice, and Define Projection then asks for the file to be added again. A `crs` on a feature, a geometry or a lone Feature is ignored. GeoJSON is always written in WGS 84 without a `crs`. Desktop FeatureCollections larger than 32 MiB use an in-place reader (which honours `crs` too, reading the file once more to check the features convert); layers with more than 100,000 features stream a view at a time. Other GeoJSON files load whole, up to 256 MiB. |
+| Delimited text | `.csv`, `.tsv`, `.txt` | Add Data, or Home › Add › Add Data › Delimited Text… to choose the columns from the file's header | Comma, semicolon, tab or pipe separated (found from the header, or `"delimiter"`); `info.fileColumns` lists the columns and the ones found. Points from x/y columns (named like longitude/latitude or easting/northing, or chosen with `"x"` and `"y"`), or any geometry from a WKT/EWKT column (named like `wkt` or `geometry`, or `"wkt"`). Coordinates in another system are converted from `"crs"` (`EPSG:2263`, or WKT) or an EWKT `SRID=`; without either, coordinates outside longitude/latitude are pointed out. A file without coordinates opens as a standalone table. |
 | Shapefile | `.shp` with `.dbf` (and `.shx`), or zipped (`.zip`) | Add Data or drop the file; in the web app, pick or drop the `.shp` and `.dbf` together, with the `.shx` and `.prj` if there are (they open as one layer), or the zip | A zip may hold several Shapefiles, in folders, and other vector files (GeoJSON, CSV, GeoParquet, FlatGeobuf); each becomes a layer, at most 32 for the whole archive (Shapefiles first, so other files are left out when Shapefiles fill it). `.txt` files and macOS `__MACOSX` entries are passed over, and a member that can't be read is skipped and named in a notice. Converted to longitude/latitude from the coordinate system in its `.prj` (EPSG, Esri or OGC WKT, or WKT2 as PROJ and QGIS write it; Web Mercator, UTM, State Plane and other common projections); without a `.prj` it must be in longitude/latitude. On the desktop, one with more than 100,000 shapes (counted from its `.shx`) is read in place, a view at a time. |
 | KML / KMZ | `.kml`, `.kmz` | Add Data, drop the file, or upload it in the web app | A layer for each kind of geometry (points, lines, polygons), with each placemark's name, description, folder path and extended data. Styles are kept: the layer is drawn by unique values of its `style` field, with each KML style's line and fill colours, widths and icon colours (up to 64 styles). Multi-geometries and `gx:Track`s are read. Ground overlays (pictures on a `LatLonBox`, turned by its `rotation`) are raster layers kept in the project: the picture inside a KMZ, or a file beside a KML (not a web address, nor outside its folder); a `gx:LatLonQuad` isn't drawn. |
 | GPX | `.gpx` | Add Data, drop the file, or upload it in the web app | Waypoints, routes, tracks (one line per track, its segments as parts) and track points (with elevation and time) as separate layers. |
@@ -68,7 +68,7 @@ GDAL](data.md#formats-through-gdal).
 
 ## Files on the web
 
-**Home › Add Data › From URL…** (`layer.addUrl` with `"url"`) downloads a file by its `https://`
+**Home › Add › Add Data › From URL…** (`layer.addUrl` with `"url"`) downloads a file by its `https://`
 (or `http://` or `s3://`, see [S3 buckets](data.md#s3-buckets)) address and adds it like an
 uploaded file. Native formats include GeoJSON, delimited text, GeoParquet, FlatGeobuf, GeoPackage,
 zipped Shapefiles, KML/KMZ, GPX, spreadsheets, GeoRSS, GML, DXF, TopoJSON, LiDAR and rasters.
@@ -132,7 +132,7 @@ FlatGeobuf whose header hasn't been fetched yet, use the From URL… dialog or a
 
 ## Map and feature services
 
-**Home › Add Data › From Service…** connects to a service by its address, lists what it offers from
+**Home › Add › Add Data › From Service…** connects to a service by its address, lists what it offers from
 its capabilities. For OGC API feature collections, enter a group name (initially **My OGC Layer**)
 and choose **Import All**. The group expands into ordinary point, line and polygon layers with
 the same legends, styling and attribute tables as file imports. Other offerings have individual
@@ -174,10 +174,10 @@ Scripts use `service.import {"url":"…","name":"My OGC Layer"}` and
 | WMS 1.1.1 / 1.3.0 | Named layers offered in Web Mercator | A tile layer of GetMap images (PNG when the service offers it, else JPEG) |
 | WMTS | Layers whose tile matrix set is Web Mercator's pyramid | A tile layer from the tile template (or KVP GetTile) |
 | WFS 1.1 / 2.0 | Feature types | Their features downloaded as GeoJSON, in the output format the service names (up to 50,000) |
-| OGC API Features | Collections | Their items downloaded as GeoJSON, following the service's `next` pages up to 100,000 features or a minute of downloading (the web app reads the first page) |
+| OGC API Features | Collections | Their items downloaded as GeoJSON, following the service's `next` pages up to 100,000 features (a command such as `service.add` waits a minute at most) |
 | OGC API Tiles | Collections' map and vector tiles; a landing page's dataset map tiles | A tile layer in WebMercatorQuad, from the tile template the tileset advertises (its `item` link; `…/tiles/WebMercatorQuad/{z}/{y}/{x}`, the usual path, when that can't be read), keeping the tiles link's query (a token), map tiles in the server's image format, vector tiles drawn layer by layer in colours of their own |
 | WCS 1.0 / 2.0 (a 1.1 service is asked in 1.0) | Coverages, with their bounds | A raster: GetCoverage of the map's view within the coverage's bounds (or its whole extent: `"bbox": "full"`), as a GeoTIFF in EPSG:4326, at most 2048 pixels on a side |
-| ArcGIS REST | FeatureServer and MapServer layers; a MapServer's map; an ImageServer; a VectorTileServer | Layers queried as GeoJSON (up to the server's record limit); a map as its tile cache when it is Web Mercator's pyramid, else exported images; an ImageServer as exported images; a VectorTileServer as its MapLibre style |
+| ArcGIS REST | FeatureServer and MapServer layers; a MapServer's map; an ImageServer; a VectorTileServer | Layers queried as GeoJSON, page by page past the server's record limit (`resultOffset`) up to 100,000 features (a command such as `service.add` waits a minute at most), where the layer supports paging (ArcGIS Server 10.3 and later; otherwise up to the record limit); a map as its tile cache when it is Web Mercator's pyramid, else exported images; an ImageServer as exported images; a VectorTileServer as its MapLibre style |
 
 The type is guessed from the address (`?SERVICE=`, `/wmts`, `/wfs`, `/wcs`, `/collections`, `/rest/services`…) or
 chosen (select **OGC API Features and Tiles** when a landing page's address doesn't identify
@@ -190,6 +190,30 @@ format and bounds; `service.coverage` gives the GetCoverage address alone). Movi
 ask for it again: add it again for another area. The server reprojects it to EPSG:4326 (WCS 2.0
 through its CRS extension); one that can't answers with an error, which is shown.
 
+A WFS, OGC API Features or ArcGIS feature layer comes whole, as in other GIS programs. A large
+one (a country's municipalities, hundreds of megabytes) can be asked for over an area instead:
+tick **Only the map's area** in the dialog, or give `service.add` a `"bbox"`
+(`[west, south, east, north]` in longitude/latitude, or `"view"`). The service then sends only
+the features that cross the area, whole, not clipped. `service.add` then zooms to the box given
+(not to the whole layer's bounds), and leaves the view as it is for `"view"`. The box is asked in
+each service's own terms:
+
+- **WFS 1.1 and 2.0:** `BBOX`, in CRS84 when the feature type offers it, else in
+  `urn:ogc:def:crs:EPSG::4326`, latitude first as that name fixes.
+- **OGC API Features:** `bbox`, longitude first; the `next` pages keep it.
+- **ArcGIS:** an envelope in EPSG:4326 the features intersect; the pages past the record limit
+  keep it.
+
+A WFS 1.0 service reads its box in the feature type's own coordinate system, so it is asked for
+the whole layer, as is an area across the antimeridian; a note says so. When a whole layer takes
+longer than `service.add` waits (a minute), the error suggests `"bbox"`:
+
+```sh
+rustgis-cli run --cmd 'service.add={"url":"https://geoservicos.ibge.gov.br/geoserver/wfs","layer":"CGMAT:qg_2024_030_munic","bbox":[-45.99,-10.93,-40.37,-2.74]}'
+```
+
+The layer holds the features of the area it was added for: moving the map doesn't ask for more.
+
 For callers that fetch documents themselves (including the web app), `service.layers` accepts
 `text` for the initial document and `documents: [{"url": "…", "text": "…"}]` for subsequent
 responses. It returns `next` while another collections document is needed; supplied documents
@@ -197,6 +221,38 @@ never cause a blocking capabilities fetch. Each listed layer includes `source_ur
 and the same documents to `service.add` to distinguish layers with the same name. Discovery
 follows at most four documents and rejects loops and disallowed addresses. Collection lists
 aren't paged. On the desktop, feature downloads follow their `next` pages (see the table above).
+
+### Secured ArcGIS services
+
+A secured ArcGIS service answers error 499, "Token Required". There are two ways in:
+
+- **Sign in to ArcGIS** (in Add From Service, shown for ArcGIS addresses; `arcgis.signIn`) signs in
+  to ArcGIS Online, an ArcGIS Online organization (`https://myorg.maps.arcgis.com`) or an ArcGIS
+  Enterprise portal (`https://gis.example.org/portal`) on the portal's own page, with its single
+  sign-on and multi-factor checks: RustGIS never sees the password. It uses OAuth 2.0 with PKCE.
+  ArcGIS Online needs no setup: leave **Client ID** blank and RustGIS's own app is used. An
+  Enterprise portal needs the client ID of an app registered on it (**Content › New item ›
+  Developer credentials › OAuth 2.0 credentials**) whose redirect URLs list RustGIS's callback:
+  `http://127.0.0.1:7290/arcgis/callback` for the desktop app and the command line (give
+  `"port"` to `arcgis.signIn` for another port, and register that address instead), and
+  `oauth-callback.html` next to the web app's page for the browser (for example
+  `https://web.rustgis.app/oauth-callback.html`), where the sign-in opens in a pop-up window.
+  ArcGIS accepts only an address the app registers, port and path included. The portal and
+  client ID are remembered; the session is not.
+- **A token with the address**: a service address given with `?token=…` (from the portal, or
+  `arcgis.token` with `"url"` and `"token"`) keeps the token for that ArcGIS Server and takes it
+  out of the address the layer keeps.
+
+A token is sent (in the `X-Esri-Authorization` header; in the browser, as the request's `token`
+parameter, since ArcGIS's query endpoints refuse the header from web pages) only where its session
+reaches: the portal
+and, for ArcGIS Online, the organization's own hosted services (`services*.arcgis.com/<org id>/…`,
+`tiles.arcgis.com/tiles/<org id>/…`), or, for ArcGIS Enterprise, the portal's host and its
+federated servers; a token given with an address goes to that server alone. Its layers, tiles and
+feature pages are then read with it. Tokens live in memory for the session, never in a project or
+a connection, and a sign-in renews itself until the portal's session ends (two weeks at most).
+**Sign out** (`arcgis.signOut`) forgets it (and, on the desktop, revokes it with the portal); `arcgis.status` lists
+the sessions.
 
 ### Catalogues
 
@@ -215,7 +271,7 @@ server itself: see [PostgreSQL and PostGIS](data.md#postgresql-and-postgis).
 
 | Source | How to add it | Notes |
 | --- | --- | --- |
-| PostGIS table or view | Add Data › Database… (`layer.addDatabase`) with a libpq connection string or `postgresql://` address | Large tables read a view at a time by their spatial index, others loaded whole. Converted to longitude/latitude by the server; `"crs"` for geometry that doesn't say. A column of mixed types becomes a layer per type. The password is kept for the session only. |
+| PostGIS table or view | Home › Add › Add Data › Database… (`layer.addDatabase`) with a libpq connection string or `postgresql://` address | Large tables read a view at a time by their spatial index, others loaded whole. Converted to longitude/latitude by the server; `"crs"` for geometry that doesn't say. A column of mixed types becomes a layer per type. The password is kept for the session only. |
 
 ## MySQL and MariaDB
 
@@ -224,7 +280,7 @@ database live, talking to the server itself: see [MySQL and MariaDB](data.md#mys
 
 | Source | How to add it | Notes |
 | --- | --- | --- |
-| MySQL or MariaDB table or view | Add Data › Database… (`layer.addDatabase`) with a `mysql://user@host:3306/database` or `mariadb://…` address | Large tables read a view at a time by their spatial index, others loaded whole. Converted to longitude/latitude by RustGIS from the column's SRID; `"crs"` for an SRID of 0. A column of mixed types becomes a layer per type. `ssl-mode` sets the encryption. The password is kept for the session only. |
+| MySQL or MariaDB table or view | Home › Add › Add Data › Database… (`layer.addDatabase`) with a `mysql://user@host:3306/database` or `mariadb://…` address | Large tables read a view at a time by their spatial index, others loaded whole. Converted to longitude/latitude by RustGIS from the column's SRID; `"crs"` for an SRID of 0. A column of mixed types becomes a layer per type. `ssl-mode` sets the encryption. The password is kept for the session only. |
 
 ## SQL Server and Azure SQL
 
@@ -233,7 +289,7 @@ external client: see [SQL Server and Azure SQL](data.md#sql-server-and-azure-sql
 
 | Source | How to add it | Notes |
 | --- | --- | --- |
-| SQL Server table or view | Add Data › Database… (`layer.addDatabase`) with an `mssql://user@host:1433/database` address | Read only; large tables read a view at a time. Geometry and geography, including curves, are converted to longitude/latitude. `"crs"` supplies SRID 0; mixed types become separate layers. TLS and certificate checking are on by default. SQL Server logins on every desktop platform; Windows logins on Windows only. Passwords are kept for the session, never in projects. |
+| SQL Server table or view | Home › Add › Add Data › Database… (`layer.addDatabase`) with an `mssql://user@host:1433/database` address | Read only; large tables read a view at a time. Geometry and geography, including curves, are converted to longitude/latitude. `"crs"` supplies SRID 0; mixed types become separate layers. TLS and certificate checking are on by default. SQL Server logins on every desktop platform; Windows logins on Windows only. Passwords are kept for the session, never in projects. |
 
 ## SQL queries and DuckDB databases
 
@@ -254,8 +310,8 @@ databases](data.md#sql-queries-and-duckdb-databases).
 | GeoTIFF / Cloud-optimised GeoTIFF | `.tif`, `.tiff` | Add Data, or upload | Regular or cloud-optimised, striped or tiled; grey, RGB(A), palette (with its colour table) or multiband; Deflate, LZW, PackBits, JPEG or Zstandard compression. Supported EPSG systems or the file's own GeoKey projection are reprojected as it draws. Rotated or skewed images are resampled north-up. Large files open from an overview, or one made while reading. Browser uploads over 256 MiB read only the parts needed for a fitting overview, provided those parts fit the upload limit; the project keeps those parts, not the full-resolution file. |
 | JPEG 2000 | `.jp2`, `.j2k` | Add Data, byte upload (`layer.addDataBytes`), or From URL… (desktop, with [GDAL](https://gdal.org) installed) | Converted through GDAL. Uploads and downloads keep the converted GeoTIFF in the project, so reopening it needs neither GDAL nor the original file or address; their output and workspace limits are described under [Files on the web](#files-on-the-web). The web app rejects JPEG 2000 uploads and downloads with an explicit GDAL limitation: use GeoTIFF instead. |
 | Scans with no coordinates | an untagged `.tif` or `.png`; any `.tif`, `.png` or `.jpg`/`.jpeg` with `"as": "scan"` | Add Data, or upload (`layer.addData`, `layer.addDataBytes`) | Grey or RGB(A), 8- or 16-bit pixels. An untagged TIFF or PNG opens as a scan by default; a JPEG needs `"as": "scan"` (otherwise it is a photo). This also discards a GeoTIFF's coordinates. The scan initially covers the current view and is marked not georeferenced (`georeferenced: false`) until **Georeference** places it. Export and tools needing ground coordinates refuse it until then. PNG/JPEG decoding is bounded and may reduce the image; large TIFFs can be read at reduced resolution. |
-| ASCII grid | `.asc` (with an optional `.prj` on desktop) | Add Data, or upload | A single numeric band. Desktop files use the neighbouring `.prj`; uploaded and downloaded grids have no sidecar and must have coordinates that fit WGS 84 longitude/latitude. |
-| Zarr | a store's folder (`.zarr`, desktop) or web address (desktop and browser), format 2 (consolidated) or 3 | Add Data › Zarr… (`layer.addZarr`), Add Data on a local folder, or a `?zarr=` link | A variable's latitude/longitude (or y/x) map at the steps picked of its other dimensions (time, level), read chunk by chunk in pure Rust (blosc, zlib, gzip, zstd, LZ4; sharded arrays too). See [Zarr stores](data.md#zarr-stores). |
+| ASCII grid | `.asc` (with an optional `.prj` on desktop) | Add Data, or upload | A single numeric band with square `CELLSIZE` or separate `DX` and `DY` pixel sizes. Desktop files use the neighbouring `.prj`; uploaded and downloaded grids have no sidecar and must have coordinates that fit WGS 84 longitude/latitude. |
+| Zarr | a store's folder (`.zarr`, desktop) or web address (desktop and browser), format 2 (consolidated) or 3 | Home › Add › Add Data › Zarr… (`layer.addZarr`), Add Data on a local folder, or a `?zarr=` link | A variable's latitude/longitude (or y/x) map at the steps picked of its other dimensions (time, level), read chunk by chunk in pure Rust (blosc, zlib, gzip, zstd, LZ4; sharded arrays too). See [Zarr stores](data.md#zarr-stores). |
 | Rasters GDAL reads | `.img`, `.hgt`, `.dem`, `.dt0`–`.dt2`, `.nc`, `.nc4`, `.hdf`, `.hdf5`, `.h5`, `.he5`, `.bil`, `.bsq`, `.bip`, `.envi`, `.grd`, `.rst`, `.sdat`, `.kea`, `.ers`, `.ntf`, `.nitf`, `.ecw`, `.sid`, `.gsb`, `.bt`, `.rsw` | Add Data (desktop, with [GDAL](https://gdal.org): `gdal_translate`, `gdalinfo` and `gdalwarp`; the installed build must include the driver) | Converted once to a cached cloud-optimised GeoTIFF. NetCDF/HDF variables are subdatasets: the first is added, the others named in a notice; `"layer"` picks one. Without a declared coordinate system, longitude/latitude-like coordinates use WGS 84 (0–360° longitudes are moved to −180–180°); otherwise give `"crs"`. JPEG 2000 is listed separately above. |
 
 ## Tiles and web services
@@ -273,7 +329,7 @@ databases](data.md#sql-queries-and-duckdb-databases).
 | Format | How to write it | Notes |
 | --- | --- | --- |
 | GeoJSON (`.geojson`, `.json`), CSV | Data › Export (`share.exportLayer`) | The Export Features dialog picks the format; the chosen extension is appended when needed. In the web app it downloads any vector format below except GeoPackage (a Shapefile as one zip). Feature export loads a streamed layer's whole source; remote sources on the web must be downloaded first. |
-| GeoPackage | Data › Export to `.gpkg` (desktop) | One feature table (an attributes table for a layer without geometry) in the layer's coordinate system (see below), with an R-tree and GeoPackage 1.4 triggers to maintain it. Unique feature ids that fit signed 64-bit integers are kept; otherwise SQLite assigns new ids. |
+| GeoPackage | Data › Export to `.gpkg` (desktop) | A new file with one feature table (an attributes table for a layer without geometry) in the layer's coordinate system (see below), with an R-tree and GeoPackage 1.4 triggers to maintain it. An existing destination is refused; adding or replacing tables in an existing GeoPackage is not supported. Unique feature ids that fit signed 64-bit integers are kept; otherwise SQLite assigns new ids. |
 | GeoParquet (`.parquet`, `.geoparquet`) | Data › Export | GeoParquet 1.1: WKB geometry in WGS 84, Snappy compression, row groups of 65,536 features and a `bbox` covering column. A standalone table without geometry writes plain Parquet. |
 | Shapefile | Data › Export to `.shp` (or `.zip` for the files zipped) | Writes `.shp`, `.shx`, `.dbf`, `.prj` (the coordinate system, see below) and `.cpg` (UTF-8). Field names are cut to 10 characters (made unique), text to 254 bytes, and numbers too wide for a dBase field are left empty; features without geometry, and lines of a single point, are left out (and reported). |
 | FlatGeobuf | Data › Export to `.fgb` | In the layer's coordinate system (see below), with a spatial index; features without geometry are left out (and reported). |
@@ -336,7 +392,7 @@ Shapefiles. The source files and their `.prj` sidecars are never rewritten by ei
 
 | File | Extension | Notes |
 | --- | --- | --- |
-| Project | `.rgis` (older `.rgisx` open too) | Saves streamed layers' file paths, not their features; a browser upload is kept inside. |
+| Project | `.rgis` (older `.rgisx` open too) | Saves streamed layers' local file paths relative to the project, not their features; a browser upload is kept inside. |
 | Map, layer, style, color ramp, template, task, bookmark and layout files | `.rgismap`, `.rgislyr`, `.rgisstyle`, `.rgisramp`, `.rgistemplate`, `.rgistask`, `.rgisbookmarks`, `.rgislayout` | See [Project items](data.md#project-items). |
 | Project package | `.rgispkg` | Everything, rasters included. |
 | Plugin | `.rgplugin` | See [Plugins](../plugins.md). |

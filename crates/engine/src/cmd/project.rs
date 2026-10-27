@@ -28,7 +28,7 @@ pub fn commands() -> Vec<C> {
             .when(|s| if s.can_redo() { None } else { Some("nothing to redo") }),
         C::new("tool.set", "Set Map Tool", "Home › Navigate", set_tool)
             .view()
-            .params(r#"{"tool": "explore"|"select"|"zoomIn"|"measure"|"measureArea"|"createPoint"|"createLine"|"createPolygon"|"editVertices"|"graphicPoint"|"graphicText"|"graphicLine"|"graphicCurve"|"graphicFreehand"|"graphicPolygon"|"graphicLasso"|"graphicRectangle"|"graphicCircle"|"graphicEllipse"|"graphicPicture"}"#),
+            .params(r#"{"tool": "explore"|"select"|"selectPolygon"|"selectLasso"|"selectRadius"|"zoomIn"|"measure"|"measureArea"|"createPoint"|"createLine"|"createPolygon"|"editVertices"|"graphicPoint"|"graphicText"|"graphicLine"|"graphicCurve"|"graphicFreehand"|"graphicPolygon"|"graphicLasso"|"graphicRectangle"|"graphicCircle"|"graphicEllipse"|"graphicPicture"}"#),
         C::new("info.project", "Project Info", "Project", info).view().params(r#"{"nameFilter"?: string, "includeFields"?: bool}"#),
         C::new("info.commands", "List Commands", "Help", list).view(),
     ]
@@ -56,6 +56,10 @@ fn reset(s: &mut Session, p: Project) {
     s.history_from_file = s.project.gp_history.len();
     // Zarr layers that follow the time slider read the step it is at.
     super::zarr::follow_time(s);
+    // The sources that read an S3 bucket through a saved connection wait for it (or its choice):
+    // nothing of the new project is fetched before.
+    s.s3_pending.clear();
+    crate::s3_connections::resolve_project_s3(s);
 }
 
 fn new(s: &mut Session, p: &Value) -> CmdResult {
@@ -89,7 +93,7 @@ fn open(s: &mut Session, p: &Value) -> CmdResult {
             if bytes.len() as u64 > MAX_PACKAGE {
                 return Err("the package is too large".into());
             }
-            Project::from_import_json(&super::items::package_text(&bytes)?)
+            Project::from_import_json(&super::items::package_text(&bytes)?, None)
         } else {
             Project::load(&path)
         }
@@ -116,7 +120,7 @@ fn open(s: &mut Session, p: &Value) -> CmdResult {
 fn open_text(s: &mut Session, p: &Value) -> CmdResult {
     let text = super::ps(p, "text").ok_or("text is required")?;
     super::connections::clear_active();
-    let proj = if super::b(p, "package").unwrap_or(false) { Project::from_import_json(text) } else { Project::from_json(text) };
+    let proj = if super::b(p, "package").unwrap_or(false) { Project::from_import_json(text, None) } else { Project::from_json(text) };
     let proj = match proj {
         Ok(proj) => proj,
         Err(error) => {
@@ -136,10 +140,12 @@ fn open_text(s: &mut Session, p: &Value) -> CmdResult {
     Ok(Value::Null)
 }
 
+/// Saves the project to `path` (`.rgis` added when it has no extension) and makes it the
+/// project's file. The project as it is now is the saved state undo can return to.
 fn write(s: &mut Session, path: PathBuf) -> CmdResult {
     let path = if path.extension().is_none() { path.with_extension(crate::project::EXTENSION) } else { path };
     let stripped = s.project.save(&path)?;
-    s.dirty = false;
+    s.mark_saved();
     s.edit_counts.clear();
     s.notify(format!("Saved {}", path.display()), false);
     if stripped > 0 {
@@ -291,7 +297,7 @@ fn info(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({
         "name": s.project.name,
         "path": s.path.as_ref().map(|p| p.display().to_string()),
-        "unsaved": s.dirty,
+        "unsaved": s.dirty(),
         "maps": s.project.maps.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
         "activeMap": m.name,
         "basemap": m.basemap.code(),

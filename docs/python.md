@@ -64,6 +64,32 @@ cities.to_geojson(selected=True)                    # only the selected features
 cities.clear_selection()                            # clears selections in every layer
 ```
 
+## PMTiles archives
+
+`Session.add_pmtiles` and `Map.add_pmtiles` add a raster or vector PMTiles archive by web
+address or local file path. `source_layers` chooses the vector source layers; `style` is an
+array of MapLibre style layers (or its JSON text), using the same
+[supported style properties](user-guide/maps.md#basemaps) as other vector tile layers. A custom
+style chooses what it draws through its own `source-layer` properties, overriding `source_layers`.
+Omit both for the archive's default look. Other `map.addTiles` parameters, such as `opacity`,
+can be passed as keyword arguments.
+
+```python
+s.add_pmtiles("https://example.org/atlas.pmtiles", name="Atlas")
+s.add_pmtiles(
+    "atlas.pmtiles", name="Water", source_layers=["water"],
+    style=[{
+        "id": "water", "type": "fill", "source-layer": "water",
+        "paint": {"fill-color": "#336699"},
+    }],
+)
+```
+
+The result gives the tile layer's name, kind and position; it is not a feature `Layer`.
+Web archives need a server supporting byte-range requests (and CORS for the notebook app).
+Local archives can be read by Python, but are not embedded in the notebook app: use a web
+address accessible to the browser to show one there.
+
 ## The app in a notebook
 
 `rustgis.Map` shows the RustGIS app (ribbon, panes, map) in the cell, kept in step with its
@@ -102,13 +128,48 @@ project, so `m.undo()` undoes only what Python did since.
 
 The app is the [web app](installation.md), loaded from https://web.rustgis.app, so the
 notebook needs to be online. `Map(url=...)` or the `RUSTGIS_WEB_URL` environment variable points
-it at another copy (a self-hosted one, or `trunk serve` in `apps/rustgis-web`). Settings you
-change in the widget last until the cell is run again: an embedded app keeps nothing in the
-browser.
+it at another copy (a self-hosted one, such as one built with the
+[Dockerfile](installation.md#self-host-the-web-app-with-docker), or `trunk serve` in
+`apps/rustgis-web`). Settings you change in the widget last until the cell is run again: an
+embedded app keeps nothing in the browser.
 
 The project, with the data that travels with it, goes to that app through the browser
 (`postMessage`); nothing goes to a server. The app runs in your browser, so with the default
 address your data stays on your machine. Point `url=` only at a copy of the app you trust.
+
+## The app in a Qt application
+
+`rustgis.qt.MapWidget` is the same app in a Qt widget, for a desktop tool or a script that opens a
+window: it shows the web app in Qt WebEngine and keeps it in step with its session, as `Map` does
+in a notebook. It needs PySide6 (or PyQt6 with PyQt6-WebEngine).
+
+```sh
+pip install "rustgis[qt]"
+```
+
+```python
+from rustgis.qt import MapWidget                     # import it before the QApplication
+from PySide6.QtWidgets import QApplication
+
+app = QApplication([])
+w = MapWidget(sample=True)                           # lang="de", url=... as for Map
+w["Countries"].style("graduated", field="pop_est")   # appears in the app
+w.show()                                             # or add it to a layout
+app.exec()
+
+w.info()["center"]                                   # where the app's map was left
+```
+
+`MapWidget` has the methods of `Map` (`run`, `run_in_app`, `add_data`, `w["Sites"]`, `to_png`,
+`notices`, ...) and is a `QWidget`, so it goes in a layout or a dock like any other; `w.view` is
+the `QWebEngineView` the app runs in. Call its methods from the Qt main thread. What the
+[notebook section](#the-app-in-a-notebook) says about files, merging and the app's address holds
+here too.
+
+In a conda environment that also has conda's own Qt, PySide6 from pip may find conda's Qt plugins
+instead of its own and fail to start ("Could not find the Qt platform plugin"). Use a separate
+environment for it, or point `QT_PLUGIN_PATH` at the `Qt/plugins` folder of the PySide6 package
+(and `QTWEBENGINEPROCESS_PATH` at its `Qt/libexec/QtWebEngineProcess`).
 
 ## Commands
 
@@ -177,6 +238,9 @@ big = s.add_geopandas(gdf[gdf.pop_max > 5_000_000], name="Big cities")
 s["Cities"].to_geojson()                            # a FeatureCollection dict
 big.to_file("big-cities.gpkg", crs="EPSG:3857")     # GeoJSON, CSV, FlatGeobuf, GeoParquet, …
 ```
+
+GeoPackage exports through `Layer.to_file` or `share.exportLayer` require a new filename.
+An existing `.gpkg` is refused to preserve its tables; export does not append or replace tables.
 
 `add_geojson` also takes any object with `__geo_interface__` (a Shapely geometry, a GeoSeries).
 `add_data`, `add_geojson` and `add_geopandas` return a `Layer` for a single layer, a list for

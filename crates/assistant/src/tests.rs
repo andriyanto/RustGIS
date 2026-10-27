@@ -264,10 +264,18 @@ fn gate_rules() {
     assert!(g("run_command", json!({"command": "edit.undo"})).is_none());
     assert!(g("run_command", json!({"command": "layer.addData", "params": {"path": "/etc/passwd"}})).is_some());
     assert!(g("run_command", json!({"command": "project.new"})).is_some());
+    // A QGIS project given as text names its files and addresses inside: asked, as with a path.
+    let qgis = g("run_command", json!({"command": "project.importQgis", "params": {"text": "<qgis/>"}}));
+    assert!(qgis.as_deref().is_some_and(|w| w.contains("QGIS project")), "{qgis:?}");
     assert!(g("run_command", json!({"command": "script.run", "params": {"script": "map.zoomFull {}"}})).is_some());
     assert!(g("run_command", json!({"command": "plugin.install", "params": {"path": "x.rgplugin"}})).is_some());
     assert!(g("run_command", json!({"command": "map.addTiles", "params": {"url": "https://tile.example/{z}/{x}/{y}.png"}})).is_some());
     assert!(g("run_command", json!({"command": "plugin:x/y"})).is_some());
+    // Saved S3 keys and the choice of a connection are the user's: asked for, every time.
+    for command in ["connection.forgetSavedKeys", "connection.resolveS3"] {
+        assert!(g("run_command", json!({"command": command, "params": {"id": "c1", "source": "s3://bucket/key"}})).is_some(), "{command}");
+    }
+    assert!(g("run_command", json!({"command": "connection.login", "params": {"id": "c1", "remember": true}})).is_some());
     let sql = g("run_command", json!({"command": "layer.addSql", "params": {"sql": "SELECT ST_Point(0, 0) AS g"}}));
     assert!(sql.as_deref().is_some_and(|w| w.contains("SQL") && w.contains("internet")), "{sql:?}");
     let sql = g("run_command", json!({"command": "layer.addSql", "params": {"sql": "FROM t", "database": "/data/x.duckdb"}}));
@@ -276,7 +284,7 @@ fn gate_rules() {
     assert!(g("list_layers", json!({})).is_none());
     assert!(g("run_command", json!({"command": "info.fileLayers", "params": {"path": "/etc/passwd"}})).is_some());
     assert!(g("run_command", json!({"command": "info.fileColumns", "params": {"path": "/etc/passwd"}})).is_some());
-    // Georeferencing is a file command only when it writes a file.
+    // Georeferencing and projecting are file commands only when they write a file.
     let extent = json!({"layer": "r", "extent": [10.0, 45.0, 10.04, 45.04]});
     assert!(g("run_command", json!({"command": "raster.georeference", "params": extent})).is_none());
     let pts = json!({"layer": "r", "points": [[0, 0, 1, 1], [1, 0, 2, 1], [0, 1, 1, 2]], "transform": "affine", "crs": 32613});
@@ -284,6 +292,12 @@ fn gate_rules() {
     let mut file = pts.clone();
     file["path"] = json!("/tmp/x.tif");
     assert!(g("run_command", json!({"command": "raster.georeference", "params": file})).is_some());
+    // So is projecting a raster.
+    let project = json!({"layer": "r", "crs": 31983, "cellSize": 100, "extent": "Countries"});
+    assert!(g("run_command", json!({"command": "raster.project", "params": project})).is_none());
+    let mut file = project.clone();
+    file["path"] = json!("/tmp/x.tif");
+    assert!(g("run_command", json!({"command": "raster.project", "params": file})).is_some());
 }
 
 /// What a command says beside its result reaches the model (issue #85).
@@ -1264,6 +1278,9 @@ fn chatgpt_credentials(expires_at: i64) -> chatgpt::Credentials {
         plan_declined: false,
         saved_at: "2026-10-14T00:00:00Z".into(),
         session: "session-1".into(),
+        rev: String::new(),
+        in_keychain: false,
+        kept: chatgpt::Kept::Nowhere,
     }
 }
 
@@ -1295,7 +1312,8 @@ fn responses_request_shape() {
     let Step::Send(req) = a.ask("Zoom to Paris", &s) else { panic!("expected a request") };
     assert_eq!(req.url, "https://api.openai.com/v1/responses");
     let h = |k: &str| req.headers.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
-    assert!(h("Authorization").is_some_and(|v| v.starts_with("Bearer ey")));
+    // No token: `chatgpt::send` authorizes each request with the current one.
+    assert_eq!(h("Authorization").map(str::to_string), Some(format!("Bearer {}", chatgpt::SIGNED_IN)));
     assert_eq!(req.headers.iter().filter(|(k, _)| !["Content-Type", "Accept", "Authorization"].contains(&k.as_str())).count(), 0);
     let b = body(&req);
     assert_eq!(b["model"], "gpt-6.1-sol");
@@ -1470,8 +1488,13 @@ fn responses_models_from_the_catalog() {
 fn chatgpt_credentials_file_shape() {
     let c = chatgpt_credentials(1_800_000_000);
     assert!(c.signed_in() && c.plan_allowed());
-    assert_eq!(chatgpt::Credentials::from_json(&c.to_json()).unwrap(), c);
-    assert_eq!(c.to_json()["issuer"], chatgpt::ISSUER);
+    // The file keeps the registration and never a token.
+    let saved = c.to_json();
+    for token in [&c.id_token, &c.access_token, &c.refresh_token] {
+        assert!(!saved.to_string().contains(token.as_str()));
+    }
+    assert_eq!(chatgpt::Credentials::from_json(&saved).unwrap(), c.without_tokens());
+    assert_eq!(saved["issuer"], chatgpt::ISSUER);
     assert!(!c.expires_soon(1_800_000_000 - 3600));
     assert!(c.expires_soon(1_800_000_000 - 60));
     assert!(chatgpt::Credentials { expires_at: 0, ..c.clone() }.expires_soon(0), "an unknown expiry means renew");
@@ -1625,7 +1648,7 @@ fn chatgpt_token_requests_and_replies() {
     let g = chatgpt::parse_grant(&resp(json!({"access_token": "a2", "refresh_token": "r2", "id_token": "i2", "expires_in": 3600,
         "scope": "openid email chatgpt.tokens.use.direct"})))
     .unwrap();
-    let account = chatgpt::Account { email: "ann@example.com".into(), subject: "user-1".into() };
+    let account = chatgpt::Account { email: "ann@example.com".into(), subject: "user-1".into(), ..Default::default() };
     let signed = chatgpt::signed_in("oaiapp_synthetic", &account, &g, 1_000);
     assert_eq!((signed.expires_at, signed.plan_allowed(), signed.plan_declined), (4_600, true, false));
     assert_eq!(signed.saved_at, "1970-01-01T00:16:40Z");

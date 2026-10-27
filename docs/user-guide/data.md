@@ -31,11 +31,22 @@ Formats](data-formats.md).
 | Web tiles: XYZ/TMS/WMS rasters, Mapbox Vector Tiles, MapLibre styles, PMTiles and MBTiles archives | Yes | Yes (Analyze › Create Hosted Imagery) |
 | RustGIS project (`.rgis`; older `.rgisx` files open too) | Yes | Yes |
 
-Add data with **Home › Add Data** (**From URL…** adds a file by its web address, reading a
-cloud-optimised GeoTIFF, GeoParquet or FlatGeobuf in place, a view at a time, and downloading
-others; see [Files on the web](data-formats.md#files-on-the-web)), by dropping files on the window, or by
-passing them on the command line (`rustgis places.geojson`). **Home › Add Data › Delimited
-Text…** asks for a CSV or a spreadsheet first, then lists its columns to pick the x and y (or WKT)
+Add data with **Home › Add › Add Data**: its main button opens the file picker, and its menu offers
+other ways to add data, including **Delimited Text…**, **From URL…** and **From Service…**. Files
+can also be dropped on the window or passed on the command line (`rustgis places.geojson`). The
+file picker opens formats listed on [Supported Data Formats](data-formats.md), including
+cloud-optimised GeoTIFF, GeoParquet and FlatGeobuf (read in place, a view at a time; see [Files
+on the web](data-formats.md#files-on-the-web)). **Home › Add › Data Sources** opens the pane with
+saved connections, favourites, recent data and the public-source library.
+On the desktop, a file that holds several layers (a File Geodatabase, a GeoPackage, a DuckDB
+database or a file read through GDAL) asks which to add when it is picked, dropped or
+double-clicked in the Browser: **Choose Layers** lists them, all ticked, with **Select All**,
+**Select None** and a filter for a long list. Turn **Ask Which Layers to Add** off in the Add Data
+menu to add every layer, as before. Scripts pick one with `layer.addData`'s `"layer"`;
+`info.fileLayers` lists them.
+On the desktop, **Home › Add › Add Data › Add Folder…** connects a folder to the Browser; the web
+app does not offer folder connections.
+**Home › Add › Add Data › Delimited Text…** asks for a CSV or a spreadsheet first, then lists its columns to pick the x and y (or WKT)
 ones from, with the coordinate system (such as `EPSG:2263`) and the separator (changing it reads
 the columns again); `info.fileColumns` lists them for scripts. Add Data finds them itself
 (columns named like longitude/latitude, easting/northing or geometry, and EWKT's `SRID=`) and
@@ -48,7 +59,7 @@ the table's name beside it (`input_name`). The **XY Table To Point** tool
 ([Geoprocessing](analysis.md), and a table's right-click menu) makes points of a table already in
 the project, from two fields of coordinates and their coordinate system. In a text field a single comma is the decimal separator
 (`1,234` is 1.234); thousands separators are not read.
-**Home › Add Data › Graphics Layer** adds a layer for [drawn graphics](cartography.md#graphics),
+**Home › Add › Add Data › Graphics Layer** adds a layer for [drawn graphics](cartography.md#graphics),
 and **Data › Layer Templates** adds empty layers with ready-made schemas to draw into.
 
 Vector geometry is stored as WGS 84 longitude/latitude. Data in another supported coordinate
@@ -56,6 +67,15 @@ system is converted as it is read; Shapefiles use their `.prj`, and formats such
 GeoParquet and FlatGeobuf carry their coordinate system in the file. Rasters keep their own
 coordinate system and are reprojected as they draw. The map uses Web Mercator by default, but
 **View › Projection** can change it; see [Maps](maps.md).
+
+ESRI `.prj` files without an EPSG code use their projection parameters and, for ED50,
+Monte Mario (from Greenwich or from Rome), OSGB36, DHDN, Amersfoort, GGRS87, CH1903/CH1903+
+and S-JTSK, the same built-in Helmert datum transformation as the EPSG definition. A `TOWGS84`
+transformation in the file takes precedence. RDN2008 and IGM95 are treated as WGS 84-like
+datums. These transformations do not replace regional grid corrections for survey accuracy. An
+unrecognized datum keeps its ellipsoid and produces a notice when no transformation is
+available. Swiss oblique Mercator and the standard Krovak East/North variant are supported from
+their parameters.
 
 Shapefile text uses a supported `.cpg` encoding, otherwise the `.dbf` code page, with UTF-8 as
 the fallback. Keep the sidecar files together.
@@ -131,12 +151,12 @@ result mixing geometry types becomes a layer per type, and rows without a geomet
 `"database"` opens a DuckDB database (read only) so the query names its tables plainly; the
 database is trusted like the query, since its views run as part of it.
 
-**Home › Add Data** opens a DuckDB database file (`.duckdb`, `.ddb`): every table with a geometry
+**Home › Add › Add Data** opens a DuckDB database file (`.duckdb`, `.ddb`): every table with a geometry
 column becomes a layer (`"layer"` picks one).
 
 ### PostgreSQL and PostGIS
 
-**Home › Add Data › Database…** (`layer.addDatabase`, desktop) connects to a PostgreSQL database with
+**Home › Add › Add Data › Database…** (`layer.addDatabase`, desktop) connects to a PostgreSQL database with
 PostGIS and reads its tables live. The dialog takes a saved connection or a typed one, a password,
 a table (**List Tables**, or all tables with geometry) and a coordinate system for geometry that
 doesn't say its own. RustGIS talks to the server itself (nothing else to install;
@@ -169,7 +189,7 @@ opt-in to the operating system's password store; see [Named connections](#named-
 for reconnect, selection and forgetting rules. Opening a project can use a remembered password
 only for a unique, exact saved-address match, or an explicit session selection. Otherwise a
 waiting layer offers **Log In…**, or a chooser when several remembered connections match.
-Without a matching connection, connect again with **Add Data › Database…**.
+Without a matching connection, connect again with **Home › Add › Add Data › Database…**.
 `PGPASSWORD` or libpq's password file (`~/.pgpass`, or
 `%APPDATA%\postgresql\pgpass.conf`) can serve when you explicitly add a table without a password;
 opening a project never newly authorizes these ambient credentials. A small table's features
@@ -243,7 +263,7 @@ connect or save at all.
 
 ## MySQL and MariaDB
 
-**Home › Add Data › Database…** (`layer.addDatabase`) also connects to a MySQL (8 or later) or
+**Home › Add › Add Data › Database…** (`layer.addDatabase`) also connects to a MySQL (8 or later) or
 MariaDB (10.2 or later) database and reads its spatial columns live, as it does PostGIS tables:
 RustGIS talks to the server itself, with nothing else to install. The connection is an address,
 `mysql://user@host:3306/database` (or `mariadb://…`); what it leaves out is, as with the
@@ -283,7 +303,7 @@ SQL queries (`layer.addSql`, the SQL pane) don't run on MySQL or MariaDB databas
 
 ## SQL Server and Azure SQL
 
-**Home › Add Data › Database…** (`layer.addDatabase`) reads the `geometry` and `geography`
+**Home › Add › Add Data › Database…** (`layer.addDatabase`) reads the `geometry` and `geography`
 columns of SQL Server 2012 or later and Azure SQL tables and views directly, on the desktop.
 Use `mssql://user@host:1433/database`; an empty host means `localhost`, and omitting the database
 uses the login's default database. **List Tables** (`info.databaseTables`) lists spatial columns.
@@ -330,18 +350,18 @@ remembered reconnects and explicit selection. Secret-named query values such as 
 `access_token` are removed from saved connection addresses. `SQLCMDPASSWORD` serves only when
 explicitly adding a database, not when opening a project. Windows integrated sign-in still
 requires that same address to have been added this session: opening a project does not
-authorize Windows identity. Reconnect with **Add Data › Database…** when needed. SQL queries
+authorize Windows identity. Reconnect with **Home › Add › Add Data › Database…** when needed. SQL queries
 (`layer.addSql`, the SQL pane) do not run on SQL Server connections.
 
 ## Web Data
 
-**Home › Web Data** gathers public web services and catalogs: STAC imagery catalogs, Overture
+**Home › Add › Web Data** gathers public web services and catalogs: STAC imagery catalogs, Overture
 Maps, OpenStreetMap, NASA Earthdata, open-data portals, satellite embeddings and more. They have a
 page of their own: [Web Data](web-data.md).
 
 ## Geocoding addresses
 
-**Home › Add Data › Geocode Addresses…** (`layer.geocode`) turns a standalone table's or a
+**Home › Add › Add Data › Geocode Addresses…** (`layer.geocode`) turns a standalone table's or a
 layer's addresses into points: a CSV of addresses without coordinates is added as a standalone table, then each row's address
 fields (`"address"`: a field, or several such as street, city and country, joined with commas)
 are looked up, each distinct address once. The result is a new point layer holding every field
@@ -364,12 +384,12 @@ it geocodes, and plugins need the network permission.
 
 ## S3 buckets
 
-An `s3://bucket/key` address works wherever data is added by its address: **Add Data › From
-URL…** and `layer.addUrl` (a cloud-optimised GeoTIFF is read in place by range, other files are
+An `s3://bucket/key` address works wherever data is added by its address: **Home › Add › Add Data ›
+From URL…** and `layer.addUrl` (a cloud-optimised GeoTIFF is read in place by range, other files are
 downloaded), PMTiles archives, `?data=` links, and STAC assets whose address is an `s3://` one.
 A public bucket needs nothing more: it is read anonymously from AWS.
 
-**Home › Add Data › S3…** (`s3.connect`) connects to a private bucket, or to an S3-compatible
+**Home › Add › Add Data › S3…** (`s3.connect`) connects to a private bucket, or to an S3-compatible
 service (MinIO, Cloudflare R2, Wasabi, source.coop…) by its endpoint, and browses a bucket a
 folder at a time (`s3.list`), adding an object with **Add**. A connection names its endpoint (AWS
 when empty), its region and the buckets it serves: the ones it is given (`"buckets"`) and the ones
@@ -387,11 +407,56 @@ rustgis-cli run --cmd 's3.connect={"name":"minio","endpoint":"https://minio.exam
   --cmd 's3.list={"url":"s3://my-bucket/rasters/"}' --cmd 'layer.addUrl={"url":"s3://my-bucket/rasters/dem.tif"}'
 ```
 
-Keys are kept until RustGIS closes: never in a project (which keeps the `s3://` address), a
-command's result, a notice or the log. After **Connect**, **Save as Connection** keeps its name,
-endpoint, region and credential source under **Data Sources › Connections**, never its keys.
-Use **Saved connection** to pick it again; typed keys must be entered again after RustGIS closes.
-Storing secrets in the system keychain isn't supported.
+Keys are kept until RustGIS closes unless you ask otherwise: never in a project (which keeps the
+address), a command's result, a notice or the log. After **Connect**, **Save as Connection** keeps
+its name, endpoint, region and credential source under **Data Sources › Connections**, never its
+keys. Use **Saved connection** to pick it again.
+
+On the desktop, a saved connection that uses typed keys can also keep them in your computer's
+credential store (the macOS Keychain, the Windows Credential Manager, or the Secret Service):
+tick **Remember on this computer** in the S3 dialog or the connection's form when you log in
+(it is off every time; `connection.login` takes `"remember": true`). Both keys go to the store,
+with the endpoint they are for, and the connection only gets a **Saved keys** mark; the
+connection's definition, the preferences and projects never contain a key. Displaying that mark
+does not read the store or guarantee it is available. In the next session, choosing, browsing,
+testing or logging in to the connection can read its keys from the store with nothing typed
+(the system may ask you to unlock it). Typed keys win over saved ones for that login.
+Temporary credentials (with a session token) are never kept: they work for the session,
+and keys saved earlier stay as they were. If the store is missing or refuses (the web app and the
+command line have none), the login still works for this session and says the keys weren't
+remembered; without keys typed, a connection with nothing available says so, and is not logged in.
+**Forget Saved Keys** (`connection.forgetSavedKeys`; the connection's right-click menu or its
+form) deletes them from the store and keeps the session's login. Removing a connection deletes
+its saved keys first, and changing its endpoint or switching away from typed keys does too.
+With a credential store available, these actions check it even when the **Saved keys** indication
+is absent: the indication may be stale. If the store refuses deletion, the forget, removal or
+edit doesn't happen. Without a store, a connection marked as holding saved keys cannot be
+removed or have its endpoint changed. Renaming, grouping, buckets and region keep the keys,
+and a copy of a connection has none. A profile, the environment or anonymous access never
+read saved keys.
+
+A saved connection's login reads only what is added through it: its listings, and the objects
+**Add** takes from them, are kept as addresses that name that connection (and its endpoint), so a
+project reads a bucket through the connection it was added with, never with another connection's
+keys because the endpoint or bucket is the same. Opening a project (or importing a map or layer)
+finds each bucket its S3 sources read. A single matching connection whose bucket list explicitly
+includes that bucket logs in and opens the sources when its credentials are available.
+Connections with an empty bucket list require an explicit choice, even when only one matches.
+When only one such connection matches, the notice names it and asks you to confirm it in
+**Choose S3 connection…**; it is not automatically authorized to read an unlisted bucket.
+Missing or unavailable keys leave the sources blocked until you log in.
+If several connections fit, **Choose S3 connection…** (`connection.resolveS3`) asks which one,
+with no connection selected initially; nothing is read until you choose, and **Cancel** leaves
+the sources blocked. If none fits, sources carrying saved-connection provenance stay unread
+(an older project's bare `s3://` address is read as before). Addresses of plain `s3.connect`
+sessions keep reading as they did.
+A saved login belonging to another open session is not reused merely because its name matches:
+each session logs in through its selected saved connection.
+Resolving a bucket retries only that bucket's deferred sources, keeping layer styles and ordering.
+An older source with an unknown endpoint stays separate from an explicitly AWS-backed source,
+even when both name the same bucket and object. Saving and reopening while a choice is pending
+preserves that distinction; choosing a connection for one resource does not choose for the other.
+Raster reloads use the same authorized address and load their pixels in the background.
 Keys go only to the endpoint they're for: a signed request that is redirected isn't followed, and
 keys from a profile or the environment are used only with AWS or the profile's own
 `endpoint_url`. In the web app, the bucket's CORS rules must allow the page's origin (and, for a
@@ -400,8 +465,8 @@ before it connects or lists; plugins can't connect, and need the network permiss
 
 ## Data Sources
 
-The **Data Sources** pane (**View › Windows › Data Sources**, `ui.pane.sources`; **Home › Add
-Data › Connections…** also opens it) gathers the places data comes from:
+The **Data Sources** pane (**View › Windows › Data Sources**, `ui.pane.sources`; **Home › Add ›
+Data Sources** also opens it) gathers the places data comes from:
 
 - **Favourites**: any source, right-clicked and added.
 - **Recent**: the last 20 sources added (files, web addresses, tile layers, services, database
@@ -440,7 +505,7 @@ database is kept without its password. The commands `sources.list`, `sources.sav
 ### Named connections
 
 In the pane, **New Connection ▾** and **Edit…** let you set the name, group and address;
-**Home › Add Data › New Connection** opens the same form for a chosen kind. Leave a new
+**Home › Add › Add Data › New Connection** opens the same form for a chosen kind. Leave a new
 connection's name blank to derive it from the address. **Test** checks the form without saving
 it: web-service, catalogue, STAC and S3 requests run in the background on both desktop and web;
 database tests run synchronously on desktop. The web app doesn't offer database kinds for new
@@ -504,9 +569,9 @@ names the command and parameters that add it (`service.add`, `layer.addDatabase`
 it left some out. Like `connection.test`, it reads the address itself on the desktop and the
 command line; with `probe: true` it returns the address to fetch, and the app passes what it
 fetched back as `answer` (and further `documents` when a service asks for them, as `next`).
-Browsing never changes the project. When a saved password turns out to be missing, or to have been
-saved for another address, the connection loses its **Saved password** marker; the stored entry
-itself is left for **Forget Saved Password**, an address edit or a removal to delete.
+Browsing never changes the project. When a saved database password turns out to be missing, or
+to have been saved for another address, the connection loses its **Saved password** marker; the
+stored entry itself is left for **Forget Saved Password**, an address edit or a removal to delete.
 
 Addresses are saved without passwords or tokens. Database passwords entered through
 `connection.login` are kept separately by connection ID for this session.
@@ -518,18 +583,20 @@ If the store is missing, unavailable or denies access, the login remains usable 
 session and a visible warning says it was not remembered (`passwordSaved:false` in the result).
 The browser and command line have no OS-store hook and remain session-only.
 
-The stored envelope is bound to the connection's ID, kind and cleaned address, including its
-username. Renaming or regrouping preserves it. Changing the address or username, or removing
-the connection, deletes the old stored password before committing the change; if deletion
-fails, the definition remains unchanged. Invalid edits do not delete a password.
+The stored database password envelope is bound to the connection's ID, kind and cleaned address,
+including its username. Renaming or regrouping preserves it. Changing the address or username,
+or removing the connection, deletes the old stored password before committing the change; if
+deletion fails, the definition remains unchanged. Invalid edits do not delete a password.
 Duplicating a connection copies neither its stored password nor its session login.
-**Saved password** marks a remembered connection without reading the store just to display it.
+**Saved password** marks a remembered database connection without reading the store just to
+display it; it is separate from an S3 connection's **Saved keys** marker.
 **Forget Saved Password** (`connection.forgetPassword {"id":"c1"}`) deletes the stored value,
 but leaves an explicitly entered session password and already-open layers alone. Forgetting an
 inactive connection never selects it or replaces another connection's active password.
 
-Projects remain address-only: they contain neither passwords nor saved connection IDs.
-On opening a project, one exact matching remembered connection may reconnect automatically.
+Database layer origins remain address-only: projects contain neither database passwords nor saved
+database connection IDs. On opening a project, one exact matching remembered database connection
+may reconnect automatically.
 Matching strips passwords and outer wrappers/whitespace, but does not infer that URI and
 libpq forms, reordered parameters, host aliases or different usernames mean the same server.
 Several eligible remembered matches open a chooser with no default; cancel leaves the layers
@@ -566,7 +633,11 @@ server positively refuses a password typed for that Test, the previous per-ID se
 selection and active address password are restored (or the attempted credential is removed if
 none existed).
 A failure after authentication, such as a table-listing error, keeps the new session login.
-S3 `accessKeyId`, `secretAccessKey` and optional `sessionToken` remain session-only.
+S3 `accessKeyId` and `secretAccessKey` likewise stay session-only unless a typed-key login opts
+into remembering them; a nonblank `sessionToken` always keeps the complete temporary credential
+set session-only, leaving previously saved keys unchanged (see [S3 buckets](#s3-buckets)).
+With login parameters, an S3 `connection.test` logs in first, never remembers keys, and a failed
+listing does not undo that session login.
 S3 profiles and environment credentials remain subject to the existing endpoint restrictions;
 editing an S3 name, endpoint or options disconnects its session login. S3 shares the name-based
 session registry used by the S3 dialog and `s3.connect`, so editing or removing a saved
@@ -574,10 +645,10 @@ connection also affects a session entry of the same name created there.
 Renaming clears runtime entries under both the old and new names, so the renamed
 connection cannot inherit an unrelated login at its destination name.
 Web-service logins are not supported. Plugins may list connections but cannot manage, log in
-to, forget passwords for, test or browse them. The in-app assistant asks for fresh approval
-each time for those operations, including Forget and scripted calls; external assistants
-using MCP cannot run them. Even `probe: true` needs approval: connection operations cannot be
-approved for the whole conversation.
+to, forget passwords or S3 keys for, choose an S3 connection for, test or browse them. The in-app
+assistant asks for fresh approval each time for those operations, including Forget, S3 source
+selection and scripted calls; external assistants using MCP cannot run them. Even `probe: true`
+needs approval: connection operations cannot be approved for the whole conversation.
 
 Desktop and web apps save connections with their preferences (`connections` in desktop
 `prefs.json`, `rustgis.connections` in web localStorage). The first load imports saved services,
@@ -679,7 +750,11 @@ A TIFF or PNG without coordinates opens as a scan to place with **Georeference**
 file next to it (as a Shapefile does); otherwise, and always for uploads, it must be in
 longitude/latitude degrees. On the desktop, a GDAL `.aux.xml` file next to a raster (`dem.tif.aux.xml`
 or `dem.aux.xml`) names its bands from their descriptions, gives the no-data value when the file
-has none, and supplies the band statistics when only an overview of the raster is read.
+has none, and supplies the band statistics when only an overview of the raster is read. Its
+category names (GDAL's `SetCategoryNames`, one per value) label the classes in the legend of a
+Colormap or Unique Values layer; a value without a name shows the value itself. The band
+descriptions GDAL and rasterio write inside a GeoTIFF (its `GDAL_METADATA` tag) name its bands
+too, a sidecar's taking precedence.
 Exporting a raster opened from an overview writes that overview; the results of adding and of
 exporting it (`layer.addData`, `share.exportRaster`) give the full size as `overviewOf`, so scripts
 and the MCP server see it too.
@@ -730,7 +805,7 @@ stretch, class breaks and legend then use only the values shown. **Clear mask** 
 again; the mask is saved with the project.
 
 A single-band raster of continuous values (an elevation model, a temperature grid, an index such
-as NDVI) is first drawn as an inverted grey stretch clipping 0.5 % at each end. To draw such rasters
+as NDVI) is first drawn as a grey stretch, black to white (matplotlib's `gray`), clipping 0.5 % at each end. To draw such rasters
 your own way, style one with the Stretch symbology, then click **Save as Default** under
 **Resampling**: rasters added from then on, opened files and analysis results (a slope, an NDVI)
 alike, take its color scheme, inversion, stretch type and
@@ -747,11 +822,11 @@ of another layer's stretch as fixed bounds, so the tiles match; `{"type": "custo
 "max": …}` sets the bounds yourself.
 
 Clicking a raster with the Explore tool shows its pixel values. Projects remember a raster's file
-path and reopen it; rasters added in the browser are stored inside the project.
+path relative to the project and reopen it; rasters added in the browser are stored inside the project.
 
 ### Zarr stores
 
-**Home › Add Data › Zarr…** (`layer.addZarr`) adds a variable of a [Zarr](https://zarr.dev) store
+**Home › Add › Add Data › Zarr…** (`layer.addZarr`) adds a variable of a [Zarr](https://zarr.dev) store
 (format 2 or 3), the multidimensional arrays climate and Earth-observation data are kept in: give
 the store's web address, or (on the desktop) its folder, and **Connect** lists its variables
 (`raster.zarrInfo`). A variable's map is its latitude/longitude (or y/x) dimensions; its other
@@ -832,13 +907,13 @@ RustGIS saves pieces of a project as files you can share and reuse:
 
 | Item | Extension | Made with | Opened with |
 | --- | --- | --- | --- |
-| Map file (a map with its data) | `.rgismap` | Publish › Save As › Map File | Home › Import |
+| Map file (a map with its data) | `.rgismap` | Publish › Save As › Map File | Command Search (`map.import`), or drop it on the window |
 | Layer file (a layer with its symbology) | `.rgislyr` | Publish › Save As › Layer File | Add Data |
 | Styles (saved symbology) | `.rgisstyle` | Style › Styles › New Style, then Publish › Save As › Style Items | Style › Styles › Add Style File |
 | [Color ramps](cartography.md#custom-color-ramps) | `.rgisramp` (also reads QGIS `.xml`/`.qml`, GDAL color `.txt` and GMT `.cpt`) | Publish › Save As › Color Ramps, or by hand | Style › Styles › Add Color Ramp File |
-| Project template (the setup without features) | `.rgistemplate` | Home › Templates, or Publish › Save As | Home › Templates › Open Custom Template |
+| Project template (the setup without features) | `.rgistemplate` | Publish › Save As, or Command Search (`project.saveTemplate`) | Command Search (`project.fromTemplate`) |
 | Project package (the project, with linked raster files embedded while they fit) | `.rgispkg` | Publish › Package › Project | Project › Open, or drop it on the window |
-| Map package / mobile map package | `.rgismpk` | Publish › Package › Map or Mobile Map | Home › Import |
+| Map package / mobile map package | `.rgismpk` | Publish › Package › Map or Mobile Map | Open the package as a project, or drop it on the window |
 | Results package (geoprocessing history and outputs) | `.rgisgpk` | Publish › Package › Results | any zip tool |
 | Task (guided command steps) | `.rgistask` | Analyze › Task, Publish › Save As › Task Item | Analyze › Task › Import Task |
 | Bookmarks (as longitude, latitude and scale) | `.rgisbookmarks` | Home › Navigate › Bookmarks › Export Bookmarks | Home › Navigate › Bookmarks › Import Bookmarks |

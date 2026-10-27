@@ -220,6 +220,42 @@ pub fn clear() {
     GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
+/// The resource a cache key reads: its address without a download budget, a byte range or a
+/// tail, and for a tile of a PMTiles or COG archive, the archive's address.
+fn resource_of(key: &str) -> &str {
+    let key = split_download_limit(key).0;
+    let key = split_tail(key).0;
+    let key = split_range(key).0;
+    if key.starts_with(crate::pmtiles::SCHEME) || key.starts_with(crate::cog::SCHEME) {
+        return key.split_once('@').map_or(key, |(_, archive)| crate::cog::split(archive).0);
+    }
+    key
+}
+
+/// Forgets what was read of one address (and of the archive or file it names), so it is read
+/// again, as [`clear`] does for everything: after the login that signs it changed (a source
+/// whose address stays the same, read again with other keys). Reads under way are kept.
+pub fn forget(url: &str) {
+    let url = crate::cog::split(split_download_limit(url).0).0;
+    let mut c = lock();
+    let dropped: usize = c
+        .slots
+        .iter()
+        .filter(|(k, s)| !matches!(s.entry, Entry::Pending) && resource_of(k) == url)
+        .map(|(_, s)| match &s.entry {
+            Entry::Ready(_, n) => *n,
+            _ => 0,
+        })
+        .sum();
+    c.slots.retain(|k, s| matches!(s.entry, Entry::Pending) || resource_of(k) != url);
+    c.bytes = c.bytes.saturating_sub(dropped);
+    drop(c);
+    crate::pmtiles::forget_archive(url);
+    crate::cog::forget_file(url);
+    rustgis_data::source::remote::forget_file(url);
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Waits (up to `timeout`) for the fetches under way to finish. Native only: in the browser
 /// fetches finish between frames, so this returns at once.
 pub fn wait(timeout: Duration) {
@@ -249,7 +285,7 @@ fn start(url: String, want: Want) {
         let latest = c.latest.unwrap_or_else(Instant::now);
         let now = q.push(url, want, |u| c.slots.get(u).map(|s| s.asked), latest, &mut swept);
         // Under the same lock as the choice: a tile asked for again meanwhile isn't forgotten.
-        forget(&mut c, &swept);
+        forget_dropped(&mut c, &swept);
         now
     };
     launch(now.into_iter().collect());
@@ -263,7 +299,7 @@ fn release(host: &str) {
         let mut c = lock();
         let latest = c.latest.unwrap_or_else(Instant::now);
         let next = q.done(host, |url| c.slots.get(url).map(|s| s.asked), latest);
-        forget(&mut c, &next.drop);
+        forget_dropped(&mut c, &next.drop);
         next
     };
     launch(next.start);
@@ -271,7 +307,7 @@ fn release(host: &str) {
 
 /// Forgets tiles dropped unfetched: no longer under way, and fetched again when next asked for.
 /// Called holding the cache's lock taken to choose them, so a tile can't be asked for between.
-fn forget(c: &mut Cache, dropped: &[Waiting<Want>]) {
+fn forget_dropped(c: &mut Cache, dropped: &[Waiting<Want>]) {
     for w in dropped {
         if matches!(c.slots.get(&w.url), Some(Slot { entry: Entry::Pending, .. })) {
             c.slots.remove(&w.url);
@@ -522,7 +558,7 @@ pub fn download_detailed(url: &str, max: usize, done: DoneDetailed) {
 }
 
 /// How long a download the caller waits for may take: commands run where the app waits too (the
-/// AI Assistant's), so a large file comes through Add Data › From URL, which downloads off the
+/// AI Assistant's), so a large file comes through Home › Add › Add Data › From URL, which downloads off the
 /// frame.
 #[cfg(not(target_arch = "wasm32"))]
 pub const BLOCKING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -538,7 +574,7 @@ pub fn download_blocking(url: &str) -> Result<Vec<u8>, String> {
 pub fn download_blocking_limited(url: &str, max: usize) -> Result<Vec<u8>, String> {
     download_blocking_within(url, max, BLOCKING_TIMEOUT).map_err(|e| {
         if e.contains("timeout") || e.contains("timed out") {
-            format!("{e} (a large file: add it with Add Data › From URL, which downloads in the background)")
+            format!("{e} (a large file: add it with Home › Add › Add Data › From URL, which downloads in the background)")
         } else {
             e
         }
@@ -559,6 +595,15 @@ pub fn download_blocking_within(url: &str, max: usize, timeout: std::time::Durat
 pub fn download_public_within(url: &str, max: usize, timeout: std::time::Duration) -> Result<Vec<u8>, String> {
     crate::address::check(url, None)?;
     native::get(&native::public_agent(timeout), &download_address(url, max))
+}
+
+/// Reads an address's first byte, connecting only to internet addresses (as
+/// [`download_public_within`]), telling what is known of a failure: whether and how a server
+/// serves a file, without reading it ([`crate::s3::public_region`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn probe_blocking(url: &str) -> Result<(), Failure> {
+    crate::address::check(url, None).map_err(|e| Failure::new(url, e))?;
+    native::get_detailed(&native::public_agent(BLOCKING_TIMEOUT), &format!("{url}{RANGE}0-0")).map(|_| ())
 }
 
 /// How a JSON document is POSTed and its answer read (the browser's `fetch`): the address, the
@@ -830,7 +875,7 @@ mod native {
         if crate::mbtiles::is_tile(url) || url.starts_with(LOCAL) {
             return String::new();
         }
-        let Some((_, rest)) = url.split_once("://") else { return String::new() };
+        let Some((_, rest)) = rustgis_data::s3_address::reached(url).split_once("://") else { return String::new() };
         let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let authority = rest.get(..end).unwrap_or(rest);
         // Credentials in the address aren't part of the server.
@@ -1114,6 +1159,13 @@ mod native {
             {
                 req = req.header("Authorization", &auth);
             }
+            // An ArcGIS sign-in's token goes to the portal and the servers it covers, asked for at
+            // each hop like Earthdata's.
+            if !prepared.signed
+                && let Some(auth) = crate::arcgis_auth::authorization_fresh(&at)
+            {
+                req = req.header("X-Esri-Authorization", &auth);
+            }
             // An error status is answered, not failed: its headers and body say who refused.
             let mut resp = req.config().http_status_as_error(false).build().call().map_err(unanswered)?;
             let status = resp.status().as_u16();
@@ -1145,7 +1197,10 @@ mod native {
                 }
             }
             if status >= 400 {
-                return Err(if detail {
+                // A signed request's refusal is told by its status alone: an answer's headers and
+                // body are the server's text, and a server may echo the request's Authorization
+                // header (the access key's id) back in it.
+                return Err(if detail && !prepared.signed {
                     refused(&mut resp)
                 } else {
                     Failure::without_answer("", format!("http status: {status}"), Reason::Status(status))

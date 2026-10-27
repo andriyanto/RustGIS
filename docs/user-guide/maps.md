@@ -8,15 +8,17 @@ For selecting, grouping, reordering and copying layers between maps, see
 
 ## Navigating
 
-Drag to pan and scroll to zoom; ++home++ (or **Full Extent**) shows all the data. **Home ›
-Navigate** has fixed zoom steps, **Previous** and **Next** extents, **Bookmarks** (the World Atlas
-has World, Europe, Africa, Americas and East Asia) and **Go To XY**, which pans to a longitude and
-latitude. **New Bookmark…** saves the current view under a name, with an optional description of
-the place. The Bookmarks menu removes a bookmark with the button beside it, and exports or imports
-them as a `.rgisbookmarks` file. Imported bookmarks show the same place on a map in another
-projection; places that projection can't show are skipped. Type a scale in the status bar to jump
-to it. Beside it are the zoom level, bearing and pitch; click them to face north and look straight
-down again. More navigation tools are under [View effects](#view-effects) below.
+Drag to pan and scroll to zoom; ++home++ (or **Full Extent**) shows all the data. **Home › Navigate**
+has fixed zoom steps, **Previous** and **Next** extents, **Bookmarks** (the World Atlas has World,
+Europe, Africa, Americas and East Asia), and **Locate**: **By Coordinates…** pans to a longitude
+and latitude; **By Place or Address…** finds a place or address with a geocoder. **New Bookmark…**
+saves the current view under a name, with an optional description of the place. The Bookmarks menu
+removes a bookmark with the button beside it, and exports or imports them as a `.rgisbookmarks`
+file. Imported bookmarks show the same place on a map in another projection; places that projection
+can't show are skipped. Type a scale in the status bar to jump to it: the map zooms from the whole
+world in past 2:1, close enough for site plans at 1:20 and finds drawings at 1:1 (type `2:1` for twice
+life size). Beside it are the zoom level, bearing and pitch; click them to face north and look
+straight down again. More navigation tools are under [View effects](#view-effects) below.
 
 **Measurement units.** In **Home › Inspect › Measure**, choose **Metric** or **Imperial**.
 The choice is remembered and updates existing distance and area measurements, the live
@@ -55,7 +57,7 @@ height, with the labels of extruded features on their roofs. While a tilted map 
 picture drawn last is laid over the ground and the extrusions and markers are moved with it, and the map is
 drawn again once it settles. `map.setBearing` sets the bearing (`{"bearing": 90}`
 puts east at the top; `{"by": 15}` turns it further), `map.setPitch` the pitch (`{"pitch": 60}`,
-or `{"by": 10}`), `map.resetNorth` faces north and looks straight down, and **Go To XY** takes a
+or `{"by": 10}`), `map.resetNorth` faces north and looks straight down, and `map.goToXY` takes a
 `bearing` and a `pitch` too. Page layout map frames take their own bearing and pitch (see
 [Layouts](layouts.md)), and the globe turns and tilts the same way: tilted, its camera swings
 back about the centre of view, so the horizon comes into sight past the curve of the Earth.
@@ -98,10 +100,11 @@ Double-click a name to rename it, and right-click it to rename, describe, update
 down, or delete it. Bookmark edits run `bookmark.*` commands and undo with ++ctrl+z++;
 **Zoom To** and **Pan To** change the view without adding an undo step.
 
-**Find Place** (`map.findPlace`) looks up a place or an address by name with OpenStreetMap's
-[Nominatim](https://nominatim.org) (or a [Photon](https://photon.komoot.io) server, or a
-geocoder of your own given by its address) and zooms to the one picked. The search goes to that
-server over the network; see [Geocoding addresses](data.md#geocoding-addresses) for whole tables.
+**Home › Navigate › Locate › By Place or Address…** (`map.findPlace`) looks up a place or an
+address by name with OpenStreetMap's [Nominatim](https://nominatim.org) (or a
+[Photon](https://photon.komoot.io) server, or a geocoder of your own given by its address) and
+zooms to the one picked. The search goes to that server over the network; see
+[Geocoding addresses](data.md#geocoding-addresses) for whole tables.
 
 The **search box** at the foot of the left pane searches the map as you type: a latitude and
 longitude (`40.7, -74.0`, `40.7N 74W` or `40°42'46"N 74°0'21"W`; latitude first unless the
@@ -206,7 +209,8 @@ Ocean, Atlas, Blank), which need no network, and web tile layers over them:
 The gallery's **Web Basemaps** need no API key: the OpenFreeMap vector maps (Liberty, Bright,
 Positron, Dark, Fiord) and USGS Imagery. Choosing one replaces the other web basemaps; tick
 **Stack on the current basemaps** above them to add it over the others instead (clicking one
-that already shows then takes it off). For many
+that already shows then takes it off). Toggling the checkbox keeps the gallery open so you can
+choose a basemap; choosing one closes it. For many
 more (OpenStreetMap, Esri, NASA and others), follow **Install the Basemaps plugin** under them,
 which opens the Plugin Manager at the
 [Basemaps plugin](https://plugins.rustgis.app/catalog/basemaps/); it adds a tab of public
@@ -237,6 +241,24 @@ Explicit bounds must form a finite, ordered geographic rectangle; an invalid val
 command without adding or replacing a layer. Invalid or malformed bounds in a saved project
 are instead discarded, leaving the project and tile layer usable without that coverage metadata.
 
+**Legends.** A WMS or WMTS layer added from its service has its legend in the Layers pane, as
+ArcGIS Pro's Contents pane shows a map service layer's: the arrow beside it opens the legend under
+the layer, indented as a feature layer's classes are, at the size the service draws it (one wider
+than the pane scrolls across). A WMS layer's legend is the one its service draws from the layer's
+styling (GetLegendGraphic, when the service offers it in PNG or JPEG), else the picture of its
+default style (its `LegendURL`: the style named `default`, else its first, inherited from the
+layers above it as WMS has it); when one can't be shown the next is. A WMTS layer's comes from
+its default style, which may give one per range of scales: the one for the map's scale shows,
+and "No legend at this scale" where none is for it. The pictures are fetched when first shown
+and kept (one that couldn't be fetched is asked for again a minute later). Any tile layer can be given one: `map.addTiles` and `map.setTiles` take
+`"legend"` (an address, or a list of addresses and `{"url", "minScale", "maxScale"}`; `null` takes
+it away), and `map.expandTiles` shows or hides it (as `layer.expand` does a layer's classes: not
+an edit to undo). A project keeps a layer's legends and whether they show.
+
+```sh
+rustgis-cli run --cmd 'service.add={"url":"https://wms.geo.admin.ch/","layer":"ch.swisstopo.geologie-swissgeocover2d_lines"}' --cmd 'map.tiles={}'
+```
+
 ### Other worlds
 
 <figure markdown="span">
@@ -247,9 +269,9 @@ are instead discarded, leaving the project and tile layer usable without that co
 A map can be on the Moon, Mars or another body instead of the Earth. Pick the body from the
 planet button at the top of the Layers pane, or under **Celestial Bodies** in the Basemap
 gallery: Earth, Moon, Mars, Callisto, Charon, Europa, Ganymede, Io, Mercury, Pluto, Titan and
-Venus. Choosing one puts one of its basemaps under the map (the gallery lists the others: Viking,
-MOLA elevation and hillshade mosaics for Mars, LOLA albedo for the Moon, and the USGS
-Astrogeology mosaics of the rest) and measures on that body: the Measure tools, the scale bar,
+Venus. Choosing one closes the gallery and puts one of its basemaps under the map (reopen the
+gallery for the others: Viking, MOLA elevation and hillshade mosaics for Mars, LOLA albedo for
+the Moon, and the USGS Astrogeology mosaics of the rest) and measures on that body: the Measure tools, the scale bar,
 the map scale and layout scale bars use its radius. Coordinates stay longitude and latitude, and
 the map stays a Web Mercator sphere, the size of the body. Off the Earth there is no atmosphere:
 the globe has no glow around it, and a tilted view's sky is the black of space, with no haze

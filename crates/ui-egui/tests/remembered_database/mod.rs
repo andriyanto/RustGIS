@@ -83,6 +83,9 @@ fn remembered_database_failed_store_has_visible_notice() {
 
 #[test]
 fn remembered_database_chooser_cancel_selection_and_project_scope() {
+    // Its own database: passwords for an address are remembered process-wide, and one the other
+    // tests leave for the shared address would open the project without asking which to use.
+    const ADDRESS: &str = "postgres:host=127.0.0.1 port=1 dbname=ui_remembered_chooser user=smoke sslmode=disable";
     let store = Arc::new(MemorySecrets::new());
     let mut seed = with_store(store.clone());
     for name in ["First database", "Second database"] {
@@ -225,7 +228,7 @@ fn remembered_database_recording_history_recent_and_preferences_never_get_sentin
     app.run("connection.new", json!({"kind":"postgres","name":"No leak","address":ADDRESS})).unwrap();
     app.run("connection.login", json!({"id":"No leak","password":"boundary-sentinel","remember":true})).unwrap();
     let mut project = app.session.project.clone();
-    let (text, _) = project.saved_text().unwrap();
+    let (text, _) = project.saved_text(None).unwrap();
     let outputs = [
         serde_json::to_string(&app.ws.recording).unwrap(),
         app.run("sources.list", json!({})).unwrap().to_string(),

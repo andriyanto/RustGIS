@@ -267,6 +267,9 @@ const NEVER: &[&str] = &[
     "project.openText",
     "project.sample",
     "project.fromTemplate",
+    // A QGIS project names the files and web addresses its layers come from, and the import
+    // adds them without each one passing a plugin's permissions.
+    "project.importQgis",
     "edit.undo",
     "edit.redo",
     // Credentials: a plugin never sets where the user's are sent.
@@ -276,6 +279,8 @@ const NEVER: &[&str] = &[
     "connection.remove",
     "connection.login",
     "connection.forgetPassword",
+    "connection.forgetSavedKeys",
+    "connection.resolveS3",
     "connection.test",
     "connection.browse",
     "s3.connect",
@@ -345,6 +350,10 @@ pub fn reaches(spec: &C, params: &Value) -> Option<Reach> {
     if spec.id == "gp.run" && ps(params, "tool").and_then(rustgis_analysis::tool).is_some_and(super::gp::reads_files) {
         return Some(Reach::Files);
     }
+    // A catalog's Zarr entry is opened as `layer.addZarr` is, a database's way.
+    if spec.id == "cube.open" && super::cube_catalog::opens_zarr(params) {
+        return Some(Reach::Files);
+    }
     // Commands that fetch from an address read and write no files, so `files` doesn't come into
     // it (their addresses would look like paths to the check below).
     if super::tiles::NETWORK.contains(&spec.id) {
@@ -353,8 +362,9 @@ pub fn reaches(spec: &C, params: &Value) -> Option<Reach> {
     if DATABASES.contains(&spec.id) {
         return Some(Reach::Files);
     }
-    // Georeferencing writes a file only when it is given a `path`; the rest of it stays in the project.
-    if spec.id == "raster.georeference" {
+    // Georeferencing and projecting write a file only when given a `path`; the rest of them stays
+    // in the project.
+    if spec.id == "raster.georeference" || spec.id == "raster.project" {
         return super::items::names_place(params, PLACE_KEYS, 0).then_some(Reach::Files);
     }
     let files = super::items::names_place(params, PLACE_KEYS, 0)
@@ -371,7 +381,8 @@ fn refused(plugin: &Plugin, spec: &C, params: &Value) -> Option<String> {
         return Some(format!("plugins can't run '{}'", spec.id));
     }
     // An SQL query reads files and web addresses alike, and a database is a file or a server.
-    if DATABASES.contains(&spec.id) && !(m.has(Permission::Files) && m.has(Permission::Network)) {
+    let database = DATABASES.contains(&spec.id) || (spec.id == "cube.open" && super::cube_catalog::opens_zarr(params));
+    if database && !(m.has(Permission::Files) && m.has(Permission::Network)) {
         return Some(format!("{} needs the 'files' and 'network' permissions to run '{}'", m.name, spec.id));
     }
     match reaches(spec, params) {
