@@ -10,9 +10,11 @@ use std::process::{Command, ExitCode};
 const LAYERS: &[(&str, u8)] = &[
     ("geom", 0),
     ("data", 1),
+    ("swat-model", 1),
     ("map", 2),
     ("analysis", 2),
     ("tiles", 2),
+    ("swat-txtinout", 2),
     ("render", 3),
     ("geolibre", 3),
     ("plugins", 3),

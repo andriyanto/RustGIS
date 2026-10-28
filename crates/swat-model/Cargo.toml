@@ -1,0 +1,11 @@
+[package]
+name = "rustgis-swat-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RustGIS L1: a SWAT+ project as its TxtInOut text files, kept losslessly, with token-level edits"
+
+[lints]
+workspace = true
+
+[dependencies]
