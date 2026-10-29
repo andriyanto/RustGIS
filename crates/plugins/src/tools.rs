@@ -183,6 +183,7 @@ fn layer_geojson(inputs: &dyn Inputs, name: &str) -> Result<Value, String> {
         crs: None,
         crs_incomplete: false,
         windowed: false,
+        zm: ds.zm.clone(),
     };
     Ok(rustgis_data::io::to_geojson(&sub))
 }

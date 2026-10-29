@@ -1,6 +1,7 @@
 //! Well-known binary (WKB) geometry: the encoding GeoParquet and GeoPackage store geometry in.
 //!
-//! Reads ISO WKB (2D, Z, M, ZM) and PostGIS extended WKB (Z/M/SRID flags); Z and M are dropped.
+//! Reads ISO WKB (2D, Z, M, ZM) and PostGIS extended WKB (Z/M/SRID flags); [`decode`] drops Z
+//! and M, [`decode_zm`] keeps them beside the geometry, and [`encode_zm`] writes them.
 //! The input is hostile: every count is checked against the bytes left, nesting is bounded and a
 //! malformed geometry is `None`, never a panic.
 
@@ -12,8 +13,87 @@ const MAX_DEPTH: usize = 8;
 
 /// Decodes a WKB geometry. `None` when it is malformed, empty or of an unsupported type.
 pub fn decode(bytes: &[u8]) -> Option<Geometry> {
-    let mut r = Reader { b: bytes, pos: 0 };
+    let mut r = Reader { b: bytes, pos: 0, shadow: false };
     r.geometry(0).flatten()
+}
+
+/// [`decode`], with the geometry's heights and measures, one per vertex in `for_each_coord` order
+/// (`None` when it has neither).
+pub fn decode_zm(bytes: &[u8]) -> Option<(Geometry, Option<crate::VertexZm>)> {
+    let g = decode(bytes)?;
+    if !has_zm(bytes) {
+        return Some((g, None));
+    }
+    // The same reading again, each coordinate as (z, m): the same members and rings are kept,
+    // since what is kept depends on x and y alone.
+    let mut r = Reader { b: bytes, pos: 0, shadow: true };
+    let shadow = r.geometry(0).flatten()?;
+    let (mut z, mut m) = (Vec::new(), Vec::new());
+    shadow.for_each_coord(|c| {
+        z.push(c.x);
+        m.push(c.y);
+    });
+    let zm = crate::VertexZm::from_values(z, m).filter(|zm| zm.fits(g.coord_count()));
+    Some((g, zm))
+}
+
+/// Encodes a geometry as ISO WKB with its heights and measures (Z, M or ZM; a vertex without one
+/// gets NaN), little-endian; without them as [`encode`].
+pub fn encode_zm(g: &Geometry, zm: Option<&crate::VertexZm>) -> Vec<u8> {
+    let Some(zm) = zm.filter(|zm| zm.fits(g.coord_count())) else { return encode(g) };
+    let (z, m) = (zm.z.as_deref(), zm.m.as_deref());
+    let dims = u32::from(z.is_some()) * 1000 + u32::from(m.is_some()) * 2000;
+    let mut out = Vec::with_capacity(wkb_size(g) * 2);
+    let mut k = 0usize;
+    let head = |out: &mut Vec<u8>, ty: u32| {
+        out.push(1);
+        out.extend_from_slice(&(ty + dims).to_le_bytes());
+    };
+    let count = |out: &mut Vec<u8>, n: usize| out.extend_from_slice(&(u32::try_from(n).unwrap_or(u32::MAX)).to_le_bytes());
+    let mut coord = |out: &mut Vec<u8>, c: &Coord| {
+        out.extend_from_slice(&c.x.to_le_bytes());
+        out.extend_from_slice(&c.y.to_le_bytes());
+        for v in [z, m].into_iter().flatten() {
+            out.extend_from_slice(&v.get(k).copied().unwrap_or(f64::NAN).to_le_bytes());
+        }
+        k += 1;
+    };
+    match g {
+        Geometry::Point(c) => {
+            head(&mut out, 1);
+            coord(&mut out, c);
+        }
+        Geometry::MultiPoint(v) => {
+            head(&mut out, 4);
+            count(&mut out, v.len());
+            for c in v {
+                head(&mut out, 1);
+                coord(&mut out, c);
+            }
+        }
+        Geometry::Line(parts) => {
+            head(&mut out, 5);
+            count(&mut out, parts.len());
+            for p in parts {
+                head(&mut out, 2);
+                count(&mut out, p.len());
+                p.iter().for_each(|c| coord(&mut out, c));
+            }
+        }
+        Geometry::Polygon(polys) => {
+            head(&mut out, 6);
+            count(&mut out, polys.len());
+            for rings in polys {
+                head(&mut out, 3);
+                count(&mut out, rings.len());
+                for r in rings {
+                    count(&mut out, r.len());
+                    r.iter().for_each(|c| coord(&mut out, c));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Encodes a geometry as ISO WKB (2D, little-endian).
@@ -122,6 +202,17 @@ fn wkb_size(g: &Geometry) -> usize {
     }
 }
 
+/// A coordinate's (z, m) as a shadow coordinate, NaN for a dimension it doesn't have.
+fn shadow_of(h: Head, v: &[f64; 4]) -> Coord {
+    let z = if h.z { v[2] } else { f64::NAN };
+    let m = match (h.z, h.m) {
+        (true, true) => v[3],
+        (false, true) => v[2],
+        _ => f64::NAN,
+    };
+    Coord::new(z, m)
+}
+
 /// One field of a coordinate chunk; `None` when the chunk is too short.
 #[inline]
 fn f64_at(ch: &[u8], off: usize, little: bool) -> Option<f64> {
@@ -132,6 +223,9 @@ fn f64_at(ch: &[u8], off: usize, little: bool) -> Option<f64> {
 struct Reader<'a> {
     b: &'a [u8],
     pos: usize,
+    /// Read each coordinate as (z, m) instead of (x, y), NaN for a dimension it lacks; what is kept
+    /// or dropped still depends on x and y.
+    shadow: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -139,6 +233,8 @@ struct Head {
     little: bool,
     ty: u32,
     dims: usize,
+    z: bool,
+    m: bool,
 }
 
 impl Reader<'_> {
@@ -184,7 +280,7 @@ impl Reader<'_> {
             _ => return None,
         }
         ty %= 1000;
-        Some(Head { little, ty, dims: 2 + usize::from(z) + usize::from(m) })
+        Some(Head { little, ty, dims: 2 + usize::from(z) + usize::from(m), z, m })
     }
 
     /// A count of items each at least `min_bytes` long, rejected when it can't fit.
@@ -193,13 +289,14 @@ impl Reader<'_> {
         (n.checked_mul(min_bytes)? <= self.left()).then_some(n)
     }
 
-    fn coord(&mut self, h: Head) -> Option<Coord> {
-        let x = self.f64(h.little)?;
-        let y = self.f64(h.little)?;
-        for _ in 2..h.dims {
-            self.f64(h.little)?;
+    /// A coordinate (as `shadow` says), and whether its x and y are finite.
+    fn coord(&mut self, h: Head) -> Option<(Coord, bool)> {
+        let mut v = [0.0_f64; 4];
+        for x in v.iter_mut().take(h.dims) {
+            *x = self.f64(h.little)?;
         }
-        Some(Coord::new(x, y))
+        let xy = Coord::new(v[0], v[1]);
+        Some((if self.shadow { shadow_of(h, &v) } else { xy }, xy.is_finite()))
     }
 
     /// A coordinate sequence, and whether every coordinate is finite. `None` when malformed.
@@ -215,7 +312,15 @@ impl Reader<'_> {
         for ch in run.chunks_exact(stride) {
             let c = Coord::new(f64_at(ch, 0, h.little)?, f64_at(ch, 8, h.little)?);
             finite &= c.is_finite();
-            v.push(c);
+            if self.shadow {
+                let mut a = [0.0_f64; 4];
+                for (i, x) in a.iter_mut().enumerate().take(h.dims) {
+                    *x = f64_at(ch, 8 * i, h.little)?;
+                }
+                v.push(shadow_of(h, &a));
+            } else {
+                v.push(c);
+            }
         }
         Some((v, finite))
     }
@@ -249,9 +354,9 @@ impl Reader<'_> {
         let h = self.head()?;
         match h.ty {
             1 => {
-                let c = self.coord(h)?;
+                let (c, finite) = self.coord(h)?;
                 // An empty point is NaN, NaN.
-                Some(c.is_finite().then_some(Geometry::Point(c)))
+                Some(finite.then_some(Geometry::Point(c)))
             }
             2 => {
                 let (line, finite) = self.coords(h)?;

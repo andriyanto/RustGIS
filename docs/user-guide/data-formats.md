@@ -54,6 +54,26 @@ desktop) are read in place, a view
 at a time, rather than loaded whole: see [Large files](data.md#large-files). They draw, label,
 identify and run through tools like any layer; **Load All Features** loads one to edit it.
 
+### Heights and measures (Z and M)
+
+RustGIS draws and analyses features in two dimensions, but keeps the heights (Z) and measures
+(M) a file gives each vertex beside them, so a survey line, a levee crest or a set of benchmarks
+keeps its elevations through RustGIS and out again.
+
+- **Read:** Shapefiles of the Z and M types (PointZ, MultiPointZ, PolylineZ, PolygonZ and their M
+  forms; M below the format's no-data value is none), small enough to be read whole, and GeoJSON
+  positions with a third number.
+- **Written:** a Shapefile export of a layer with heights is of the Z types (a vertex without a
+  height at 0, as GDAL does), of the M types with measures alone; a GeoJSON export writes the
+  heights as third coordinates. A layer without either is written as before. A project keeps them.
+- **Changing a feature's vertices** (adding or removing one, or a tool that makes new shapes)
+  leaves it without heights rather than give a height to the wrong vertex; moving a vertex keeps
+  them. Heights aren't changed by a change of coordinate system (they are in the file's vertical
+  datum).
+- **Not yet:** GeoPackage, GeoParquet and FlatGeobuf layers, Shapefiles read in place, WKT in CSV,
+  and DXF vertex heights still read in 2D (a DXF entity's `elevation` is a field). Heights aren't
+  shown in the attribute table yet.
+
 ## Formats read through GDAL
 
 With [GDAL](https://gdal.org) installed (its `ogr2ogr` and `ogrinfo` on the `PATH`, GDAL 3.7 or
