@@ -23,7 +23,9 @@ use crate::{CmdResult, CommandSpec as C, Session};
 const WHERE: &str = "Analyze › SWAT+";
 
 /// The most files, and bytes, a project may have: a large basin's weather files are big.
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_FILES: usize = 20_000;
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_BYTES: u64 = 4 << 30;
 /// The most records a reply lists (the statistics cover them all).
 const MAX_LISTED: usize = 500;
