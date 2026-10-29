@@ -252,6 +252,8 @@ pub(crate) fn leak(s: &str) -> &'static str {
 
 /// Commands reserved to the user (see [`user_only`]); plugin management is too.
 const NEVER: &[&str] = &[
+    // Lifting a SWAT+ project's confidential mode lets its values reach the assistant's model.
+    "swat.confidential",
     "gp.installGeolibre",
     "gp.uninstallGeolibre",
     "gp.setGeolibre",
@@ -298,7 +300,7 @@ const NEVER: &[&str] = &[
 ];
 
 /// Commands that write files without naming one in their parameters.
-const WRITES_FILES: &[&str] = &["project.save", "project.saveAs"];
+const WRITES_FILES: &[&str] = &["project.save", "project.saveAs", "swat.save"];
 
 /// Commands that read a file a layer names, not their parameters.
 const READS_FILES: &[&str] = &["gpkg.discardEdits"];

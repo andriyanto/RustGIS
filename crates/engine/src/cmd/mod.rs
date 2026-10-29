@@ -47,6 +47,7 @@ pub mod sharing;
 pub mod sources;
 pub mod sql;
 pub mod stac;
+pub mod swat;
 pub mod tiles;
 pub mod time;
 pub mod view;
@@ -116,6 +117,7 @@ pub fn all() -> Vec<CommandSpec> {
     v.extend(arcgis::commands());
     v.extend(nldi::commands());
     v.extend(time::commands());
+    v.extend(swat::commands());
     v
 }
 

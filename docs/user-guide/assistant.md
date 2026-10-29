@@ -141,6 +141,8 @@ complete instructions do not fit. RustGIS comes with these:
 | `geoprocessing` | Running and chaining tools: buffer, clip, erase, dissolve, select by location, summarize within |
 | `add-data` | Adding files, web addresses, DuckDB SQL queries, STAC catalogs and Overture Maps |
 | `share-web-map` | Sharing the map or a layer as files that work without a server: a web map, a web layer, a style, an image |
+| `swat-model` | A SWAT+ model (TxtInOut folder): its period, objects and files, what is missing, where a parameter is and its values |
+| `swat-edit` | Changing a SWAT+ model's parameters: one value or many by a rule (replace, add, multiply), checked against `cal_parms.cal`, reviewed, reverted and saved |
 
 On the desktop, the settings' **Skills** list shows every skill and where it comes from,
 with a switch to turn each one on or off:
