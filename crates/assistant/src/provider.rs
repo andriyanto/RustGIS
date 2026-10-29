@@ -7,6 +7,7 @@
 //! thread and the browser sends with its `fetch`.
 
 use crate::Error;
+use rustgis_engine::data::secrets::{Secret, SecretError, SecretStore};
 use serde_json::{Map, Value, json};
 
 /// A wire format.
@@ -165,8 +166,9 @@ impl std::fmt::Debug for Config {
 }
 
 impl Config {
-    /// The preset's defaults, with a key and base URL from the environment where set (for a
-    /// sign-in provider, the account signed in on this computer).
+    /// The preset's defaults, with a key and base URL from the environment where set. A sign-in
+    /// provider's account is not read here: its tokens are in the system keychain, which may block
+    /// (`chatgpt::load_any`, then [`Config::sign_in`]).
     pub fn from_env(provider: &str) -> Config {
         let p = preset(provider).unwrap_or(&PRESETS[0]);
         let env = |name: &str| std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
@@ -176,7 +178,7 @@ impl Config {
         if p.id == "ollama" && !base_url.trim_end_matches('/').ends_with("/v1") {
             base_url = format!("{}/v1", base_url.trim_end_matches('/'));
         }
-        let cfg = Config {
+        Config {
             provider: p.id.to_string(),
             base_url,
             model: p.model.to_string(),
@@ -189,26 +191,13 @@ impl Config {
                 .and_then(|s| s.parse().ok())
                 .filter(|n| *n > 0)
                 .unwrap_or(crate::tools::DEFAULT_OUTPUT_TOKENS),
-        };
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let mut cfg = cfg;
-            if p.login
-                && let Some(t) = crate::chatgpt::load_any()
-            {
-                cfg.sign_in(&t);
-            }
-            cfg
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            cfg
         }
     }
 
-    /// Uses a signed-in account's access token.
+    /// Uses a signed-in account. The key only says that it is signed in, never a token:
+    /// `chatgpt::send` puts the current access token on each request.
     pub fn sign_in(&mut self, c: &crate::chatgpt::Credentials) {
-        self.key = if c.plan_allowed() { c.access_token.clone() } else { String::new() };
+        self.key = if c.plan_allowed() && c.signed_in() { crate::chatgpt::SIGNED_IN.to_string() } else { String::new() };
         self.client_id = c.client_id.clone();
         self.account = c.subject.clone();
         self.session = c.session.clone();
@@ -248,6 +237,69 @@ impl Config {
     fn base(&self) -> &str {
         self.base_url.trim().trim_end_matches('/')
     }
+}
+
+/// The desktop preference naming the provider it uses (`prefs.json`).
+pub const PROVIDER_PREF: &str = "assistant_provider";
+
+/// The desktop preference that is "on" when it keeps API keys in the system keychain.
+pub const REMEMBER_KEY_PREF: &str = "assistant_remember_key";
+
+/// The desktop preference holding a provider's address, when it isn't the default.
+pub fn url_pref(provider: &str) -> String {
+    format!("assistant_url_{provider}")
+}
+
+/// The value [`REMEMBER_KEY_PREF`] is saved with.
+pub fn remember_key_value(on: bool) -> &'static str {
+    if on { "on" } else { "off" }
+}
+
+/// Whether a saved [`REMEMBER_KEY_PREF`] value asks to keep keys in the keychain.
+pub fn remembers_keys(value: Option<&str>) -> bool {
+    value == Some("on")
+}
+
+/// The provider the desktop app chose (its [`PROVIDER_PREF`]), when it is one that exists.
+pub fn saved_provider(prefs: &Map<String, Value>) -> Option<&'static str> {
+    prefs.get(PROVIDER_PREF).and_then(Value::as_str).and_then(preset).map(|p| p.id)
+}
+
+/// The first key-using provider whose API key `config` finds (the environment's, for
+/// `Config::from_env`). A sign-in is chosen, not assumed.
+pub fn first_keyed(config: impl Fn(&str) -> Config) -> Option<&'static str> {
+    PRESETS.iter().find(|p| !p.login && !config(p.id).key.is_empty()).map(|p| p.id)
+}
+
+/// The provider a command-line run uses: the explicit choice, then the environment's choice, then
+/// the first provider with an environment key, then (only when `saved` has the desktop's
+/// preferences) the one the desktop app uses, else `ollama`. Environment credentials win over the
+/// desktop's saved choice, as every environment setting wins over a saved one.
+pub fn choose(explicit: Option<&str>, environment: Option<&str>, keyed: Option<&str>, saved: Option<&Map<String, Value>>) -> String {
+    explicit.or(environment).or(keyed).or_else(|| saved.and_then(saved_provider)).unwrap_or("ollama").to_string()
+}
+
+/// The keychain account of a provider's API key (the desktop's Remember).
+pub fn key_account(provider: &str) -> String {
+    format!("assistant/{provider}")
+}
+
+/// Reads the desktop's remembered API key only for its provider and address, when no key was
+/// supplied by the environment. Sign-in providers never use API-key accounts.
+pub fn saved_key(cfg: &Config, prefs: &Map<String, Value>, store: &dyn SecretStore) -> Result<Option<Secret>, SecretError> {
+    if cfg.login() || !cfg.key.is_empty() || !remembers_keys(prefs.get(REMEMBER_KEY_PREF).and_then(Value::as_str)) {
+        return Ok(None);
+    }
+    let desktop = prefs
+        .get(&url_pref(&cfg.provider))
+        .and_then(Value::as_str)
+        .filter(|url| !url.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| Config::from_env(&cfg.provider).base_url);
+    if desktop.trim().trim_end_matches('/') != cfg.base_url.trim().trim_end_matches('/') {
+        return Ok(None);
+    }
+    store.load(&key_account(&cfg.provider)).map(|key| key.filter(|key| !key.expose().trim().is_empty()))
 }
 
 /// An HTTP request to make.

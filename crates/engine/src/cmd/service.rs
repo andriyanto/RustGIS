@@ -1,6 +1,7 @@
 //! Web map and feature services: connect to a WMS, WMTS, WFS, WCS, OGC API Features or ArcGIS
 //! REST service, list what it offers (from its capabilities), and add a layer — map layers as
-//! tile layers, feature types and collections as data downloaded as GeoJSON, coverages as rasters
+//! tile layers, feature types and collections as data downloaded as GeoJSON (the whole layer, or
+//! the features crossing an area), coverages as rasters
 //! (a GeoTIFF of the view from GetCoverage). And search a catalogue (CSW) for records and the
 //! services and files they link to.
 //!
@@ -8,7 +9,7 @@
 //! here as `"text"`; the command line, MCP and the desktop assistant let these commands fetch
 //! (waiting for the answer).
 
-use rustgis_data::ogc::{Coverage, Offer, Service};
+use rustgis_data::ogc::{Coverage, Offer, Service, SliderSteps};
 use serde_json::{Value, json};
 
 use super::ps;
@@ -26,7 +27,7 @@ pub fn commands() -> Vec<C> {
             r#"{"url": "a WMS, WMTS or WFS address (GetCapabilities is added), an OGC API collections address or landing page (its map tiles and linked collections), or an ArcGIS FeatureServer, MapServer, ImageServer or VectorTileServer, or an ArcGIS services directory or folder (its folders and services, each listed by its own url)", "type"?: "wms"|"wmts"|"wfs"|"ogcapi"|"arcgis" (guessed from the address), "text"?: "the capabilities document, when already fetched", "documents"?: [{"url": "a discovered document address", "text": "its fetched JSON"}]} → layers with source_url, and next when supplied documents need another fetch"#,
         ),
         C::new("service.add", "Add Service Layer", "Home › Add", add).params(
-            r#"{"url": "as service.layers", "type"?, "layer": "the layer's name (service.layers lists them)", "name"?: text, "time"?: "a time-enabled WMTS layer's date (2024-06-01; its default otherwise)", "text"?: "the capabilities document, when already fetched", "documents"?: "additional fetched documents, as service.layers", "source_url"?: "the listed layer's source_url", "describe"?: "a WCS coverage's DescribeCoverage document, when already fetched", "tiles"?: "an OGC API layer's tile template, when already read from its tileset (the app's)", "bbox"?: [west, south, east, north] | "view" (the default) | "full" (a WCS coverage's area)}"#,
+            r#"{"url": "as service.layers", "type"?, "layer": "the layer's name (service.layers lists them)", "name"?: text, "time"?: "a time-enabled WMS or WMTS layer: by default (or \"slider\", true) it follows the time slider, turned on with the layer's times when it is off; or one of its dates (2024-06-01), or \"default\" (false): its service's default", "text"?: "the capabilities document, when already fetched", "documents"?: "additional fetched documents, as service.layers", "source_url"?: "the listed layer's source_url", "describe"?: "a WCS coverage's DescribeCoverage document, when already fetched", "tiles"?: "an OGC API layer's tile template, when already read from its tileset (the app's)", "bbox"?: [west, south, east, north] | "view" | "full": a WCS coverage's area (the view by default); for a WFS, OGC API or ArcGIS feature layer, only the features that cross it (the whole layer, "full", by default)}"#,
         ),
         C::new("service.coverage", "WCS Coverage Request", "Home › Add", coverage).view().params(
             r#"{"url": "a WCS address", "type"?: "wcs", "layer": "the coverage's name", "text"?: "the capabilities document, when already fetched", "documents"?: "additional fetched documents, as service.layers", "source_url"?: "the listed coverage's source_url", "describe"?: "its DescribeCoverage answer, when already fetched", "bbox"?: [west, south, east, north] | "view" (the default) | "full"} → the GetCoverage address of a GeoTIFF (layer.addUrl adds it)"#,
@@ -46,6 +47,35 @@ fn url_of(p: &Value) -> Result<&str, String> {
         return Err(format!("{url}: a service is given by its http:// or https:// address"));
     }
     Ok(url)
+}
+
+/// `p` with its ArcGIS service address's `?token=…` taken out and kept for the session (it then
+/// goes, as the request's credential, to every request to that server: the service's layers, tiles and feature
+/// pages), so the address the layer keeps has no token in it. `None` when there is none.
+pub(crate) fn without_token(p: &Value) -> Result<Option<Value>, String> {
+    use crate::render::rustgis_tiles::arcgis_auth;
+    let Some(url) = ps(p, "url").map(str::trim) else { return Ok(None) };
+    let has_token = url
+        .split_once('?')
+        .is_some_and(|(_, q)| q.split('&').any(|kv| kv.split('=').next().is_some_and(|k| k.eq_ignore_ascii_case("token"))));
+    // ArcGIS REST addresses only: another kind of service's `token` stays in its address.
+    let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
+    let arcgis = match ps(p, "type") {
+        Some("arcgis") => true,
+        None | Some("auto") => path.contains("/rest/services") || path.contains("/sharing/rest"),
+        Some(_) => false,
+    };
+    if !has_token || !arcgis || arcgis_auth::server_root(url).is_none() {
+        return Ok(None);
+    }
+    let before = arcgis_auth::authorization(url);
+    let mut owned = p.clone();
+    owned["url"] = json!(arcgis_auth::adopt_url_token(url)?);
+    // What was cached unauthorized (refused tiles) is asked for again with the new token.
+    if arcgis_auth::authorization(url) != before {
+        crate::render::rustgis_tiles::cache::clear();
+    }
+    Ok(Some(owned))
 }
 
 /// Capability discovery is shared by supplied-document GUI requests and native commands.
@@ -158,7 +188,7 @@ fn capabilities(p: &Value) -> Result<Discovery, String> {
 
 #[cfg(target_arch = "wasm32")]
 fn fetch_capabilities(url: &str, _caps: &str) -> Result<Service, String> {
-    Err(format!("{url}: in the web app, use Home › Add Data › From Service"))
+    Err(format!("{url}: in the web app, use Home › Add › Add Data › From Service"))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -196,30 +226,36 @@ pub fn features_answer(s: &mut Session, name: &str, bytes: Vec<u8>) -> Vec<u8> {
     rustgis_data::ogc::fix_axes(&bytes).unwrap_or(bytes)
 }
 
-/// A service's features at `url`, with the pages its `next` links lead to: at most `max` bytes
-/// and [`BLOCKING_TIMEOUT`](crate::render::rustgis_tiles::cache::BLOCKING_TIMEOUT) in all. A
-/// `next` link is fetched only where its page may point.
+/// A service's features at `url`, with the pages that follow (its `next` links, or an ArcGIS
+/// layer's pages past its record limit, see [`read_pages`](rustgis_data::ogc::read_pages)): at
+/// most `max` bytes and [`BLOCKING_TIMEOUT`](crate::render::rustgis_tiles::cache::BLOCKING_TIMEOUT)
+/// in all. A page is fetched only where the page before it may point.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn download_features(s: &mut Session, name: &str, url: &str, max: usize) -> Result<Vec<u8>, String> {
     use crate::render::rustgis_tiles::{address, cache};
     let until = std::time::Instant::now() + cache::BLOCKING_TIMEOUT;
     let first = cache::download_blocking_limited(url, max).map_err(|e| format!("{url}: {e}"))?;
     let mut left = max.saturating_sub(first.len());
-    let mut from = url.to_string();
-    let (bytes, note) = rustgis_data::ogc::join_pages(url, first, rustgis_data::ogc::MAX_PAGED_FEATURES, |next| {
-        address::check(next, Some(&from))?;
-        let wait = until.saturating_duration_since(std::time::Instant::now());
-        if wait.is_zero() {
-            return Err("the pages took too long".into());
-        }
-        let page = cache::download_blocking_within(next, left, wait)?;
-        if page.len() > left {
-            return Err("the pages are larger than RustGIS downloads".into());
-        }
-        left -= page.len();
-        from = next.to_string();
-        Ok(page)
-    });
+    let mut step = rustgis_data::ogc::read_pages(url, first, rustgis_data::ogc::MAX_PAGED_FEATURES);
+    let (bytes, note) = loop {
+        let pages = match step {
+            rustgis_data::ogc::Step::Done(bytes, note) => break (bytes, note),
+            rustgis_data::ogc::Step::Fetch(pages) => pages,
+        };
+        let answer = address::check(pages.next_url(), Some(pages.referrer())).and_then(|()| {
+            let wait = until.saturating_duration_since(std::time::Instant::now());
+            if wait.is_zero() {
+                return Err("the pages took too long".to_string());
+            }
+            let page = cache::download_blocking_within(pages.next_url(), left, wait)?;
+            if page.len() > left {
+                return Err("the pages are larger than RustGIS downloads".into());
+            }
+            left -= page.len();
+            Ok(page)
+        });
+        step = (*pages).land(answer);
+    };
     if let Some(note) = note {
         s.notify(format!("{name}: {note}"), false);
     }
@@ -260,6 +296,9 @@ fn advertised_template(_: &str, _: bool) -> Option<String> {
     None
 }
 
+/// Of a layer's times, those `service.layers` lists from each end of a long list.
+const SHOWN_TIMES: usize = 12;
+
 /// A service as the app and other callers see it.
 pub fn service_json(svc: &Service) -> Value {
     let layers: Vec<Value> = svc
@@ -276,7 +315,12 @@ pub fn service_json(svc: &Service) -> Value {
             };
             let mut layer = json!({"name": l.name, "title": l.title, "bbox": l.bbox, "offer": offer, "tilesets": l.tilesets});
             if let Some(t) = &l.time {
-                layer["time"] = json!({"default": t.default, "values": t.values});
+                // The first and last few of a long list, and how many (the slider takes them all).
+                let values: Vec<&String> = match t.values.len() {
+                    n if n > 2 * SHOWN_TIMES => t.values.iter().take(SHOWN_TIMES).chain(t.values.iter().skip(n - SHOWN_TIMES)).collect(),
+                    _ => t.values.iter().collect(),
+                };
+                layer["time"] = json!({"default": t.default, "values": values, "count": t.values.len(), "multiple": t.multiple});
             }
             layer
         })
@@ -285,6 +329,8 @@ pub fn service_json(svc: &Service) -> Value {
 }
 
 pub(crate) fn layers(_s: &mut Session, p: &Value) -> CmdResult {
+    let owned = without_token(p)?;
+    let p = owned.as_ref().unwrap_or(p);
     let found = capabilities(p)?;
     let mut out = service_json(&found.service);
     if let Some(layers) = out.get_mut("layers").and_then(Value::as_array_mut) {
@@ -301,6 +347,8 @@ pub(crate) fn layers(_s: &mut Session, p: &Value) -> CmdResult {
 /// Adds one of a service's layers: map layers as tiles (an overlay), a style as a style, features
 /// downloaded.
 pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
+    let owned = without_token(p)?;
+    let p = owned.as_ref().unwrap_or(p);
     let url = url_of(p)?.to_string();
     let want = ps(p, "layer").map(str::trim).filter(|l| !l.is_empty()).ok_or("layer is required")?;
     let found = capabilities(p)?;
@@ -310,10 +358,39 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
         .find(|(l, _)| l.name == want)
         .or_else(|| candidates().find(|(l, _)| l.name.eq_ignore_ascii_case(want) || l.title.eq_ignore_ascii_case(want)))
         .ok_or_else(|| format!("{url}: no layer '{want}' (service.layers lists them)"))?;
-    // A time-enabled layer at the time asked for (its default otherwise), named with it.
-    let asked = ps(p, "time").map(str::trim).filter(|t| !t.is_empty());
+    // A time-enabled layer follows the time slider, at each of its steps, unless a time is asked
+    // for: one of its times (the layer named with it), or "default" (`false`), the service's.
+    // (`"time": true`, the slider, as for a Zarr variable, `layer.addZarr`'s.)
+    // A year given as a number is that time; an empty one, as before, the service's default.
+    let given: Option<String> = match p.get("time") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(true)) => Some("slider".into()),
+        Some(Value::Bool(false)) => Some("default".into()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        Some(Value::String(t)) if t.trim().is_empty() => Some("default".into()),
+        Some(Value::String(t)) => Some(t.trim().to_string()),
+        Some(_) => return Err(format!("{}: time is a date, \"slider\" or \"default\"", layer.title)),
+    };
+    let asked = given.as_deref();
+    let pinned = asked.is_some_and(|a| a.eq_ignore_ascii_case("default"));
+    let slider = match (&layer.time, asked) {
+        (Some(t), Some(a)) if a.eq_ignore_ascii_case("slider") => Some(
+            t.slider()
+                .ok_or_else(|| format!("{}: its times aren't dates the time slider can step to (give one of them as time)", layer.title))?,
+        ),
+        (None, Some(a)) if a.eq_ignore_ascii_case("slider") => {
+            return Err(format!("{}: the layer has no time to follow the time slider with", layer.title));
+        }
+        // None asked: on the slider when its times are dates it steps to, at its default if not.
+        (Some(t), None) => t.slider(),
+        _ => None,
+    };
+    let asked = asked.filter(|_| slider.is_none() && !pinned);
     let time = match (&layer.time, asked) {
+        // A WMS layer's: a list of times or an interval when it takes several (WMS 1.3.0 Annex C).
+        (Some(l), Some(t)) if l.multiple => Some(rustgis_data::ogc::checked_wms_time(t)?),
         (Some(_), Some(t)) => Some(rustgis_data::ogc::checked_time(t)?),
+        (Some(_), None) if slider.is_some() => None,
         (Some(t), None) => Some(t.default.clone()),
         (None, Some(_)) => return Err(format!("{}: the layer has no time to pick (leave time out)", layer.title)),
         (None, None) => None,
@@ -338,11 +415,58 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
     match &layer.offer {
         Offer::Tiles { template } => {
             let template = advertised.as_deref().unwrap_or(template);
-            let template = match &time {
-                Some(t) => template.replace("{Time}", t),
-                None => template.to_string(),
+            let template = match (&time, &slider) {
+                // Its time written as the layer writes its times, filled at each step.
+                (_, Some(st)) => template.replace("{Time}", &format!("{{date:{}}}", st.format)),
+                (Some(t), None) => rustgis_data::ogc::with_time(template, t),
+                (None, None) => template.to_string(),
             };
-            let r = super::tiles::add(s, &json!({"url": template, "kind": "raster", "name": name, "overlay": true, "bounds": layer.bbox}))?;
+            // With its legends, as its service gives them (none: no key, as before).
+            let mut add = json!({"url": template, "kind": "raster", "name": name, "overlay": true, "bounds": layer.bbox});
+            // The time slider, when it is off, turned on with the layer's steps (one that is on
+            // keeps its own); it starts at the layer's default.
+            let fresh = s.map().time.is_none();
+            if let Some(st) = slider.as_ref().filter(|_| fresh) {
+                match &st.steps {
+                    SliderSteps::Dates(dates) => add["dates"] = json!(dates),
+                    SliderSteps::Every { start, end, unit, interval } => {
+                        add["start"] = json!(start);
+                        add["end"] = json!(end);
+                        add["unit"] = json!(unit.code());
+                        add["interval"] = json!(interval);
+                    }
+                }
+            }
+            // (Those the layer wouldn't keep, an address too long, are left out, not refused.)
+            let legends = rustgis_map::tiles::checked_legends(layer.legends.iter().cloned());
+            if !legends.is_empty() {
+                add["legend"] = json!(legends);
+            }
+            let mut r = super::tiles::add(s, &add)?;
+            // A WMS layer's GetFeatureInfo request, for identify.
+            let added = r["index"].as_u64().and_then(|i| usize::try_from(i).ok());
+            if let Some(t) = added.and_then(|i| s.map_mut().tiles.get_mut(i)) {
+                t.feature_info = layer.feature_info.clone();
+            }
+            if let Some(at) = slider.as_ref().filter(|_| fresh).and_then(|st| st.at) {
+                super::time::set(s, &json!({"date": at}))?;
+                // Its address at the step the slider went to.
+                if let Some(t) = added.and_then(|i| s.map().tiles.get(i)) {
+                    r["url"] = json!(t.url);
+                }
+            }
+            // A slider already on keeps its steps: the service may have no map for some of them.
+            let current = s.map().time.as_ref().map(|t| t.current);
+            if let (Some(st), Some(now), false) = (&slider, current, fresh)
+                && !st.has(now)
+            {
+                s.notify(
+                    format!(
+                        "{name}: follows the time slider's steps, and its service lists other times, so it may draw nothing at some of them"
+                    ),
+                    false,
+                );
+            }
             zoom(s);
             Ok(r)
         }
@@ -368,7 +492,7 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
             #[cfg(target_arch = "wasm32")]
             {
                 let _ = get;
-                Err(format!("{url}: in the web app, Home › Add Data › From Service downloads the coverage"))
+                Err(format!("{url}: in the web app, Home › Add › Add Data › From Service downloads the coverage"))
             }
             #[cfg(not(target_arch = "wasm32"))]
             {
@@ -378,21 +502,61 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
             }
         }
         Offer::Features { url: items } => {
+            let area = features_area(s, p)?;
+            let asked = area.and_then(|a| rustgis_data::ogc::features_in_area(items, a));
             #[cfg(target_arch = "wasm32")]
             {
-                let _ = items;
-                Err(format!("{url}: in the web app, Home › Add Data › From Service downloads the features"))
+                let _ = (items, asked);
+                Err(format!("{url}: in the web app, Home › Add › Add Data › From Service downloads the features"))
             }
             #[cfg(not(target_arch = "wasm32"))]
             {
+                // An area asked for, whether or not the request could carry it: a slow whole layer
+                // then says so, and doesn't suggest the `bbox` already given.
+                let given = p.get("bbox").is_some_and(|b| !b.is_null() && *b != "full");
+                if given && asked.is_none() {
+                    let why = if area.is_none() { "an area across the antimeridian" } else { "its request can't carry an area" };
+                    s.notify(format!("{name}: {why}, so the whole layer is asked for"), false);
+                }
                 let max = crate::render::rustgis_tiles::cache::MAX_DOWNLOAD;
-                let bytes = download_features(s, &name, items, max)?;
+                let bytes = download_features(s, &name, asked.as_deref().unwrap_or(items), max).map_err(|e| slow_whole_layer(e, given))?;
                 let bytes = features_answer(s, &name, bytes);
-                let r = super::raster::add_named_bytes(s, &json!({"name": name}), format!("{name}.geojson"), bytes)?;
-                zoom(s);
+                let mut r = super::raster::add_named_bytes(s, &json!({"name": name}), format!("{name}.geojson"), bytes)?;
+                // Over an area, the features crossing it: the view stays, or goes to a box given
+                // (the whole layer's bounds would show a country to fill one state).
+                match (asked.is_some(), area, p.get("bbox")) {
+                    (true, Some([w, so, e, n]), Some(Value::Array(_))) => s.zoom_to(&rustgis_geom::Extent::new(w, so, e, n)),
+                    (true, ..) => {}
+                    _ => zoom(s),
+                }
+                if let (Some(_), Some(out)) = (&asked, r.as_object_mut()) {
+                    out.insert("area".into(), json!(area));
+                }
                 Ok(r)
             }
         }
+    }
+}
+
+/// The area a service's features are asked for over: a `bbox` given (`[west, south, east,
+/// north]`, or `"view"`, the map's), else none, for the whole layer (`"full"` says so). A box
+/// across the antimeridian asks for the whole layer too, as `catalog.search` does.
+fn features_area(s: &Session, p: &Value) -> Result<Option<[f64; 4]>, String> {
+    match p.get("bbox") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(f)) if f == "full" => Ok(None),
+        Some(_) => Ok(Some(super::catalogs::area(s, p)?).filter(|a| a[0] <= a[2])),
+    }
+}
+
+/// A whole layer too slow to download while a command waits: the error says an area can be asked
+/// for instead, unless one was (`area_given`).
+#[cfg(not(target_arch = "wasm32"))]
+fn slow_whole_layer(e: String, area_given: bool) -> String {
+    if !area_given && (e.contains("timeout") || e.contains("timed out")) {
+        format!("{e}; or ask for the features in an area only, with \"bbox\": [west, south, east, north] or \"view\"")
+    } else {
+        e
     }
 }
 
@@ -482,7 +646,7 @@ pub(crate) fn coverage_check(name: &str, bytes: &[u8]) -> Result<(), String> {
 
 /// `catalog.search`: a page of a catalogue's (CSW) records matching words and an area, with the
 /// links RustGIS can follow (those pointing where a document on the web may not send it left out).
-fn catalog_search(s: &mut Session, p: &Value) -> CmdResult {
+pub(super) fn catalog_search(s: &mut Session, p: &Value) -> CmdResult {
     let url = url_of(p)?;
     let request = records_request(s, p)?;
     let page = match ps(p, "text") {
@@ -523,5 +687,18 @@ fn fetch_records(url: &str, request: &str) -> Result<rustgis_data::ogc::RecordPa
 
 #[cfg(target_arch = "wasm32")]
 fn fetch_records(url: &str, _: &str) -> Result<rustgis_data::ogc::RecordPage, String> {
-    Err(format!("{url}: in the web app, use Home › Add Data › From Service › Search Catalogue"))
+    Err(format!("{url}: in the web app, use Home › Add › Add Data › From Service › Search Catalogue"))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    /// A whole layer past the wait is pointed to `bbox`, unless a `bbox` was given (one the request
+    /// couldn't carry, a WFS 1.0's or across the antimeridian); other errors are left as they are.
+    #[test]
+    fn a_slow_whole_layer_suggests_bbox_only_when_none_was_given() {
+        let slow = "https://x.org/wfs: timed out reading the answer".to_string();
+        assert!(super::slow_whole_layer(slow.clone(), false).ends_with("with \"bbox\": [west, south, east, north] or \"view\""));
+        assert_eq!(super::slow_whole_layer(slow.clone(), true), slow);
+        assert_eq!(super::slow_whole_layer("404 Not Found".into(), false), "404 Not Found");
+    }
 }

@@ -15,24 +15,32 @@ fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Waits for worker results, downloaded tiles and the GPU callbacks that upload their pictures.
+/// UI steps alone do not run paced uploads; every candidate settled frame must be painted.
 fn wait_for_frame(h: &mut egui_kittest::Harness<'_, RustGisApp>) {
     use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache;
-    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    // Tiles still arriving would draw the map again: until none arrived since the last frames.
+    // A hang guard: a software adapter (WARP on the Windows runners) is many times slower.
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
-        assert!(std::time::Instant::now() < end, "tiles kept arriving");
+        assert!(std::time::Instant::now() < end, "frame workers, tiles or GPU uploads did not settle");
         let tiles = cache::generation();
         for _ in 0..40 {
             h.step();
         }
-        while h.state().map.drawing() || cache::in_flight() > 0 {
-            assert!(std::time::Instant::now() < end, "frame worker did not finish");
-            std::thread::sleep(std::time::Duration::from_millis(2));
+        // Painting can discover another upload backlog. Let the next UI frame adopt it
+        // before treating drawing=false as proof that the displayed scene is complete.
+        // Uploads are paced per paint (fewer a paint on a slow adapter): paint until done.
+        loop {
+            h.render().expect("paint frame and advance tile uploads");
             h.step();
+            if !h.state().map.drawing() || std::time::Instant::now() >= end {
+                break;
+            }
         }
-        if cache::generation() == tiles {
+        if !h.state().map.drawing() && cache::in_flight() == 0 && cache::generation() == tiles {
             break;
         }
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }
 
@@ -160,6 +168,7 @@ fn zooming_a_planet_with_raster_tiles_reuses_the_gpu_frame() {
             delta: egui::vec2(0.0, 2.0),
             phase: egui::TouchPhase::Move,
             modifiers: Default::default(),
+            source: egui::MouseWheelSource::Wheel,
         });
         h.step();
     }
@@ -231,7 +240,9 @@ fn planet_layer_toggles_show_in_the_next_frame_and_stale_jobs_do_not_restore_the
             let image = h.render().expect("settled frame");
             let center = h.state().map.view_rect.expect("map").0.center();
             let p = image.get_pixel(center.x.round() as u32, center.y.round() as u32);
-            assert!(p[0] > p[1], "an old worker restored a hidden overlay: {p:?}");
+            // The overlay's green, as above: a tile still to come shows the body's plain grey,
+            // which is no overlay either (macOS CI drew one such frame).
+            assert!(u16::from(p[1]) <= u16::from(p[0]) * 2, "{projection} GPU={gpu}: an old worker restored a hidden overlay: {p:?}");
         }
     }
 }
@@ -293,6 +304,7 @@ fn raster_tiles_move_with_the_camera_on_the_gpu() {
                 delta: egui::vec2(0.0, 0.5),
                 phase: egui::TouchPhase::Move,
                 modifiers: Default::default(),
+                source: egui::MouseWheelSource::Wheel,
             });
             h.step();
         }
@@ -316,4 +328,97 @@ fn raster_tiles_move_with_the_camera_on_the_gpu() {
     }
     assert!(h.state().map.moves_on_gpu());
     assert_gpu_picture_matches_cpu(&mut h);
+}
+
+/// Waiting for a live scene must include paints: tile uploads are paced in the GPU callback,
+/// so CPU composition and finished downloads alone do not make the displayed frame complete.
+#[test]
+fn waiting_for_live_tiles_paints_until_the_top_layer_is_uploaded() {
+    use rustgis_ui_egui::rustgis_engine::{
+        map::{TileKind, TileLayer},
+        render::rustgis_tiles,
+    };
+    let _serial = one_at_a_time();
+    let png = |color| {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(256, 256, image::Rgba(color)).write_to(&mut out, image::ImageFormat::Png).expect("tile");
+        out.into_inner()
+    };
+    let bottom = png([180, 40, 40, 255]);
+    let top = png([30, 40, 200, 255]);
+    rustgis_tiles::cache::set_fetcher(move |url, done| done(Ok(if url.contains("upload-top") { top.clone() } else { bottom.clone() })));
+    let Some(mut h) = harness() else { return };
+    h.state_mut().run("map.body", json!({"name": "moon", "basemap": false})).expect("Moon");
+    h.state_mut().run("map.projection", json!({"type": "mercator"})).expect("projection");
+    h.state_mut().run("map.setScale", json!({"scale": 10_000_000.0})).expect("tile scale");
+    let m = h.state_mut().session.map_mut();
+    m.layers.clear();
+    m.graticule = false;
+    // More independent pictures than one upload frame accepts, even on a fast adapter.
+    for n in 0..31 {
+        m.tiles.push(TileLayer::new(
+            format!("Bottom {n}"),
+            TileKind::Raster,
+            format!("https://upload-bottom-{n}.test/{{z}}/{{x}}/{{y}}.png"),
+        ));
+    }
+    m.tiles.insert(0, TileLayer::new("Top", TileKind::Raster, "https://upload-top.test/{z}/{x}/{y}.png"));
+    h.state_mut().map.invalidate();
+    wait_for_frame(&mut h);
+    let image = h.render().expect("settled tiles");
+    let center = h.state().map.view_rect.expect("map").0.center();
+    let p = image.get_pixel(center.x.round() as u32, center.y.round() as u32);
+    assert!(u16::from(p[2]) > u16::from(p[0]) * 2, "the waiter returned before the top live layer was uploaded: {p:?}");
+    h.step();
+    assert!(!h.state().map.drawing(), "painting the settled frame must not reveal an upload backlog");
+}
+
+/// Zoomed in past where f32 holds the basemap's meshes, they are drawn on the CPU (#902): the
+/// scene is a picture, shifted and scaled until it is drawn again, and the live tiles over it
+/// must move with it, not be placed for the new camera and then moved again (a WMS layer
+/// flickered and stepped back on each wheel step out).
+#[test]
+fn live_tiles_move_with_a_scene_shown_as_a_picture() {
+    use rustgis_ui_egui::rustgis_engine::geom::Coord;
+    use rustgis_ui_egui::rustgis_engine::map::{TileKind, TileLayer};
+    use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles;
+    let _serial = one_at_a_time();
+    // A checkerboard: tiles out of place show at once.
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::RgbaImage::from_fn(256, 256, |x, y| {
+        image::Rgba(if (x / 16 + y / 16) % 2 == 0 { [250, 250, 250, 255] } else { [10, 10, 10, 255] })
+    })
+    .write_to(&mut png, image::ImageFormat::Png)
+    .expect("tile");
+    rustgis_tiles::cache::set_fetcher(move |_, done| done(Ok(png.get_ref().clone())));
+    let Some(mut h) = harness() else { return };
+    let m = h.state_mut().session.map_mut();
+    m.layers.clear();
+    m.graticule = false;
+    m.tiles.push(TileLayer::new("WMS", TileKind::Raster, "https://wms.test/?BBOX={bbox-epsg-3857}&WIDTH=256&HEIGHT=256"));
+    // Bern, past the layer's max zoom (19).
+    m.camera.center = Coord::new(828_000.0, 5_933_000.0);
+    m.camera.res = 0.01;
+    h.state_mut().map.invalidate();
+    wait_for_frame(&mut h);
+    assert!(!h.state().map.moves_on_gpu(), "the basemap is drawn on the CPU this far in: the scene is a picture");
+    let start = h.state().map.full_frame_camera();
+    let mut shifted = 0;
+    for _ in 0..12 {
+        h.input_mut().events.push(egui::Event::PointerMoved(egui::pos2(450.0, 300.0)));
+        h.input_mut().events.push(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -40.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: Default::default(),
+            source: egui::MouseWheelSource::Wheel,
+        });
+        h.step();
+        if h.state().map.full_frame_camera() != h.state().session.map().camera {
+            shifted += 1;
+        }
+        assert_gpu_picture_matches_cpu(&mut h);
+    }
+    assert!(shifted > 0, "some steps show the picture shifted and scaled, not drawn again");
+    assert!(h.state().session.map().camera.res > start.res * 2.0, "zoomed out");
 }

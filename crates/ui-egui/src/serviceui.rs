@@ -1,7 +1,8 @@
 //! Background group import/refresh for both desktop and browser. Discovery and updates live in
 //! engine commands; this state machine only supplies their downloaded documents.
 
-use crate::{RustGisApp, Slot, fetch_into, fetch_into_limited};
+use crate::{RustGisApp, Slot, fetch_into, fetch_into_limited, i18n};
+use rustgis_engine::data::ogc::{self, Pages, Step};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 
@@ -18,6 +19,110 @@ pub struct Import {
     remaining: VecDeque<String>,
     responses: Vec<Value>,
     bytes: usize,
+}
+
+/// A service whose layers are listed: its address, type, capabilities document and the further
+/// documents its discovery read. `service.add` reads layers from them without fetching again.
+pub struct ServiceSource {
+    pub url: String,
+    /// `wms`, `wmts`, `wfs`, `wcs`, `ogcapi`, `arcgis`, or `auto`.
+    pub kind: &'static str,
+    pub text: String,
+    pub documents: Vec<Value>,
+}
+
+/// A service type as the add dialog and `ui.addService` name it, `auto` for any other text.
+pub(crate) fn kind_of(t: &str) -> &'static str {
+    match t {
+        "wms" => "wms",
+        "wmts" => "wmts",
+        "wfs" => "wfs",
+        "wcs" => "wcs",
+        "ogcapi" => "ogcapi",
+        "arcgis" => "arcgis",
+        _ => "auto",
+    }
+}
+
+/// Adds one of a service's layers (as `service.layers` lists it): features are downloaded in the
+/// background as From URL… does, map layers are added now, and an OGC API layer or a WCS coverage
+/// waits on a document (a step the app moves along). A feature layer is asked only for the
+/// features crossing `area` (longitude/latitude) when given, whole otherwise. `dialog` tells where
+/// the result is reported.
+pub(crate) fn add_layer(
+    app: &mut RustGisApp,
+    src: &ServiceSource,
+    l: &Value,
+    time: &str,
+    area: Option<[f64; 4]>,
+    dialog: bool,
+) -> Result<&'static str, String> {
+    add_layer_from(app, src, l, time, area, dialog, None)
+}
+
+/// [`add_layer`] for a layer of the connection named `origin` (the Connections tree): once the
+/// layer is added, now or when its document or download lands, Recent shows its source under that
+/// name. An add that fails or is dropped is not renamed.
+pub(crate) fn add_layer_from(
+    app: &mut RustGisApp,
+    src: &ServiceSource,
+    l: &Value,
+    time: &str,
+    area: Option<[f64; 4]>,
+    dialog: bool,
+    origin: Option<&str>,
+) -> Result<&'static str, String> {
+    let name = l.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    let title = l.get("title").and_then(Value::as_str).unwrap_or(&name).to_string();
+    let offer = l.get("offer").cloned().unwrap_or_default();
+    if offer.get("type").and_then(Value::as_str) == Some("features") {
+        let items = offer.get("url").and_then(Value::as_str).unwrap_or("");
+        // Over an area when its request can carry one (not a WFS 1.0's, nor across the
+        // antimeridian): whole otherwise, as `service.add` does.
+        let asked = area.and_then(|a| ogc::features_in_area(items, a));
+        if area.is_some() && asked.is_none() {
+            app.session.notify(
+                crate::i18n::fmt("{name}: its request can't carry an area, so the whole layer is asked for", &[("name", &title)]),
+                false,
+            );
+        }
+        let items = asked.as_deref().unwrap_or(items);
+        return crate::connectiontree::run_add_url(app, json!({"url": items, "name": title, "service": true}), origin)
+            .map(|_| tl!("Downloading…"));
+    }
+    let origin = origin.map(str::to_string);
+    if offer.get("type").and_then(Value::as_str) == Some("coverage") {
+        // A coverage: its description first, off the frame (a step asks for it).
+        let describe = offer.get("describe").and_then(Value::as_str).unwrap_or("").to_string();
+        let mut p = json!({"url": src.url, "layer": name, "text": src.text, "name": title, "documents": src.documents});
+        if src.kind != "auto" {
+            p["type"] = json!(src.kind);
+        }
+        let slot = crate::fetch_into(&describe);
+        app.ui.service_steps.push(crate::ServiceStep::Coverage { params: p, slot, dialog, origin });
+        return Ok(tl!("Describing"));
+    }
+    let mut p = json!({"url": src.url, "layer": name, "text": src.text, "documents": src.documents, "source_url": l.get("source_url")});
+    if src.kind != "auto" {
+        p["type"] = json!(src.kind);
+    }
+    if l.get("time").is_some() && !time.is_empty() {
+        p["time"] = json!(time);
+    }
+    match l.get("tilesets").and_then(Value::as_str) {
+        // An OGC API layer: its tileset's advertised template is read first, off the frame (a
+        // step adds the layer).
+        Some(list) => {
+            p["name"] = json!(title);
+            let fallback = offer.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+            let vector = offer.get("type").and_then(Value::as_str) == Some("vectorTiles");
+            let slot = crate::fetch_into(list);
+            let resolve = crate::TilesResolve { params: p, list: list.to_string(), doc: list.to_string(), read: 0, vector, fallback, slot };
+            app.ui.service_steps.push(crate::ServiceStep::Tiles { resolve, dialog, origin });
+            Ok(tl!("Reading the tileset of"))
+        }
+        None => crate::connectiontree::run_named(app, "service.add", p, origin.as_deref()).map(|_| tl!("Added")),
+    }
 }
 
 pub fn start(app: &mut RustGisApp, p: &Value, refresh: bool) -> Result<(), String> {
@@ -163,5 +268,84 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
     } else {
         ctx.request_repaint_after(std::time::Duration::from_millis(30));
         app.ui.service_import = Some(task);
+    }
+}
+
+/// A download that landed, with what it is added with: its id, address and `layer.addDownload`
+/// parameters, and the connection it came from (named in Recent).
+pub(crate) struct Landed {
+    pub id: u64,
+    pub url: String,
+    pub params: Value,
+    pub origin: Option<String>,
+}
+
+/// A service layer's features read page by page off the frame, after its first page landed (#764):
+/// each further answer [`Pages`] asks for is fetched in the background and handed to it, until
+/// the collection is read; then it is added as the download it began as.
+pub struct PageRead {
+    landed: Landed,
+    pages: Box<Pages>,
+    /// The bytes the answers still to come may take (the download's budget, less those read).
+    left: usize,
+    slot: Slot<Result<Vec<u8>, String>>,
+}
+
+/// Starts reading a service's features past their first page (`first`, landed): added now when it
+/// leads nowhere, else read on in the background ([`poll_pages`]).
+pub(crate) fn read_pages(app: &mut RustGisApp, landed: Landed, first: Vec<u8>) {
+    let left = rustgis_engine::render::rustgis_tiles::cache::MAX_DOWNLOAD.saturating_sub(first.len());
+    let step = ogc::read_pages(&landed.url, first, ogc::MAX_PAGED_FEATURES);
+    if matches!(step, Step::Fetch(_)) {
+        app.session.notify(i18n::fmt("Reading {url} page by page…", &[("url", &landed.url)]), false);
+    }
+    go_on(app, landed, left, step);
+}
+
+/// Hands each page that landed to its read, and adds the layers whose features are all read. A
+/// read whose project was closed meanwhile is dropped.
+pub fn poll_pages(app: &mut RustGisApp, ctx: &egui::Context) {
+    if app.ui.service_pages.is_empty() {
+        return;
+    }
+    for read in std::mem::take(&mut app.ui.service_pages) {
+        if !app.session.download_is_pending(read.landed.id) {
+            let url = &read.landed.url;
+            app.session.notify(i18n::fmt("{url}: downloaded after its project was closed, so it wasn't added", &[("url", url)]), false);
+            continue;
+        }
+        let answer = read.slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+        match answer {
+            Some(answer) => {
+                let left = read.left.saturating_sub(answer.as_ref().map_or(0, Vec::len));
+                let step = (*read.pages).land(answer);
+                go_on(app, read.landed, left, step);
+            }
+            None => app.ui.service_pages.push(read),
+        }
+    }
+    if !app.ui.service_pages.is_empty() {
+        ctx.request_repaint_after(std::time::Duration::from_millis(30));
+    }
+}
+
+/// The next answer fetched, or the collection added (with a note when some features were left
+/// unread).
+fn go_on(app: &mut RustGisApp, landed: Landed, left: usize, step: Step) {
+    match step {
+        Step::Fetch(pages) => {
+            let slot = match rustgis_engine::render::rustgis_tiles::address::check(pages.next_url(), Some(pages.referrer())) {
+                Ok(()) => fetch_into_limited(pages.next_url(), left),
+                Err(e) => Slot::new(std::sync::Mutex::new(Some(Err(e)))),
+            };
+            app.ui.service_pages.push(PageRead { landed, pages, left, slot });
+        }
+        Step::Done(bytes, note) => {
+            if let Some(note) = note {
+                let name = landed.params.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()).unwrap_or(&landed.url);
+                app.session.notify(format!("{name}: {note}"), false);
+            }
+            app.add_landed(landed, bytes);
+        }
     }
 }

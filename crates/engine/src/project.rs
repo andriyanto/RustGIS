@@ -1,12 +1,25 @@
 //! The project: maps, standalone tables and geoprocessing history, saved as JSON (`.rgis`).
 
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use rustgis_data::{Dataset, Feature, Field, GeometryType};
 use rustgis_map::Map;
 use serde::{Deserialize, Serialize};
 
 use crate::GpRecord;
+
+/// A map export cannot keep runtime-only download reservations, even in a larger project.
+pub(crate) fn ensure_map_imports_complete(map: &Map) -> Result<(), String> {
+    if map.layers.iter().any(|layer| layer.dataset.source.as_deref().is_some_and(|source| source.starts_with("geolibre-pending:")))
+        || map.tiles.iter().any(|tile| tile.id.starts_with("geolibre-pending:"))
+    {
+        return Err("GeoLibre layers are still downloading; wait for them to finish before saving".into());
+    }
+    Ok(())
+}
 
 pub const EXTENSION: &str = "rgis";
 /// The project extension earlier versions wrote; such files still open.
@@ -29,14 +42,84 @@ pub fn opens_as_project(name: &str) -> bool {
 }
 
 /// The command that opens a file given by its path, as the desktop app's command line and a file
-/// dropped on its window do: `project.open` for a project or a package, `layer.addData` otherwise.
+/// dropped on its window do: native projects replace it, GeoLibre projects import a map, and
+/// other files are added as data.
 pub fn open_command(path: &str) -> &'static str {
-    if opens_as_project(path) { "project.open" } else { "layer.addData" }
+    if rustgis_map::geolibre::is_project_file(path) {
+        "project.importGeolibre"
+    } else if opens_as_project(path) {
+        "project.open"
+    } else {
+        "layer.addData"
+    }
 }
 /// Format version written to files.
 pub const FORMAT: u32 = 1;
 /// Largest project file read (512 MiB).
-const MAX_BYTES: u64 = 512 << 20;
+pub const MAX_BYTES: u64 = 512 << 20;
+
+/// The address a saved file keeps. Only web addresses can contain layer credentials. A tile
+/// template (`pmtiles:…@archive`, `cog:…@archive`) is judged by its archive, and an address read
+/// through a saved S3 connection by the address it wraps, the wrapper rebuilt around it (its
+/// binding and endpoint are provenance, not secrets); a COG's look after either is kept.
+fn saved_address(address: &str) -> Option<String> {
+    use rustgis_data::s3_address;
+    if let Some((head, archive)) = crate::sources::template_archive(address) {
+        let (file, look) = split_look(archive);
+        return saved_address(file).map(|saved| format!("{head}{saved}{look}"));
+    }
+    if s3_address::is_wrapper(address) {
+        let (file, look) = split_look(address);
+        // One that doesn't parse stays as it is (and blocked): it names no connection.
+        let b = s3_address::parse(file).ok().flatten()?;
+        let inner = saved_address(b.url)?;
+        return s3_address::bind(b.binding, b.endpoint, &inner).ok().map(|saved| format!("{saved}{look}"));
+    }
+    let inner = address.strip_prefix(crate::render::rustgis_tiles::s3::ANONYMOUS).unwrap_or(address);
+    let (protocol, _) = inner.split_once("://")?;
+    if !["http", "https", "s3"].iter().any(|s| protocol.eq_ignore_ascii_case(s)) {
+        return None;
+    }
+    let (scheme, mut rest) = address.split_once("://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if let Some(at) = rest.get(..end).and_then(|authority| authority.rfind('@')) {
+        rest = rest.get(at + 1..)?;
+    }
+    let rest = rest.split('#').next().unwrap_or(rest);
+    let mut out = format!("{scheme}://{rest}");
+    rustgis_data::source::credentials::redact_query(&mut out);
+    (out != address).then_some(out)
+}
+
+/// A COG address without its look (`…#bands=…`), and the look as written.
+fn split_look(address: &str) -> (&str, &str) {
+    let file = crate::render::rustgis_tiles::cog::split(address).0;
+    (file, address.get(file.len()..).unwrap_or(""))
+}
+
+/// Strips layer credentials, keeping originals in the visitor's order for the caller to restore.
+/// Packaging calls this without registering the resulting text as a file this process wrote.
+pub(crate) fn strip_addresses(addresses: Vec<&mut String>) -> Vec<Option<String>> {
+    addresses.into_iter().map(|a| saved_address(a).map(|redacted| std::mem::replace(a, redacted))).collect()
+}
+
+struct Written {
+    len: usize,
+    hash: u64,
+    was: Vec<Option<String>>,
+}
+
+const MAX_WRITTEN: usize = 32;
+
+fn kept() -> MutexGuard<'static, Vec<Written>> {
+    static KEPT: OnceLock<Mutex<Vec<Written>>> = OnceLock::new();
+    KEPT.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn identity(text: &str) -> (usize, u64) {
+    static KEY: OnceLock<RandomState> = OnceLock::new();
+    (text.len(), KEY.get_or_init(RandomState::new).hash_one(text.as_bytes()))
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Project {
@@ -135,7 +218,19 @@ struct TableFile {
 impl From<TableFile> for Table {
     fn from(t: TableFile) -> Self {
         let TableFile { id, name, geometry_type, fields, features, source } = t;
-        Table { id, dataset: Dataset { name, geometry_type, fields, features: features.into(), source, crs: None, windowed: false } }
+        Table {
+            id,
+            dataset: Dataset {
+                name,
+                geometry_type,
+                fields,
+                features: features.into(),
+                source,
+                crs: None,
+                crs_incomplete: false,
+                windowed: false,
+            },
+        }
     }
 }
 
@@ -323,7 +418,47 @@ impl Default for Project {
     }
 }
 
+/// Resolve linked files and explicitly relative provenance against their containing document.
+pub(crate) fn resolve_file_paths<'a>(dir: &str, paths: impl IntoIterator<Item = (&'a mut String, bool)>) {
+    for (p, record) in paths {
+        if (!record || ["./", "../", ".\\", "..\\"].iter().any(|prefix| p.starts_with(prefix)))
+            && rustgis_map::paths::is_project_relative(p)
+            && let Some(full) = rustgis_map::paths::resolve(dir, p)
+        {
+            *p = full;
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ProjectFormat {
+    #[serde(default)]
+    format: Option<u32>,
+}
+
 impl Project {
+    fn file_paths_mut(&mut self) -> Vec<(&mut String, bool)> {
+        let mut paths = Vec::new();
+        for map in &mut self.maps {
+            paths.extend(map.file_paths_mut());
+        }
+        for area in &mut self.offline_areas {
+            paths.extend(area.data.file_paths_mut());
+        }
+        for table in &mut self.tables {
+            if let Some(p) = &mut table.dataset.source
+                && rustgis_map::paths::is_local(p)
+            {
+                paths.push((p, true));
+            }
+        }
+        paths
+    }
+
+    fn resolve_paths(&mut self, dir: &str) {
+        resolve_file_paths(dir, self.file_paths_mut());
+    }
+
     pub fn new(name: impl Into<String>) -> Self {
         Project {
             format: FORMAT,
@@ -352,6 +487,23 @@ impl Project {
             shared: Vec::new(),
             data_stores: Vec::new(),
         }
+    }
+
+    /// Every map and offline snapshot's data addresses, followed by standalone tables' sources.
+    pub fn addresses_mut(&mut self) -> Vec<&mut String> {
+        let mut addresses = Vec::new();
+        for map in &mut self.maps {
+            addresses.extend(map.addresses_mut());
+        }
+        for area in &mut self.offline_areas {
+            addresses.extend(area.data.addresses_mut());
+        }
+        for table in &mut self.tables {
+            if let Some(source) = &mut table.dataset.source {
+                addresses.push(source);
+            }
+        }
+        addresses
     }
 
     /// The standalone table of an id.
@@ -470,7 +622,8 @@ impl Project {
                 true
             });
             // Layer groups likewise: ids of their own, children that exist and are in no other
-            // group, numbers in range; children kept together in the drawing order.
+            // group, numbers in range, parents that exist without a loop or too many levels;
+            // each group's layers kept together in the drawing order.
             m.groups.truncate(rustgis_map::MAX_GROUPS);
             m.groups.retain_mut(|g| {
                 if g.id == 0 || !ids.insert(g.id) {
@@ -483,10 +636,7 @@ impl Project {
                 g.children.retain(|c| layer_ids.contains(c) && children.insert(*c));
                 true
             });
-            let group_ids: Vec<u32> = m.groups.iter().map(|g| g.id).collect();
-            for id in group_ids {
-                m.gather_group(id);
-            }
+            m.tidy_groups();
             // A projection this version can't use (a hand edit, or a newer file) falls back to
             // Web Mercator rather than being named while another is drawn.
             if let rustgis_map::Projection::Custom(code) = &m.projection
@@ -500,31 +650,65 @@ impl Project {
             m.camera.clamp();
             // The time slider's window and dated tile addresses, before the addresses are checked.
             m.apply_time();
+            for t in &mut m.tiles {
+                if let Some(f) = t.archive_file().filter(|f| rustgis_map::paths::is_project_relative(f)) {
+                    t.error = Some(rustgis_map::paths::unknown_folder(f));
+                }
+            }
             // Tile layers with an address that can't be fetched (a hand edit) are dropped.
             m.tiles.retain_mut(|t| t.repair().map_err(|e| log::warn!("{}: {e}", m.name)).is_ok());
             m.tiles.truncate(rustgis_map::tiles::MAX_TILE_LAYERS);
+            #[cfg(not(target_arch = "wasm32"))]
+            for t in &mut m.tiles {
+                if t.error.is_none()
+                    && let Some(f) = t.archive_file()
+                    && !Path::new(f.strip_prefix("file://").unwrap_or(f)).is_file()
+                {
+                    t.error = Some(format!("{f}: the file isn't there"));
+                }
+            }
             for l in &mut m.layers {
                 if let Some(z) = l.raster.as_mut().and_then(|r| r.time_zarr.as_mut()) {
                     z.repair();
                 }
+                let unresolved = l
+                    .file_paths_mut()
+                    .into_iter()
+                    .find(|(p, record)| !record && rustgis_map::paths::is_project_relative(p))
+                    .map(|(p, _)| p.clone());
+                if let Some(p) = &unresolved {
+                    let error = rustgis_map::paths::unknown_folder(p);
+                    if let Some(rl) = &mut l.raster {
+                        rl.error = Some(error.clone());
+                        rl.data = None;
+                    }
+                    if let Some(src) = &mut l.source {
+                        src.error = Some(error);
+                    }
+                }
                 if let Some(rl) = &mut l.raster
                     && rl.data.is_none()
+                    && !rl.path.as_deref().is_some_and(crate::s3_connections::is_s3_backed)
+                    && unresolved.is_none()
                     && let Err(e) = rl.reload()
                 {
                     log::warn!("{}: {e}", l.name);
                 }
-                // A streamed layer's features are read again from its source.
+                // A streamed layer's features are read again from its source. One read from an S3
+                // bucket waits for [`crate::s3_connections::resolve_project_s3`], which opens it
+                // with the saved connection that is to read it (or, with none to choose, as
+                // before): reading a project fetches nothing with another session's keys.
                 if let Some(src) = &mut l.source {
                     l.dataset.windowed = true;
                     if !src.is_open()
                         && src.error.is_none()
+                        && !src.path.as_deref().is_some_and(crate::s3_connections::is_s3_backed)
                         && let Err(e) = src.open()
                     {
                         log::warn!("{}: {e}", l.name);
                     }
                 }
-                let n = l.dataset.features.len();
-                l.selection.retain(|r| *r < n);
+                l.normalize_selection();
                 let fields = l.dataset.fields.len();
                 for f in &mut l.dataset.features {
                     f.attrs.resize(fields, rustgis_data::Value::Null);
@@ -548,19 +732,170 @@ impl Project {
         &mut self.maps[i]
     }
 
-    pub fn save(&self, path: &Path) -> Result<(), String> {
-        let text = serde_json::to_string(self).map_err(|e| e.to_string())?;
-        rustgis_data::io::write_atomic(path, text.as_bytes()).map_err(|e| format!("could not save {}: {e}", path.display()))
+    /// A consumed download cannot run again when an older undo snapshot is restored.
+    pub(crate) fn discard_import_reservation(&mut self, token: &str) {
+        for map in &mut self.maps {
+            let removed: std::collections::HashSet<_> =
+                map.layers.iter().filter(|layer| layer.dataset.source.as_deref() == Some(token)).map(|layer| layer.id).collect();
+            map.layers.retain(|layer| !removed.contains(&layer.id));
+            map.tiles.retain(|tile| tile.id != token);
+            for group in &mut map.groups {
+                group.children.retain(|id| !removed.contains(id));
+            }
+        }
+    }
+
+    /// Runtime download reservations cannot be reopened; refuse snapshots until they finish.
+    pub(crate) fn ensure_imports_complete(&self) -> Result<(), String> {
+        for map in self.maps.iter().chain(self.offline_areas.iter().map(|area| &area.data)) {
+            ensure_map_imports_complete(map)?;
+        }
+        Ok(())
+    }
+
+    /// The file keeps no passwords, keys, tokens or signatures in layer addresses. The open project
+    /// keeps them. This process remembers the 32 most recent distinct saved snapshots with stripped
+    /// addresses: opening identical plain project text restores them until that snapshot is evicted
+    /// or RustGIS closes. Packages and imports never restore them.
+    pub fn saved_text(&mut self, dir: Option<&Path>) -> Result<(String, usize), String> {
+        self.ensure_imports_complete()?;
+        let was = strip_addresses(self.addresses_mut());
+        let n = was.iter().flatten().count();
+        let originals: Vec<Option<String>> = if let Some(d) = dir.and_then(Path::to_str) {
+            self.file_paths_mut()
+                .into_iter()
+                .map(|(p, _)| {
+                    let relative = rustgis_map::paths::is_absolute_local(p)
+                        .then(|| rustgis_map::paths::relative_to(d, p))
+                        .flatten()
+                        // Keep the traversal stable during restoration, even for an unusually deep
+                        // destination whose relative spelling exceeds the local-path size bound.
+                        .filter(|r| rustgis_map::paths::is_local(r));
+                    relative.map(|r| std::mem::replace(p, r))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let text = serde_json::to_string(self).map_err(|e| e.to_string());
+        if !originals.is_empty() {
+            for ((p, _), original) in self.file_paths_mut().into_iter().zip(originals) {
+                if let Some(original) = original {
+                    *p = original;
+                }
+            }
+        }
+        // Serialization can fail: put the live addresses back before handling its result.
+        for (address, original) in self.addresses_mut().into_iter().zip(&was) {
+            if let Some(original) = original {
+                *address = original.clone();
+            }
+        }
+        if let Ok(text) = &text
+            && n > 0
+        {
+            let (len, hash) = identity(text);
+            let mut kept = kept();
+            kept.retain(|entry| (entry.len, entry.hash) != (len, hash));
+            if kept.len() >= MAX_WRITTEN {
+                kept.remove(0);
+            }
+            kept.push(Written { len, hash, was });
+        }
+        text.map(|text| (text, n))
+    }
+
+    /// The project as an autosaved recovery copy keeps it: its text without passwords, keys, tokens
+    /// or signatures in layer addresses, from a copy of the project (autosave writes it off the
+    /// interface thread). Unlike [`Self::saved_text`], local file paths stay as the open project
+    /// holds them, absolute: the copy lives in the app's recovery folder and is opened from there,
+    /// not from the project's folder. Nor is it remembered as a file this process wrote, so
+    /// frequent copies can't push the user's own saves out of the snapshots that restore secrets.
+    /// Runtime import reservations are omitted while completed work remains recoverable.
+    /// Text too large to open again is refused.
+    pub fn recovery_text(mut self) -> Result<String, String> {
+        // A recovery copy preserves completed work without persisting runtime-only reservations.
+        for map in self.maps.iter_mut().chain(self.offline_areas.iter_mut().map(|area| &mut area.data)) {
+            let pending: std::collections::HashSet<_> = map
+                .layers
+                .iter()
+                .filter(|layer| layer.dataset.source.as_deref().is_some_and(|source| source.starts_with("geolibre-pending:")))
+                .map(|layer| layer.id)
+                .collect();
+            map.layers.retain(|layer| !pending.contains(&layer.id));
+            for group in &mut map.groups {
+                group.children.retain(|id| !pending.contains(id));
+            }
+            map.tiles.retain(|tile| !tile.id.starts_with("geolibre-pending:"));
+        }
+        strip_addresses(self.addresses_mut());
+        let text = serde_json::to_string(&self).map_err(|e| e.to_string())?;
+        if text.len() as u64 > MAX_BYTES {
+            return Err("the project is too large to keep a recovery copy".into());
+        }
+        Ok(text)
+    }
+
+    fn restore_addresses(&mut self, text: &str) {
+        let id = identity(text);
+        let kept = kept();
+        let Some(entry) = kept.iter().find(|entry| (entry.len, entry.hash) == id) else { return };
+        for (address, original) in self.addresses_mut().into_iter().zip(&entry.was) {
+            if let Some(full) = original
+                && saved_address(full).as_deref() == Some(address.as_str())
+            {
+                *address = full.clone();
+            }
+        }
+    }
+
+    pub fn save(&mut self, path: &Path) -> Result<usize, String> {
+        let dir = std::path::absolute(path).ok().and_then(|p| p.parent().map(Path::to_path_buf));
+        let (text, stripped) = self.saved_text(dir.as_deref())?;
+        rustgis_data::io::write_atomic(path, text.as_bytes()).map_err(|e| format!("could not save {}: {e}", path.display()))?;
+        Ok(stripped)
     }
 
     /// Reads a project from its JSON text (a browser upload).
     pub fn from_json(text: &str) -> Result<Project, String> {
+        Self::read_json(text, true, None)
+    }
+
+    /// Reads imported JSON (including package contents) without restoring a saved file's secrets.
+    pub(crate) fn from_import_json(text: &str, dir: Option<&Path>) -> Result<Project, String> {
+        Self::read_json(text, false, dir)
+    }
+
+    fn read_json(text: &str, restore: bool, dir: Option<&Path>) -> Result<Project, String> {
         if text.len() as u64 > MAX_BYTES {
             return Err("the project file is too large".into());
         }
-        let mut p: Project = serde_json::from_str(text).map_err(|e| format!("not a RustGIS project: {e}"))?;
+        if let Ok(pf) = serde_json::from_str::<ProjectFormat>(text)
+            && let Some(format) = pf.format
+            && format > FORMAT
+        {
+            return Err(format!("this project was saved by a newer RustGIS (format {format}). Update RustGIS to open it."));
+        }
+        let mut p: Project = serde_json::from_str(text).map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("unknown variant") {
+                format!("this project may have been saved by a newer RustGIS: {msg}. Update RustGIS to open it.")
+            } else {
+                format!("not a RustGIS project: {msg}")
+            }
+        })?;
+        p.ensure_imports_complete().map_err(|_| "a project file cannot contain runtime GeoLibre download reservations".to_string())?;
         if p.format > FORMAT {
-            return Err(format!("this project was saved by a newer RustGIS (format {})", p.format));
+            return Err(format!("this project was saved by a newer RustGIS (format {}). Update RustGIS to open it.", p.format));
+        }
+        if restore {
+            p.restore_addresses(text);
+        }
+        // A binding is this computer's runtime token for a login: one in a file is no authority
+        // to use any login here.
+        crate::s3_connections::clear_bindings(p.addresses_mut());
+        if let Some(d) = dir.and_then(Path::to_str) {
+            p.resolve_paths(d);
         }
         p.normalize();
         Ok(p)
@@ -572,7 +907,8 @@ impl Project {
             return Err("the project file is too large".into());
         }
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        Project::from_json(&text)
+        let dir = std::path::absolute(path).ok().and_then(|p| p.parent().map(Path::to_path_buf));
+        Self::read_json(&text, true, dir.as_deref())
     }
 }
 

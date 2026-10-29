@@ -59,6 +59,8 @@ pub struct Info {
     pub bounds: [f64; 4],
     /// The JSON metadata (vector layers, attribution…), `Null` when there is none.
     pub metadata: Value,
+    /// Its vector layers' names, as [`source_layers::of_metadata`](rustgis_data::source_layers::of_metadata) keeps them.
+    vector_layers: Vec<String>,
     root: Arc<Vec<Entry>>,
     leaf_offset: u64,
     leaf_length: u64,
@@ -69,13 +71,16 @@ pub struct Info {
 }
 
 impl Info {
-    /// The names of the metadata's vector layers.
-    pub fn vector_layers(&self) -> Vec<String> {
-        self.metadata
-            .get("vector_layers")
-            .and_then(Value::as_array)
-            .map(|v| v.iter().filter_map(|l| l.get("id").and_then(Value::as_str)).map(str::to_string).collect())
-            .unwrap_or_default()
+    /// The names of the metadata's vector layers, as
+    /// [`source_layers::of_metadata`](rustgis_data::source_layers::of_metadata) keeps them.
+    pub fn vector_layers(&self) -> &[String] {
+        &self.vector_layers
+    }
+
+    /// Takes the archive's metadata, and the vector layers' names from it.
+    fn set_metadata(&mut self, metadata: Value) {
+        self.vector_layers = rustgis_data::source_layers::of_metadata(&metadata);
+        self.metadata = metadata;
     }
 
     /// The metadata's attribution, if any.
@@ -164,7 +169,11 @@ pub fn is_tile(url: &str) -> bool {
 
 /// Whether an archive address is a file on this computer rather than a web address.
 /// (As `rustgis_map::tiles::is_local_archive` decides it, which a layer's address went through.)
+/// An address read through a saved S3 connection is never a file, well formed or not.
 pub fn is_local(archive: &str) -> bool {
+    if rustgis_data::s3_address::is_wrapper(archive) {
+        return false;
+    }
     let lower = archive.get(..8).unwrap_or(archive).to_ascii_lowercase();
     !(lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("s3://"))
 }
@@ -387,6 +396,17 @@ pub(crate) fn forget() {
     leaves().lock().unwrap_or_else(|e| e.into_inner()).retain(|_, l| matches!(l, Leaf::Loading(_)));
 }
 
+/// Forgets what was read of one archive (its header, and its directories), but not a read under
+/// way: a failed read is made again with whatever login now signs the archive's address.
+pub(crate) fn forget_archive(archive: &str) {
+    let mut all = archives().lock().unwrap_or_else(|e| e.into_inner());
+    if all.get(archive).is_some_and(|s| !matches!(s, State::Loading(_))) {
+        all.remove(archive);
+    }
+    drop(all);
+    leaves().lock().unwrap_or_else(|e| e.into_inner()).retain(|(a, _), l| a != archive || matches!(l, Leaf::Loading(_)));
+}
+
 /// An archive's header and metadata: `Ok(None)` while they are read (the map draws again once
 /// they arrive).
 pub fn info(archive: &str) -> Result<Option<Arc<Info>>, String> {
@@ -460,7 +480,7 @@ fn load(archive: String) {
                             // Unreadable metadata only loses the layer names and credits.
                             if let Ok(m) = m {
                                 let m = info.internal.decode(m).unwrap_or_default();
-                                info.metadata = serde_json::from_slice(&m).unwrap_or(Value::Null);
+                                info.set_metadata(serde_json::from_slice(&m).unwrap_or(Value::Null));
                             }
                             finish(&a2, Ok(info));
                         }),
@@ -714,6 +734,7 @@ fn parse_head(b: &[u8]) -> Result<(Info, u64, u64), String> {
         max_zoom,
         bounds,
         metadata: Value::Null,
+        vector_layers: Vec::new(),
         root: Arc::new(root),
         leaf_offset,
         leaf_length,
@@ -1027,6 +1048,7 @@ pub(crate) mod tests {
             attribution: String::new(),
             layers: Vec::new(),
             style_layers: String::new(),
+            hidden_layers: Vec::new(),
         };
         let mut resolved = crate::source::resolve(&spec);
         for _ in 0..200 {

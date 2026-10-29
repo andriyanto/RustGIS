@@ -47,9 +47,16 @@ pub struct Placed {
     pub lines: Vec<String>,
 }
 
-/// Text width in millimetres.
-fn width_mm(s: &str, pt: f32, bold: bool) -> f64 {
+/// Text width in millimetres at `pt` points, as layouts and reports draw it.
+pub fn width_mm(s: &str, pt: f32, bold: bool) -> f64 {
     text::measure(s, pt, bold) as f64 * 25.4 / 96.0
+}
+
+/// [`width_mm`] in the serif a layout draws a `"font": "serif"` text in (the sans where no serif is
+/// installed): the ink's width, which the line has to hold.
+pub fn serif_width_mm(s: &str, pt: f32, bold: bool) -> f64 {
+    let (lo, hi) = text::styled_extent(s, pt * 1.33, text::Face { bold, italic: false, serif: true, family: None }, 0.0);
+    f64::from((hi - lo).max(0.0)) * 25.4 / 96.0
 }
 
 /// Point size and line height (mm) of each kind of block.
@@ -66,31 +73,42 @@ fn style(b: &Block) -> (f32, bool, f64) {
     }
 }
 
-/// Splits text into lines no wider than `w` millimetres.
-fn wrap(s: &str, w: f64, pt: f32) -> Vec<String> {
+/// Splits text into lines no wider than `w` millimetres at `pt` points: whole words, a word wider
+/// than the line broken across lines.
+pub fn wrap(s: &str, w: f64, pt: f32) -> Vec<String> {
+    wrap_with(s, w, |t| width_mm(t, pt, false))
+}
+
+/// [`wrap`] with the width of a piece of text (in mm) measured by `width`: bold text, or text whose
+/// tokens are filled in only when it is drawn.
+pub fn wrap_with(s: &str, w: f64, width: impl Fn(&str) -> f64) -> Vec<String> {
     let mut out = Vec::new();
     for para in s.lines().take(2000) {
         let mut line = String::new();
         for word in para.split_whitespace().take(5000) {
-            // A word wider than the line (a long URL…) is broken across lines.
+            // A word wider than the line (a long URL…) is broken across lines: the most of its
+            // characters that fit, found by halving (a few measures a line, not one a character).
             let mut word = word.to_string();
-            while width_mm(&word, pt, false) > w && word.chars().count() > 1 {
-                let mut head = String::new();
-                for ch in word.chars() {
-                    if !head.is_empty() && width_mm(&format!("{head}{ch}"), pt, false) > w {
-                        break;
+            while width(&word) > w && word.chars().count() > 1 {
+                let chars: Vec<char> = word.chars().collect();
+                let (mut fits, mut over) = (1, chars.len());
+                while over - fits > 1 {
+                    let mid = (fits + over) / 2;
+                    if width(&chars[..mid].iter().collect::<String>()) > w {
+                        over = mid;
+                    } else {
+                        fits = mid;
                     }
-                    head.push(ch);
                 }
                 if !line.is_empty() {
                     out.push(std::mem::take(&mut line));
                 }
-                word = word.chars().skip(head.chars().count()).collect();
-                out.push(head);
+                out.push(chars[..fits].iter().collect());
+                word = chars[fits..].iter().collect();
             }
             let word = word.as_str();
             let next = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
-            if !line.is_empty() && width_mm(&next, pt, false) > w {
+            if !line.is_empty() && width(&next) > w {
                 out.push(std::mem::take(&mut line));
                 line = word.to_string();
             } else {
@@ -447,6 +465,22 @@ mod tests {
         blocks.push(Block::Text("word ".repeat(3000)));
         blocks.push(Block::Chart { title: "Records per region".into(), bars: vec![("West".into(), 3.0), ("East".into(), 1.0)] });
         Doc { title: "Cities".into(), width: 215.9, height: 279.4, blocks }
+    }
+
+    /// A word wider than the line breaks into pieces that each fit, nothing lost, found in a few
+    /// measures a piece rather than one a character (a hostile 2000-character word stays cheap).
+    #[test]
+    fn a_long_word_breaks_in_few_measures() {
+        let word = "x".repeat(2000);
+        let count = std::cell::Cell::new(0usize);
+        let lines = wrap_with(&word, 40.0, |t| {
+            count.set(count.get() + 1);
+            width_mm(t, 7.0, false)
+        });
+        assert!(lines.len() > 10, "{} lines", lines.len());
+        assert!(lines.iter().all(|l| width_mm(l, 7.0, false) <= 40.0), "every piece fits");
+        assert_eq!(lines.concat(), word, "nothing lost");
+        assert!(count.get() < 20 * lines.len(), "{} measures for {} lines", count.get(), lines.len());
     }
 
     #[test]

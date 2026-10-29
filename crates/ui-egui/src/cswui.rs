@@ -99,14 +99,18 @@ pub fn poll(app: &mut RustGisApp) {
 pub fn form(app: &mut RustGisApp, ui: &mut egui::Ui, kinds: impl FnOnce(&mut RustGisApp, &mut egui::Ui)) {
     let mut go = false;
     egui::Grid::new("csw").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
-        ui.label(tl!("Address"));
-        let r = ui.add(egui::TextEdit::singleline(&mut app.ui.csw.url).hint_text("https://…/csw").desired_width(420.0));
+        let input_label = ui.label(tl!("Address"));
+        let r = ui
+            .add(egui::TextEdit::singleline(&mut app.ui.csw.url).hint_text("https://…/csw").desired_width(420.0))
+            .labelled_by(input_label.id);
         go |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         ui.end_row();
         kinds(app, ui);
         ui.end_row();
-        ui.label(tl!("Words"));
-        let r = ui.add(egui::TextEdit::singleline(&mut app.ui.csw.query).hint_text(tl!("anywhere in the records")).desired_width(420.0));
+        let input_label = ui.label(tl!("Words"));
+        let r = ui
+            .add(egui::TextEdit::singleline(&mut app.ui.csw.query).hint_text(tl!("anywhere in the records")).desired_width(420.0))
+            .labelled_by(input_label.id);
         go |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         ui.end_row();
         ui.label("");
@@ -136,18 +140,27 @@ pub fn form(app: &mut RustGisApp, ui: &mut egui::Ui, kinds: impl FnOnce(&mut Rus
 /// The records found: each with its abstract (on hover), a Zoom to its bounds and a button per
 /// link RustGIS can follow.
 fn records(app: &mut RustGisApp, ui: &mut egui::Ui) {
+    let list = crate::sourcespane::connections_snapshot(app);
     let st = &app.ui.csw;
     if st.records.is_empty() && st.matched == 0 {
         return;
     }
     ui.separator();
-    ui.label(
-        egui::RichText::new(crate::i18n::fmt(
-            "{shown} of {matched} records",
-            &[("shown", &st.records.len().to_string()), ("matched", &st.matched.to_string())],
-        ))
-        .strong(),
-    );
+    let url = st.asked["url"].as_str().unwrap_or("").to_string();
+    let keepable = !url.is_empty() && crate::connectionui::picked(&list, app.dialogs.connection.as_deref(), &url).is_none();
+    let mut keep = false;
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(crate::i18n::fmt(
+                "{shown} of {matched} records",
+                &[("shown", &st.records.len().to_string()), ("matched", &st.matched.to_string())],
+            ))
+            .strong(),
+        );
+        if keepable {
+            keep = crate::connectionui::keep_button(ui);
+        }
+    });
     for n in &st.notes {
         ui.label(egui::RichText::new(n).small().weak());
     }
@@ -222,6 +235,12 @@ fn records(app: &mut RustGisApp, ui: &mut egui::Ui) {
         };
         if let Err(e) = r {
             app.ui.csw.error = Some(e);
+        }
+    }
+    if keep {
+        match crate::connectionui::keep(app, json!({"kind": "csw", "address": url})) {
+            Ok(id) => app.dialogs.connection = Some(id),
+            Err(e) => app.ui.csw.error = Some(e),
         }
     }
 }

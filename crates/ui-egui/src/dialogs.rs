@@ -10,20 +10,47 @@ use crate::theme::{Tokens, semibold};
 
 #[derive(Default)]
 pub struct Dialogs {
+    /// The layer captured when Define Projection opens; changing selection must not retarget it.
+    pub projection_layer: Option<u32>,
+    /// Map-local layer IDs require the dialog to retain its original project and map as well.
+    pub projection_map: Option<(u64, usize, String)>,
+    pub geometry: Option<crate::geometrycalc::Form>,
+    pub repair: Option<crate::repairsource::Form>,
     pub open: Option<&'static str>,
     pub layer: String,
+    /// GeoPackage save/discard targets use IDs because display names can repeat.
+    pub gpkg_layer: Option<u32>,
+    /// The live instance captured with the map-local ID; Undo can make that ID reusable.
+    pub gpkg_instance: Option<u64>,
+    /// Layer IDs are map-local; source writes must stay in the captured project and map.
+    pub gpkg_map: Option<(u64, usize, String)>,
+    /// The source-backed layer last counted: its name for PostGIS, numeric ID for GeoPackage.
+    pub counted: String,
+    /// Revision after the last count command, which itself advances the session revision.
+    pub counted_revision: Option<u64>,
+    pub counted_instance: Option<u64>,
     pub text: String,
     pub a: String,
     pub b: String,
     pub c: String,
+    pub d: String,
+    pub e: String,
+    /// Add From Database: load the PostgreSQL table whole, to be edited and saved back.
+    pub edit: bool,
     pub mode: &'static str,
     pub flag: bool,
     pub error: Option<String>,
     pub info: Option<String>,
-    /// Choices found for the dialog (Add From Database's tables; Add Delimited Text's columns).
+    /// The saved connection this dialog was opened on, by id (see `connectionui::picked`).
+    pub connection: Option<String>,
+    /// Choices found for the dialog (database or GeoPackage tables; delimited text columns).
     pub list: Vec<String>,
+    /// The database or GeoPackage file whose tables were last listed.
+    pub listed: Option<String>,
     /// Add Delimited Text's file, picked before the dialog opens.
     pub csv: Option<CsvFile>,
+    /// Reset collapsed then closed dialogs when reopening
+    pub reset_collapse: bool,
 }
 
 /// A file picked for Add Delimited Text.
@@ -40,6 +67,7 @@ pub enum CsvSource {
 }
 
 impl Dialogs {
+    /// Opens a dialog on the current selection, capturing the target of CRS changes.
     pub fn open(&mut self, which: &str, s: &Session) -> Result<(), String> {
         let active = s.active_layer.and_then(|id| s.map().layer(id));
         let name: &'static str = match which {
@@ -55,6 +83,8 @@ impl Dialogs {
             "renameServiceGroup" => "renameServiceGroup",
             "renameGroup" => "renameGroup",
             "coordinateSystem" => "coordinateSystem",
+            "defineProjection" => "defineProjection",
+            "addShapefile" => "addShapefile",
             "camera" => "camera",
             "addTiles" => "addTiles",
             "basemap" => "basemap",
@@ -68,24 +98,48 @@ impl Dialogs {
             "addUrl" => "addUrl",
             "addService" => "addService",
             "addDatabase" => "addDatabase",
+            // Add From Database with Load for editing ticked.
+            "pgAddLayer" => "addDatabase",
+            "pgSave" => "pgSave",
+            "pgDiscard" => "pgDiscard",
+            "gpkgAddLayer" => "gpkgAddLayer",
+            "gpkgSave" => "gpkgSave",
+            "gpkgDiscard" => "gpkgDiscard",
+            "chooseConnection" => "chooseConnection",
             "s3" => "s3",
             "zarr" => "zarr",
             "exportLayer" => "exportLayer",
             "saveProject" => "saveProject",
             other => return Err(format!("unknown dialog '{other}'")),
         };
-        if matches!(name, "addField" | "calculateField" | "definitionQuery" | "renameLayer" | "exportLayer") && active.is_none() {
+        if matches!(name, "addField" | "calculateField" | "definitionQuery" | "renameLayer" | "exportLayer" | "defineProjection")
+            && active.is_none()
+        {
             return Err("select a layer in the Layers pane first".into());
         }
         if name == "exportLayer" && active.is_some_and(|l| l.is_raster()) {
             return Err("Export Features needs a vector layer (Data › Export Raster writes a raster)".into());
         }
+        if matches!(name, "pgSave" | "pgDiscard") && !s.map().layers.iter().any(|l| l.postgis.is_some()) {
+            return Err("the map has no PostGIS layer loaded for editing (Home › Add Data › Database…, Load for editing)".into());
+        }
+        if matches!(name, "gpkgSave" | "gpkgDiscard") && !s.map().layers.iter().any(|l| l.gpkg.is_some()) {
+            return Err(tl!("the map has no GeoPackage layer loaded for editing (Home › Add Data › Edit GeoPackage Table…)").into());
+        }
         if name == "selectByAttributes" && s.map().layers.is_empty() {
             return Err("the map has no layers".into());
         }
-        *self = Dialogs { open: Some(name), mode: "new", ..Dialogs::default() };
+        *self = Dialogs { open: Some(name), mode: "new", edit: which == "pgAddLayer", reset_collapse: true, ..Dialogs::default() };
         self.layer = active.or_else(|| s.map().layers.first()).map(|l| l.name.clone()).unwrap_or_default();
         match name {
+            "defineProjection" => {
+                self.projection_layer = active.map(|l| l.id);
+                self.projection_map = Some((s.opened, s.project.active_map, s.map().name.clone()));
+                self.text = active
+                    .and_then(|l| l.dataset.crs)
+                    .map(|c| c.custom_def().map(|d| d.proj4.clone()).unwrap_or_else(|| c.label()))
+                    .unwrap_or_else(|| "EPSG:4326".into());
+            }
             "coordinateSystem" => {
                 self.text = s.map().projection.code();
                 // An EPSG code goes in the code box; presets are picked from the list.
@@ -111,6 +165,18 @@ impl Dialogs {
             // A file name can't hold a folder separator, which a project name may.
             "saveProject" => self.text = format!("{}.rgis", s.project.name.replace(['/', '\\'], "-")),
             "exportLayer" => self.mode = "geojson",
+            // The active layer when it is from PostGIS, else the first that is.
+            "pgSave" | "pgDiscard" => {
+                let pg = |l: &&rustgis_engine::map::Layer| l.postgis.is_some();
+                self.layer = active.filter(pg).or_else(|| s.map().layers.iter().find(pg)).map(|l| l.name.clone()).unwrap_or_default();
+            }
+            "gpkgSave" | "gpkgDiscard" => {
+                let gpkg = |l: &&rustgis_engine::map::Layer| l.gpkg.is_some();
+                let layer = active.filter(gpkg).or_else(|| s.map().layers.iter().find(gpkg));
+                self.gpkg_layer = layer.map(|l| l.id);
+                self.gpkg_instance = layer.map(|l| l.instance_id());
+                self.gpkg_map = Some((s.opened, s.project.active_map, s.map().name.clone()));
+            }
             // A table of addresses is what's usually geocoded: picked by its id (`flag` says the
             // choice is a table), since names can repeat.
             "geocode" => {
@@ -122,18 +188,60 @@ impl Dialogs {
         }
         Ok(())
     }
+
+    fn gpkg_owner(&self, s: &Session) -> Result<(), String> {
+        if !self
+            .gpkg_map
+            .as_ref()
+            .is_some_and(|(project, index, name)| *project == s.opened && *index == s.project.active_map && *name == s.map().name)
+        {
+            return Err(tl!("The active project or map changed; reopen the GeoPackage dialog for the intended layer.").into());
+        }
+        Ok(())
+    }
+
+    fn gpkg_target(&self, s: &Session) -> Result<u32, String> {
+        self.gpkg_owner(s)?;
+        let id = self.gpkg_layer.ok_or_else(|| tl!("Choose a GeoPackage layer").to_string())?;
+        if !s.map().layer(id).is_some_and(|l| l.gpkg.is_some() && Some(l.instance_id()) == self.gpkg_instance) {
+            return Err(tl!("The selected GeoPackage layer is no longer available; choose a layer").to_string());
+        }
+        Ok(id)
+    }
 }
 
+/// Whether `error` is a target refusal from [`Dialogs::gpkg_target`], which a later valid
+/// target (Redo restoring the layer) makes stale. Save failures and other errors aren't.
+fn is_gpkg_target_error(error: &str) -> bool {
+    [
+        tl!("The active project or map changed; reopen the GeoPackage dialog for the intended layer."),
+        tl!("Choose a GeoPackage layer"),
+        tl!("The selected GeoPackage layer is no longer available; choose a layer"),
+    ]
+    .contains(&error)
+}
+
+/// Draws the active dialog and leaves it open on validation failure or a newly opened dialog.
 pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     let Some(which) = app.dialogs.open else { return };
+    if which == "calculateGeometry" {
+        crate::geometrycalc::show(app, ctx);
+        return;
+    }
+    if which == "repairSource" {
+        crate::repairsource::show(app, ctx);
+        return;
+    }
     let title = match which {
         "selectByAttributes" => "Select By Attributes",
-        "goToXY" => "Go To XY",
+        "goToXY" => "By Coordinates",
         "bookmark" => "New Bookmark",
         "addField" => "Add Field",
         "calculateField" => "Calculate Field",
         "definitionQuery" => "Definition Query",
         "coordinateSystem" => "Coordinate System",
+        "defineProjection" => "Define Projection",
+        "addShapefile" => "Import Shapefile with Projection",
         "camera" => "Camera",
         "addTiles" => "Add Tile Layer",
         "basemap" => "Basemap",
@@ -142,12 +250,21 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         "layerTemplate" => "Layer Template",
         "addPolyline" => "Add Encoded Polyline",
         "addCsv" => "Add Delimited Text",
-        "findPlace" => "Find Place",
+        "findPlace" => "By Place or Address",
         "geocode" => "Geocode Addresses",
         "addUrl" => "Add Data From URL",
         "addService" => "Add From Service",
         "addDatabase" => "Add From Database",
+        "pgSave" => "Save to PostGIS",
+        "pgDiscard" => "Discard PostGIS Edits",
+        "gpkgAddLayer" => "Edit GeoPackage Table",
+        "gpkgSave" => "Save to GeoPackage",
+        "gpkgDiscard" => "Discard GeoPackage Edits",
+        "newConnection" => "New Connection",
+        "editConnection" => "Edit Connection",
+        "chooseConnection" => "Choose Connection",
         "s3" => "S3 Buckets",
+        "s3Connections" => "Choose S3 connection",
         "zarr" => "Add Zarr Variable",
         "exportLayer" => "Export Features",
         "saveProject" => "Save Project As",
@@ -157,14 +274,29 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         "renameGroup" => "Rename Group",
         _ => "Rename Layer",
     };
+
+    // list of dialogs which should allow collapse feature
+    let collapsible_windows = ["addService"];
+    let should_be_collapsible = collapsible_windows.contains(&which);
+
     let t = Tokens::get(ctx);
     let mut open = true;
     let mut close = false;
+
+    let window_id = egui::Id::unique(("dialog", which));
+
+    if app.dialogs.reset_collapse {
+        let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ctx, window_id.with("collapsing"), true);
+        state.set_open(true);
+        state.store(ctx);
+        app.dialogs.reset_collapse = false;
+    }
+
     // Opens centred and can be moved; each dialog remembers where it was put.
     egui::Window::new(tl!(title))
-        .id(egui::Id::new(("dialog", which)))
+        .id(window_id)
         .open(&mut open)
-        .collapsible(false)
+        .collapsible(should_be_collapsible)
         .resizable(false)
         .pivot(Align2::CENTER_CENTER)
         .default_pos(ctx.content_rect().center() + vec2(0.0, -40.0))
@@ -172,6 +304,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         ui.set_width(match which {
             "coordinateSystem" | "zarr" => 660.0,
             "addTiles" | "addUrl" | "addService" | "s3" => 560.0,
+            "newConnection" | "editConnection" | "chooseConnection" | "s3Connections" => 520.0,
             _ => 440.0,
         });
         ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
@@ -179,14 +312,14 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
             "selectByAttributes" => close = select_by_attributes(app, ui, &t),
             "goToXY" => {
                 egui::Grid::new("xy").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
-                    ui.label(tl!("Longitude (X)"));
-                    ui.add(egui::TextEdit::singleline(&mut app.dialogs.a).desired_width(200.0));
+                    let input_label = ui.label(tl!("Longitude (X)"));
+                    ui.add(egui::TextEdit::singleline(&mut app.dialogs.a).desired_width(200.0)).labelled_by(input_label.id);
                     ui.end_row();
-                    ui.label(tl!("Latitude (Y)"));
-                    ui.add(egui::TextEdit::singleline(&mut app.dialogs.b).desired_width(200.0));
+                    let input_label = ui.label(tl!("Latitude (Y)"));
+                    ui.add(egui::TextEdit::singleline(&mut app.dialogs.b).desired_width(200.0)).labelled_by(input_label.id);
                     ui.end_row();
-                    ui.label(tl!("Scale 1:"));
-                    ui.add(egui::TextEdit::singleline(&mut app.dialogs.c).hint_text(tl!("keep current")).desired_width(200.0));
+                    let input_label = ui.label(tl!("Scale 1:"));
+                    ui.add(egui::TextEdit::singleline(&mut app.dialogs.c).hint_text(tl!("keep current")).desired_width(200.0)).labelled_by(input_label.id);
                     ui.end_row();
                 });
                 close = buttons(app, ui, "Go", |app| {
@@ -198,6 +331,37 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 });
             }
             "coordinateSystem" => close = coordinate_system(app, ui, &t),
+            "addShapefile" => {
+                ui.label(tl!("Choose the source coordinate system before importing. It replaces a missing or incorrect .prj without changing the original file."));
+                let input_label = ui.label(tl!("Source coordinate system"));
+                let response = ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text("EPSG:2263").desired_width(f32::INFINITY)).labelled_by(input_label.id);
+                response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, tl!("Source coordinate system")));
+                ui.label(tl!("In the browser, pick the .shp and .dbf together, with any sidecars, or pick a ZIP. The override applies to every Shapefile in the ZIP."));
+                close = buttons(app, ui, "Choose File…", |app| app.run("ui.importShapefile", json!({"crs": app.dialogs.text.trim()})).map(|_| ()));
+            }
+            "defineProjection" => {
+                ui.label(egui::RichText::new(&app.dialogs.layer).strong());
+                ui.label(tl!("Interpret the layer's native coordinates in this coordinate system. This changes where it draws; the source file is unchanged."));
+                let input_label = ui.label(tl!("Source coordinate system"));
+                let label = ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text("EPSG:2263").desired_width(f32::INFINITY)).labelled_by(input_label.id);
+                label.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, tl!("Source coordinate system")));
+                ui.label(egui::RichText::new(tl!("Geometry lost during import cannot be recovered here. Use Import Original File to choose its coordinate system before reading it. Streamed layers must first be loaded into memory.")).weak());
+                if ui.button(tl!("Import Original File…")).clicked() {
+                    let crs = app.dialogs.text.clone();
+                    if app.dialogs.open("addShapefile", &app.session).is_ok() {
+                        app.dialogs.text = crs;
+                    }
+                }
+                close = buttons(app, ui, "Apply", |app| {
+                    if !app.dialogs.projection_map.as_ref().is_some_and(|(project, index, name)| {
+                        *project == app.session.opened && *index == app.session.project.active_map && *name == app.session.map().name
+                    }) {
+                        return Err(tl!("The active project or map changed; reopen Define Projection for the intended layer.").into());
+                    }
+                    let id = app.dialogs.projection_layer.ok_or(tl!("No layer selected"))?;
+                    app.run("layer.defineProjection", json!({"layer": id, "crs": app.dialogs.text.trim()})).map(|_| ())
+                });
+            }
             "basemap" | "body" | "addSample" | "layerTemplate" => {
                 // Menu items close their nearest closable parent. Keep that local to the
                 // gallery so picking an item doesn't persistently collapse the Window's body.
@@ -237,14 +401,22 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
             "addUrl" => close = add_url(app, ui),
             "addService" => close = add_service(app, ui),
             "addDatabase" => close = add_database(app, ui),
+            "pgSave" => close = pg_save(app, ui),
+            "pgDiscard" => close = pg_discard(app, ui),
+            "gpkgAddLayer" => close = gpkg_add_layer(app, ui),
+            "gpkgSave" => close = gpkg_save(app, ui),
+            "gpkgDiscard" => close = gpkg_discard(app, ui),
+            "newConnection" | "editConnection" => close = crate::connectionui::dialog(app, ui),
+            "chooseConnection" => close = crate::connectionui::chooser(app, ui),
             "s3" => crate::s3ui::dialog(app, ui),
+            "s3Connections" => close = crate::connectionui::s3_chooser(app, ui),
             "zarr" => close = crate::zarrui::dialog(app, ui),
             "exportLayer" => close = export_layer(app, ui),
             "camera" => {
                 egui::Grid::new("cam").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
                     for (label, v) in [("Longitude", &mut app.dialogs.a), ("Latitude", &mut app.dialogs.b), ("Scale 1:", &mut app.dialogs.c)] {
-                        ui.label(tl!(label));
-                        ui.add(egui::TextEdit::singleline(v).desired_width(160.0));
+                        let input_label = ui.label(tl!(label));
+                        ui.add(egui::TextEdit::singleline(v).desired_width(160.0)).labelled_by(input_label.id);
                         ui.end_row();
                     }
                     ui.label(tl!("Projection"));
@@ -265,8 +437,8 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 });
             }
             "bookmark" => {
-                ui.label(tl!("Name"));
-                ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).desired_width(f32::INFINITY));
+                let input_label = ui.label(tl!("Name"));
+                ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).desired_width(f32::INFINITY)).labelled_by(input_label.id);
                 // What the place is (#351); Enter creates the bookmark, Shift+Enter starts a line.
                 ui.label(tl!("Description"));
                 let hint = tl!("Optional. Shift+Enter starts a new line.");
@@ -277,15 +449,15 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
             }
             "addField" => {
                 egui::Grid::new("af").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
-                    ui.label(tl!("Field name"));
-                    ui.add(egui::TextEdit::singleline(&mut app.dialogs.a).desired_width(220.0));
+                    let input_label = ui.label(tl!("Field name"));
+                    ui.add(egui::TextEdit::singleline(&mut app.dialogs.a).desired_width(220.0)).labelled_by(input_label.id);
                     ui.end_row();
-                    ui.label(tl!("Data type"));
+                    let input_label = ui.label(tl!("Data type"));
                     egui::ComboBox::from_id_salt("af_type").selected_text(app.dialogs.b.clone()).show_ui(ui, |ui| {
                         for ty in ["Long", "Double", "Text", "Boolean"] {
                             ui.selectable_value(&mut app.dialogs.b, ty.to_string(), ty);
                         }
-                    });
+                    }).response.labelled_by(input_label.id);
                     ui.end_row();
                 });
                 close = buttons(app, ui, "Add", |app| app.run("edit.addField", json!({"name": app.dialogs.a, "type": app.dialogs.b})).map(|_| ()));
@@ -293,15 +465,15 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
             "calculateField" => {
                 let fields: Vec<String> = app.session.active_layer.and_then(|id| app.session.map().layer(id)).map(|l| l.dataset.fields.iter().map(|f| f.name.clone()).collect()).unwrap_or_default();
                 ui.horizontal(|ui| {
-                    ui.label(tl!("Field"));
+                    let input_label = ui.label(tl!("Field"));
                     egui::ComboBox::from_id_salt("cf_field").selected_text(app.dialogs.a.clone()).width(220.0).show_ui(ui, |ui| {
                         for f in &fields {
                             ui.selectable_value(&mut app.dialogs.a, f.clone(), f);
                         }
-                    });
+                    }).response.labelled_by(input_label.id);
                 });
-                ui.label(format!("{} =", app.dialogs.a));
-                ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text(tl!("e.g.  pop_est / 1000000   or   'Africa'   or   name")).desired_width(f32::INFINITY));
+                let input_label = ui.label(format!("{} =", app.dialogs.a));
+                ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text(tl!("e.g.  pop_est / 1000000   or   'Africa'   or   name")).desired_width(f32::INFINITY)).labelled_by(input_label.id);
                 ui.label(egui::RichText::new(tl!("A value, a field, or two of them joined by + − × ÷. Applies to the selected rows, or every row when none is selected.")).small().weak());
                 close = buttons(app, ui, "Calculate", |app| app.run("edit.calculateField", json!({"field": app.dialogs.a, "expression": app.dialogs.text})).map(|_| ()));
             }
@@ -316,8 +488,8 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
             "saveProject" => close = save_project(app, ui),
             // `a` is the map or layout being renamed; an empty or unchanged name just closes.
             "renameMap" | "renameLayout" => {
-                ui.label(tl!("Name"));
-                ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).desired_width(f32::INFINITY));
+                let input_label = ui.label(tl!("Name"));
+                ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).desired_width(f32::INFINITY)).labelled_by(input_label.id);
                 close = buttons(app, ui, "Rename", |app| {
                     let (old, new) = (app.dialogs.a.clone(), app.dialogs.text.trim().to_string());
                     if new.is_empty() || new == old {
@@ -332,24 +504,24 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 });
             }
             "renameServiceGroup" => {
-                ui.label(tl!("Name"));
-                ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).desired_width(f32::INFINITY));
+                let input_label = ui.label(tl!("Name"));
+                ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).desired_width(f32::INFINITY)).labelled_by(input_label.id);
                 close = buttons(app, ui, "Rename", |app| {
                     let group = app.dialogs.layer.parse::<u32>().map_err(|e| e.to_string())?;
                     app.run("service.group", json!({"group":group,"name":app.dialogs.text})).map(|_| ())
                 });
             }
             "renameGroup" => {
-                ui.label(tl!("Name"));
-                ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).desired_width(f32::INFINITY));
+                let input_label = ui.label(tl!("Name"));
+                ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).desired_width(f32::INFINITY)).labelled_by(input_label.id);
                 close = buttons(app, ui, "Rename", |app| {
                     let group = app.dialogs.layer.parse::<u32>().map_err(|e| e.to_string())?;
                     app.run("group.set", json!({"group": group, "name": app.dialogs.text})).map(|_| ())
                 });
             }
             _ => {
-                ui.label(tl!("Name"));
-                ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).desired_width(f32::INFINITY));
+                let input_label = ui.label(tl!("Name"));
+                ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).desired_width(f32::INFINITY)).labelled_by(input_label.id);
                 close = buttons(app, ui, "Rename", |app| app.run("layer.rename", json!({"name": app.dialogs.text})).map(|_| ()));
             }
         }
@@ -406,14 +578,19 @@ fn export_layer(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
         ui.label(tl!("Layer"));
         ui.label(&app.dialogs.layer);
         ui.end_row();
-        ui.label(tl!("Format"));
+        let input_label = ui.label(tl!("Format"));
         let shown = EXPORT_FORMATS.iter().find(|(_, e)| *e == app.dialogs.mode).map(|(l, _)| *l).unwrap_or("GeoJSON");
-        egui::ComboBox::from_id_salt("export_format").selected_text(shown).width(220.0).show_ui(ui, |ui| {
-            // GeoPackages are written with SQLite, which the web app doesn't have.
-            for (label, ext) in EXPORT_FORMATS.iter().filter(|(_, e)| !(web && *e == "gpkg")) {
-                ui.selectable_value(&mut app.dialogs.mode, *ext, *label);
-            }
-        });
+        egui::ComboBox::from_id_salt("export_format")
+            .selected_text(shown)
+            .width(220.0)
+            .show_ui(ui, |ui| {
+                // GeoPackages are written with SQLite, which the web app doesn't have.
+                for (label, ext) in EXPORT_FORMATS.iter().filter(|(_, e)| !(web && *e == "gpkg")) {
+                    ui.selectable_value(&mut app.dialogs.mode, *ext, *label);
+                }
+            })
+            .response
+            .labelled_by(input_label.id);
         ui.end_row();
     });
     if app.dialogs.mode == "shp" && web {
@@ -498,7 +675,7 @@ fn add_csv(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     egui::Grid::new("csv").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
         let columns = app.dialogs.list.clone();
         for (i, label) in ["X column", "Y column", "WKT column"].into_iter().enumerate() {
-            ui.label(tl!(label));
+            let input_label = ui.label(tl!(label));
             let d = &mut app.dialogs;
             let v = match i {
                 0 => &mut d.a,
@@ -507,12 +684,17 @@ fn add_csv(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             };
             let before = v.clone();
             let selected = if v.is_empty() { tl!("None").to_string() } else { v.clone() };
-            egui::ComboBox::from_id_salt(("csv_column", i)).selected_text(selected).width(240.0).show_ui(ui, |ui| {
-                ui.selectable_value(v, String::new(), tl!("None"));
-                for c in &columns {
-                    ui.selectable_value(v, c.clone(), c.as_str());
-                }
-            });
+            egui::ComboBox::from_id_salt(("csv_column", i))
+                .selected_text(selected)
+                .width(240.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(v, String::new(), tl!("None"));
+                    for c in &columns {
+                        ui.selectable_value(v, c.clone(), c.as_str());
+                    }
+                })
+                .response
+                .labelled_by(input_label.id);
             // x/y columns or a WKT column, not both.
             if *v != before && !v.is_empty() {
                 if i == 2 {
@@ -523,19 +705,24 @@ fn add_csv(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             }
             ui.end_row();
         }
-        ui.label(tl!("Coordinate system"));
-        ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text("EPSG:4326").desired_width(240.0));
+        let input_label = ui.label(tl!("Coordinate system"));
+        ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text("EPSG:4326").desired_width(240.0)).labelled_by(input_label.id);
         ui.end_row();
         // A sheet has no separator.
         if !sheet {
-            ui.label(tl!("Separator"));
+            let input_label = ui.label(tl!("Separator"));
             let before = app.dialogs.mode;
             let shown = SEPARATORS.iter().find(|(c, _)| *c == app.dialogs.mode).map(|(_, l)| tl!(*l).to_string()).unwrap_or_default();
-            egui::ComboBox::from_id_salt("csv_sep").selected_text(shown).width(240.0).show_ui(ui, |ui| {
-                for (code, label) in SEPARATORS {
-                    ui.selectable_value(&mut app.dialogs.mode, code, tl!(label));
-                }
-            });
+            egui::ComboBox::from_id_salt("csv_sep")
+                .selected_text(shown)
+                .width(240.0)
+                .show_ui(ui, |ui| {
+                    for (code, label) in SEPARATORS {
+                        ui.selectable_value(&mut app.dialogs.mode, code, tl!(label));
+                    }
+                })
+                .response
+                .labelled_by(input_label.id);
             reread = app.dialogs.mode != before;
             ui.end_row();
         }
@@ -607,14 +794,28 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     if app.dialogs.mode == "new" {
         app.dialogs.mode = "auto";
     }
+    let list = crate::sourcespane::connections_snapshot(app);
+    let address = if app.dialogs.mode == "csw" { &app.ui.csw.url } else { &app.dialogs.text };
+    let current = crate::connectionui::picked(&list, app.dialogs.connection.as_deref(), address);
+    if let Some(c) = crate::connectionui::picker(ui, "service_saved", &list, crate::connectionui::SERVICE_KINDS, current) {
+        if let Err(e) = crate::connectionui::open_connection(app, &c) {
+            app.dialogs.error = Some(e);
+        }
+        return false;
+    }
     let kinds = |app: &mut RustGisApp, ui: &mut egui::Ui| {
-        ui.label(tl!("Type"));
+        let input_label = ui.label(tl!("Type"));
         let shown = KINDS.iter().find(|(c, _)| *c == app.dialogs.mode).map(|(_, l)| tl!(*l).to_string()).unwrap_or_default();
-        egui::ComboBox::from_id_salt("service_kind").selected_text(shown).width(240.0).show_ui(ui, |ui| {
-            for (code, label) in KINDS {
-                ui.selectable_value(&mut app.dialogs.mode, code, tl!(label));
-            }
-        });
+        egui::ComboBox::from_id_salt("service_kind")
+            .selected_text(shown)
+            .width(240.0)
+            .show_ui(ui, |ui| {
+                for (code, label) in KINDS {
+                    ui.selectable_value(&mut app.dialogs.mode, code, tl!(label));
+                }
+            })
+            .response
+            .labelled_by(input_label.id);
     };
     // A catalogue: searched for records, whose links connect here or download.
     if app.dialogs.mode == "csw" {
@@ -625,8 +826,10 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     ui.label(egui::RichText::new(tl!("A map, feature or coverage service's address: WMS, WMTS, WFS, WCS, OGC API Features or Tiles, or an ArcGIS FeatureServer, MapServer, ImageServer or VectorTileServer (or a services directory, to browse).")).weak());
     let mut connect = false;
     egui::Grid::new("service").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
-        ui.label(tl!("Address"));
-        let r = ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text("https://…/wms").desired_width(420.0));
+        let input_label = ui.label(tl!("Address"));
+        let r = ui
+            .add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text("https://…/wms").desired_width(420.0))
+            .labelled_by(input_label.id);
         connect |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         ui.end_row();
         kinds(app, ui);
@@ -636,6 +839,10 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     ui.horizontal(|ui| {
         connect |= crate::widgets::dialog_button(ui, tl!("Connect"), Some(t.accent), vec2(96.0, 28.0)).clicked();
     });
+    // A secured ArcGIS service: sign in to its portal first.
+    if crate::arcgisui::wanted(app) {
+        crate::arcgisui::section(app, ui);
+    }
     if connect {
         let url = app.dialogs.text.trim().to_string();
         app.dialogs.error = None;
@@ -652,6 +859,11 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     // A directory's folder or service to open, or Back to the directory before.
     let mut open: Option<String> = None;
     let mut back = false;
+    let keepable = app.ui.service.as_ref().and_then(|conn| {
+        let (url, kind) = app.ui.service_browse.back.first().map(|(u, k)| (u.as_str(), *k)).unwrap_or((&conn.url, conn.kind));
+        crate::connectionui::picked(&list, app.dialogs.connection.as_deref(), url).is_none().then(|| (url.to_string(), kind))
+    });
+    let mut keep_root = false;
     if let Some(conn) = &app.ui.service {
         ui.separator();
         if let Some(e) = &conn.error {
@@ -676,13 +888,18 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             let none = Vec::new();
             let layers = v.get("layers").and_then(Value::as_array).unwrap_or(&none);
             let grouped = kind.starts_with("OGC API");
-            ui.label(
-                egui::RichText::new(crate::i18n::fmt(
-                    "{kind} {title}: {count} layers",
-                    &[("kind", kind), ("title", title), ("count", &layers.len().to_string())],
-                ))
-                .strong(),
-            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(crate::i18n::fmt(
+                        "{kind} {title}: {count} layers",
+                        &[("kind", kind), ("title", title), ("count", &layers.len().to_string())],
+                    ))
+                    .strong(),
+                );
+                if keepable.is_some() && conn.pending.is_none() && conn.error.is_none() && conn.failure.is_none() {
+                    keep_root = crate::connectionui::keep_button(ui);
+                }
+            });
             for n in v.get("notes").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
                 ui.label(egui::RichText::new(n).small().weak());
             }
@@ -694,18 +911,41 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                         back = true;
                     }
                     if layers.len() > 12 {
-                        ui.label(tl!("Filter"));
-                        ui.add(egui::TextEdit::singleline(&mut browse.filter).hint_text(tl!("words in the name")).desired_width(260.0));
+                        let input_label = ui.label(tl!("Filter"));
+                        ui.add(egui::TextEdit::singleline(&mut browse.filter).hint_text(tl!("words in the name")).desired_width(260.0))
+                            .labelled_by(input_label.id);
                     }
                 });
             }
-            // Layers that change with time (NASA GIBS's) are added at a date.
+            // Layers that change with time (NASA GIBS's, swisstopo's maps by year) are added at a
+            // date; empty, at the service's default.
             if layers.iter().any(|l| l.get("time").is_some()) {
                 ui.horizontal(|ui| {
-                    ui.label(tl!("Date"));
-                    ui.add(egui::TextEdit::singleline(&mut browse.time).hint_text(tl!("latest")).desired_width(120.0));
-                    ui.label(egui::RichText::new(tl!("YYYY-MM-DD, for the layers that change with time")).small().weak());
+                    let mut follow = !browse.fixed;
+                    if ui
+                        .checkbox(&mut follow, tl!("Follow the time slider"))
+                        .on_hover_text(tl!("Step through the layer's times with the time slider (View › Time), which starts with them"))
+                        .changed()
+                    {
+                        browse.fixed = !follow;
+                    }
+                    let input_label = ui.label(tl!("Date"));
+                    ui.add_enabled(
+                        browse.fixed,
+                        egui::TextEdit::singleline(&mut browse.time).hint_text(tl!("its default")).desired_width(120.0),
+                    )
+                    .labelled_by(input_label.id);
+                    ui.label(
+                        egui::RichText::new(tl!("for the layers that change with time, as they list their times (2024-06-01, 1995)"))
+                            .small()
+                            .weak(),
+                    );
                 });
+            }
+            // Feature layers come whole, or only the features crossing the map's view.
+            if !grouped && layers.iter().any(|l| l["offer"]["type"] == "features") {
+                ui.checkbox(&mut browse.area, tl!("Only the map's area"))
+                    .on_hover_text(tl!("Feature layers: ask the service only for the features that cross the map's view"));
             }
             if grouped && layers.iter().any(|l| l["offer"]["type"] == "features") {
                 ui.horizontal(|ui| {
@@ -732,38 +972,85 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                     egui::RichText::new(crate::i18n::fmt("The first {n} are listed.", &[("n", &SHOWN_LAYERS.to_string())])).small().weak(),
                 );
             }
-            egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-                for l in matching.into_iter().take(SHOWN_LAYERS) {
-                    ui.horizontal(|ui| {
-                        let kind = l.get("offer").and_then(|o| o.get("type")).and_then(Value::as_str);
-                        if kind == Some("service") {
-                            if ui.small_button(tl!("Open")).clicked() {
-                                open = l.get("offer").and_then(|o| o.get("url")).and_then(Value::as_str).map(str::to_string);
-                            }
-                        } else if !(grouped && kind == Some("features")) && ui.small_button(tl!("Add")).clicked() {
-                            add = Some(l.clone());
+            let ui_width = ui.available_width();
+            egui::Resize::default()
+                .id_salt("add_service_layers")
+                .default_height(280.0)
+                .min_height(100.0)
+                .max_height(350.0)
+                .resizable(true)
+                .max_width(ui_width)
+                .min_width(ui_width)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for l in matching.into_iter().take(SHOWN_LAYERS) {
+                            ui.horizontal(|ui| {
+                                let kind = l.get("offer").and_then(|o| o.get("type")).and_then(Value::as_str);
+
+                                if kind == Some("service") {
+                                    if ui.small_button(tl!("Open")).clicked() {
+                                        open = l.get("offer").and_then(|o| o.get("url")).and_then(Value::as_str).map(str::to_string);
+                                    }
+                                } else if !(grouped && kind == Some("features")) && ui.small_button(tl!("Add")).clicked() {
+                                    add = Some(l.clone());
+                                }
+
+                                let name = l.get("name").and_then(Value::as_str).unwrap_or("");
+                                ui.label(l.get("title").and_then(Value::as_str).unwrap_or(name)).on_hover_text(name);
+
+                                let what = match kind {
+                                    Some("features") => tl!("features"),
+                                    Some("style") => tl!("style"),
+                                    Some("coverage") => tl!("coverage"),
+                                    Some("service") if name.ends_with('/') => tl!("folder"),
+                                    Some("service") => tl!("service"),
+                                    _ if l.get("time").is_some() => tl!("map by date"),
+                                    _ => tl!("map"),
+                                };
+
+                                let what = ui.label(egui::RichText::new(what).small().weak());
+                                // The times a layer lists, to pick one for Date: made only while hovered.
+                                if let Some(t) = l.get("time") {
+                                    what.on_hover_ui(|ui| {
+                                        let values: Vec<&str> =
+                                            t["values"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                                        let default = t["default"].as_str().unwrap_or("");
+                                        // The first and last few of a long list (`service.layers` lists
+                                        // those, with how many there are).
+                                        let count = t["count"].as_u64().and_then(|c| usize::try_from(c).ok()).unwrap_or(values.len());
+                                        let half = values.len() / 2;
+                                        let times = if count > values.len() {
+                                            format!(
+                                                "{}, …, {}",
+                                                values.get(..half).unwrap_or(&[]).join(", "),
+                                                values.get(half..).unwrap_or(&[]).join(", ")
+                                            )
+                                        } else {
+                                            values.join(", ")
+                                        };
+                                        ui.label(crate::i18n::fmt(
+                                            "Its default: {default}. Its times: {times}",
+                                            &[("default", default), ("times", &times)],
+                                        ));
+                                    });
+                                }
+                            });
                         }
-                        let name = l.get("name").and_then(Value::as_str).unwrap_or("");
-                        ui.label(l.get("title").and_then(Value::as_str).unwrap_or(name)).on_hover_text(name);
-                        let what = match kind {
-                            Some("features") => tl!("features"),
-                            Some("style") => tl!("style"),
-                            Some("coverage") => tl!("coverage"),
-                            Some("service") if name.ends_with('/') => tl!("folder"),
-                            Some("service") => tl!("service"),
-                            _ if l.get("time").is_some() => tl!("map by date"),
-                            _ => tl!("map"),
-                        };
-                        ui.label(egui::RichText::new(what).small().weak());
                     });
-                }
-            });
+                });
         }
         if let Some(pending) = &conn.pending {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(crate::i18n::fmt("Connecting to {url}…", &[("url", pending)]));
             });
+        }
+    }
+    if keep_root && let Some((url, kind)) = keepable {
+        // "auto" is the dialog's detection mode; saved connections call that kind "service".
+        match crate::connectionui::keep(app, json!({"kind": if kind == "auto" { "service" } else { kind }, "address": url})) {
+            Ok(id) => app.dialogs.connection = Some(id),
+            Err(e) => app.dialogs.error = Some(e),
         }
     }
     if let Some(p) = import
@@ -791,60 +1078,22 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
         });
     }
     if let (Some(l), Some(conn)) = (add, &app.ui.service) {
-        let (url, kind, text) = (conn.url.clone(), conn.kind, conn.text.clone().unwrap_or_default());
-        let name = l.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-        let title = l.get("title").and_then(Value::as_str).unwrap_or(&name).to_string();
-        let offer = l.get("offer").cloned().unwrap_or_default();
-        // Features are downloaded in the background, as From URL… does; map layers are added now.
-        let r = if offer.get("type").and_then(Value::as_str) == Some("features") {
-            let items = offer.get("url").and_then(Value::as_str).unwrap_or("").to_string();
-            app.run("ui.addUrl", json!({"url": items, "name": title, "service": true})).map(|_| tl!("Downloading…"))
-        } else if offer.get("type").and_then(Value::as_str) == Some("coverage") {
-            // A coverage: its description first, off the frame (poll_describe asks for it).
-            let describe = offer.get("describe").and_then(Value::as_str).unwrap_or("").to_string();
-            let mut p = json!({"url": url, "layer": name, "text": text, "name": title, "documents": conn.documents});
-            if kind != "auto" {
-                p["type"] = json!(kind);
-            }
-            let slot = crate::fetch_into(&describe);
-            if let Some(c) = &mut app.ui.service {
-                c.describing = Some((p, slot));
-            }
-            Ok(tl!("Describing"))
-        } else {
-            let mut p = json!({"url": url, "layer": name, "text": text, "documents": conn.documents, "source_url": l.get("source_url")});
-            if kind != "auto" {
-                p["type"] = json!(kind);
-            }
-            let time = app.ui.service_browse.time.trim();
-            if l.get("time").is_some() && !time.is_empty() {
-                p["time"] = json!(time);
-            }
-            match l.get("tilesets").and_then(Value::as_str) {
-                // An OGC API layer: its tileset's advertised template is read first, off the
-                // frame (poll_tiles_resolve adds the layer).
-                Some(list) => {
-                    p["name"] = json!(title);
-                    let fallback = offer.get("url").and_then(Value::as_str).unwrap_or("").to_string();
-                    let vector = offer.get("type").and_then(Value::as_str) == Some("vectorTiles");
-                    let slot = crate::fetch_into(list);
-                    if let Some(c) = &mut app.ui.service {
-                        c.resolving = Some(crate::TilesResolve {
-                            params: p,
-                            list: list.to_string(),
-                            doc: list.to_string(),
-                            read: 0,
-                            vector,
-                            fallback,
-                            slot,
-                        });
-                    }
-                    Ok(tl!("Reading the tileset of"))
-                }
-                None => app.run("service.add", p).map(|_| tl!("Added")),
-            }
+        let src = crate::serviceui::ServiceSource {
+            url: conn.url.clone(),
+            kind: conn.kind,
+            text: conn.text.clone().unwrap_or_default(),
+            documents: conn.documents.clone(),
         };
-        match r {
+        let name = l.get("name").and_then(Value::as_str).unwrap_or("");
+        let title = l.get("title").and_then(Value::as_str).unwrap_or(name).to_string();
+        // Features are downloaded in the background, as From URL… does; map layers are added now.
+        let time = crate::webdataui::fixed_or_slider(app.ui.service_browse.fixed, &app.ui.service_browse.time);
+        // The view's area, for a feature layer only: a map layer never asks for one, so an
+        // unknown view can't stop it.
+        let features = l["offer"]["type"] == "features";
+        let area =
+            (features && app.ui.service_browse.area).then(|| rustgis_engine::cmd::catalogs::area(&app.session, &Value::Null)).transpose();
+        match area.and_then(|area| crate::serviceui::add_layer(app, &src, &l, &time, area, true)) {
             Ok(m) => app.dialogs.info = Some(format!("{m} {title}")),
             Err(e) => app.dialogs.error = Some(e),
         }
@@ -867,11 +1116,13 @@ fn add_url(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     };
     ui.label(egui::RichText::new(hint).weak());
     egui::Grid::new("url").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
-        ui.label(tl!("Address"));
-        ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text("https://…/data.geojson").desired_width(400.0));
+        let input_label = ui.label(tl!("Address"));
+        ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text("https://…/data.geojson").desired_width(400.0))
+            .labelled_by(input_label.id);
         ui.end_row();
-        ui.label(tl!("Name"));
-        ui.add(egui::TextEdit::singleline(&mut app.dialogs.a).hint_text(tl!("from the address")).desired_width(400.0));
+        let input_label = ui.label(tl!("Name"));
+        ui.add(egui::TextEdit::singleline(&mut app.dialogs.a).hint_text(tl!("from the address")).desired_width(400.0))
+            .labelled_by(input_label.id);
         ui.end_row();
     });
     buttons(app, ui, "Add", |app| {
@@ -896,51 +1147,144 @@ fn add_database(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             a.to_string()
         }
     };
+    let connections = crate::sourcespane::connections_snapshot(app);
+    let typed = database(&app.dialogs.a);
+    let current = crate::connectionui::picked(&connections, app.dialogs.connection.as_deref(), &typed);
+    #[cfg(not(target_arch = "wasm32"))]
+    let postgres = rustgis_engine::connections::database_kind(&typed) == Some("postgres");
+    let mut pick = None;
     let mut list = false;
     egui::Grid::new("database").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
-        ui.label(tl!("Connection"));
-        ui.add(egui::TextEdit::singleline(&mut app.dialogs.a).hint_text("host=localhost dbname=gis user=postgres").desired_width(280.0));
+        let kinds = rustgis_engine::connections::DATABASE_KINDS;
+        if connections.iter().any(|c| kinds.contains(&c.kind.as_str())) {
+            ui.label(tl!("Saved connection"));
+            pick = crate::connectionui::picker_combo(ui, "database_saved", &connections, kinds, current);
+            ui.end_row();
+        }
+        let input_label = ui.label(tl!("Connection"));
+        ui.add(egui::TextEdit::singleline(&mut app.dialogs.a).hint_text("host=localhost dbname=gis user=postgres").desired_width(280.0))
+            .labelled_by(input_label.id);
         ui.end_row();
-        ui.label(tl!("Password"));
+        let input_label = ui.label(tl!("Password"));
         ui.add(
             egui::TextEdit::singleline(&mut app.dialogs.b)
                 .password(true)
                 .hint_text(tl!("none, or from PGPASSWORD, MYSQL_PWD or SQLCMDPASSWORD"))
                 .desired_width(280.0),
-        );
+        )
+        .labelled_by(input_label.id);
         ui.end_row();
         ui.label(tl!("Table"));
         ui.horizontal(|ui| {
             let shown = if app.dialogs.c.is_empty() { tl!("All tables with geometry").to_string() } else { app.dialogs.c.clone() };
-            egui::ComboBox::from_id_salt("db_table").selected_text(shown).width(190.0).show_ui(ui, |ui| {
-                ui.selectable_value(&mut app.dialogs.c, String::new(), tl!("All tables with geometry"));
-                for t in app.dialogs.list.clone() {
-                    ui.selectable_value(&mut app.dialogs.c, t.clone(), t);
-                }
-            });
+            egui::ComboBox::from_id_salt("db_table")
+                .selected_text(shown)
+                .width(190.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut app.dialogs.c, String::new(), tl!("All tables with geometry"));
+                    for t in app.dialogs.list.clone() {
+                        ui.selectable_value(&mut app.dialogs.c, t.clone(), t);
+                    }
+                })
+                .response
+                .on_hover_text(tl!("Table"));
             list = ui.button(tl!("List Tables")).clicked();
         });
         ui.end_row();
-        ui.label(tl!("Coordinate system"));
-        ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text(tl!("of a geometry that doesn't say")).desired_width(280.0));
+        let input_label = ui.label(tl!("Coordinate system"));
+        ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text(tl!("of a geometry that doesn't say")).desired_width(280.0))
+            .labelled_by(input_label.id);
         ui.end_row();
+        // A PostgreSQL table can instead be loaded whole, to be edited and saved back to it.
+        #[cfg(not(target_arch = "wasm32"))]
+        if postgres {
+            ui.label("");
+            ui.checkbox(&mut app.dialogs.edit, tl!("Load for editing")).on_hover_text(tl!(
+                "Load the table whole (up to 100,000 rows) so its edits can be saved back to it with Edit › Save to PostGIS. It needs a single-column integer primary key."
+            ));
+            ui.end_row();
+            if app.dialogs.edit {
+                let input_label = ui.label(tl!("Condition"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.dialogs.d)
+                        .hint_text(tl!("optional, such as population > 10000"))
+                        .desired_width(280.0),
+                )
+                .labelled_by(input_label.id);
+                ui.end_row();
+                let input_label = ui.label(tl!("Most rows"));
+                ui.add(egui::TextEdit::singleline(&mut app.dialogs.e).hint_text("100000").desired_width(280.0)).labelled_by(input_label.id);
+                ui.end_row();
+            }
+        }
     });
+    // The connection that layers loaded for editing save through, until RustGIS closes.
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(dsn) = app.session.postgis.clone() {
+        ui.horizontal(|ui| {
+            let short = rustgis_engine::data::source::duckdb::Database::Postgres(dsn).short();
+            ui.label(egui::RichText::new(crate::i18n::fmt("Connected for editing: {db}", &[("db", &short)])).weak());
+            if ui
+                .button(tl!("Disconnect"))
+                .on_hover_text(tl!("Close the connection that PostGIS layers loaded for editing save through."))
+                .clicked()
+                && let Err(e) = app.run("pg.disconnect", Value::Null)
+            {
+                app.dialogs.error = Some(e);
+            }
+        });
+    }
+    // The tables listed and the one chosen belong to the address they were listed for.
+    if app.dialogs.listed.as_deref().is_some_and(|l| l != database(&app.dialogs.a)) {
+        app.dialogs.listed = None;
+        app.dialogs.list.clear();
+        app.dialogs.c.clear();
+        app.dialogs.info = None;
+    }
+    if let Some(c) = pick {
+        if let Err(e) = crate::connectionui::open_connection(app, &c) {
+            app.dialogs.error = Some(e);
+        }
+        return false;
+    }
     if list {
         let p = json!({"database": database(&app.dialogs.a), "password": app.dialogs.b});
         match app.run("info.databaseTables", p) {
             Ok(v) => {
                 app.dialogs.list = v["layers"].as_array().into_iter().flatten().filter_map(|t| t.as_str().map(str::to_string)).collect();
+                app.dialogs.listed = Some(database(&app.dialogs.a));
                 app.dialogs.error = None;
                 app.dialogs.info = Some(crate::i18n::fmt("{n} tables with geometry", &[("n", &app.dialogs.list.len().to_string())]));
             }
             Err(e) => {
+                // What a failed listing leaves can't be tied to an address any more, so it goes too.
+                app.dialogs.listed = None;
+                app.dialogs.list.clear();
+                app.dialogs.c.clear();
                 app.dialogs.info = None;
                 app.dialogs.error = Some(e);
             }
         }
     }
+    ui.horizontal(|ui| {
+        let address = database(&app.dialogs.a);
+        if app.dialogs.listed.as_deref() == Some(address.as_str())
+            && let Some(kind) = rustgis_engine::connections::database_kind(&address)
+            && crate::connectionui::picked(&connections, app.dialogs.connection.as_deref(), &address).is_none()
+            && crate::connectionui::keep_button(ui)
+        {
+            match crate::connectionui::keep(app, json!({"kind": kind, "address": address})) {
+                Ok(id) => app.dialogs.connection = Some(id),
+                Err(e) => app.dialogs.error = Some(e),
+            }
+        }
+    });
     buttons(app, ui, "Add", |app| {
-        let mut p = json!({"database": database(&app.dialogs.a), "password": app.dialogs.b});
+        let address = database(&app.dialogs.a);
+        if app.dialogs.edit && rustgis_engine::connections::database_kind(&address) == Some("postgres") {
+            return add_for_editing(app, address);
+        }
+        let mut p = json!({"database": address, "password": app.dialogs.b});
         for (key, v) in [("layer", &app.dialogs.c), ("crs", &app.dialogs.text)] {
             if !v.trim().is_empty() {
                 p[key] = json!(v.trim());
@@ -952,6 +1296,264 @@ fn add_database(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             app.dialogs.b.clear();
         }
         r
+    })
+}
+
+/// Add From Database with Load for editing: connects to the PostgreSQL database for editing
+/// (`pg.connect`) and loads the chosen table whole (`pg.addLayer`).
+fn add_for_editing(app: &mut RustGisApp, address: String) -> Result<(), String> {
+    let d = &app.dialogs;
+    let table = d.c.trim();
+    if table.is_empty() {
+        return Err(tl!("Choose a table to load for editing").to_string());
+    }
+    let mut p = json!({"table": table});
+    for (key, v) in [("where", &d.d), ("crs", &d.text)] {
+        if !v.trim().is_empty() {
+            p[key] = json!(v.trim());
+        }
+    }
+    if !d.e.trim().is_empty() {
+        let n: u64 = d.e.trim().replace([',', '.'], "").parse().map_err(|_| tl!("Most rows: a whole number").to_string())?;
+        p["limit"] = json!(n);
+    }
+    let connect = json!({"connection": address, "password": d.b});
+    app.run("pg.connect", connect)?;
+    // The password is the session's to keep, not the dialog's.
+    app.dialogs.b.clear();
+    app.run("pg.addLayer", p).map(|_| ())
+}
+
+/// Load one GeoPackage feature table whole, to be edited and saved back to its file.
+fn gpkg_add_layer(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
+    ui.label(egui::RichText::new(tl!("Loads one feature table of a GeoPackage on this computer (up to 100,000 rows) so its edits can be saved back to that table with Edit › Save to GeoPackage. It needs an INTEGER PRIMARY KEY.")).weak());
+    let mut list = false;
+    egui::Grid::new("gpkg_add_layer").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
+        let input_label = ui.label(tl!("File"));
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut app.dialogs.a).desired_width(260.0)).labelled_by(input_label.id);
+            #[cfg(not(target_arch = "wasm32"))]
+            if ui.button(tl!("Browse…")).clicked()
+                && let Some(path) = pick_open(&["gpkg"], tl!("GeoPackage"))
+            {
+                app.dialogs.a = path;
+            }
+        });
+        ui.end_row();
+        let input_label = ui.label(tl!("Table"));
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("gpkg_table")
+                .selected_text(app.dialogs.c.clone())
+                .width(190.0)
+                .show_ui(ui, |ui| {
+                    for table in app.dialogs.list.clone() {
+                        ui.selectable_value(&mut app.dialogs.c, table.clone(), table);
+                    }
+                })
+                .response
+                .labelled_by(input_label.id);
+            list = ui.button(tl!("List Tables")).clicked();
+        });
+        ui.end_row();
+        let input_label = ui.label(tl!("Most rows"));
+        ui.add(egui::TextEdit::singleline(&mut app.dialogs.e).hint_text("100000").desired_width(280.0)).labelled_by(input_label.id);
+        ui.end_row();
+    });
+    if app.dialogs.listed.as_deref().is_some_and(|path| path != app.dialogs.a) {
+        app.dialogs.listed = None;
+        app.dialogs.list.clear();
+        app.dialogs.c.clear();
+        app.dialogs.info = None;
+    }
+    if list {
+        match app.run("info.fileLayers", json!({"path": app.dialogs.a})) {
+            Ok(v) => {
+                app.dialogs.list = v["layers"].as_array().into_iter().flatten().filter_map(|t| t.as_str().map(str::to_string)).collect();
+                app.dialogs.listed = Some(app.dialogs.a.clone());
+                app.dialogs.error = None;
+                app.dialogs.info = Some(crate::i18n::fmt("{n} tables with geometry", &[("n", &app.dialogs.list.len().to_string())]));
+            }
+            Err(e) => {
+                app.dialogs.listed = None;
+                app.dialogs.list.clear();
+                app.dialogs.c.clear();
+                app.dialogs.info = None;
+                app.dialogs.error = Some(e);
+            }
+        }
+    }
+    buttons(app, ui, "Load", |app| {
+        let mut p = json!({"path": app.dialogs.a.trim()});
+        if !app.dialogs.c.trim().is_empty() {
+            p["table"] = json!(app.dialogs.c.trim());
+        }
+        if !app.dialogs.e.trim().is_empty() {
+            let input = app.dialogs.e.trim();
+            let mut groups = input.split(',');
+            let first = groups.next().unwrap_or_default();
+            let grouped = first.len() != input.len();
+            if grouped
+                && (first.is_empty()
+                    || first.len() > 3
+                    || !first.bytes().all(|b| b.is_ascii_digit())
+                    || !groups.all(|group| group.len() == 3 && group.bytes().all(|b| b.is_ascii_digit())))
+            {
+                return Err(tl!("Most rows: a whole number").to_string());
+            }
+            let n: u64 = if grouped { input.replace(',', "").parse() } else { input.parse() }
+                .map_err(|_| tl!("Most rows: a whole number").to_string())?;
+            p["limit"] = json!(n);
+        }
+        app.run("gpkg.addLayer", p).map(|_| ())
+    })
+}
+
+/// A source-backed layer to save or discard the edits of, and what changed in it: its table
+/// and how many rows are new, changed and deleted (cached until the selection or session changes).
+fn source_layer_edits(app: &mut RustGisApp, ui: &mut egui::Ui, prefix: &'static str) {
+    if prefix == "gpkg"
+        && let Err(error) = app.dialogs.gpkg_owner(&app.session)
+    {
+        app.dialogs.list.clear();
+        app.dialogs.counted.clear();
+        app.dialogs.error = Some(error);
+        return;
+    }
+    let layers: Vec<(u32, u64, String)> = app
+        .session
+        .map()
+        .layers
+        .iter()
+        .filter(|l| if prefix == "pg" { l.postgis.is_some() } else { l.gpkg.is_some() })
+        .map(|l| (l.id, l.instance_id(), l.name.clone()))
+        .collect();
+    egui::Grid::new(("source_edits", prefix)).num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
+        ui.label(tl!("Layer"));
+        let selected = if prefix == "gpkg" {
+            layers
+                .iter()
+                .find(|(id, instance, _)| Some(*id) == app.dialogs.gpkg_layer && Some(*instance) == app.dialogs.gpkg_instance)
+                .map(|(id, _, name)| format!("{name} (#{id})"))
+                .unwrap_or_else(|| tl!("Choose a layer").to_string())
+        } else {
+            app.dialogs.layer.clone()
+        };
+        let previous = app.dialogs.gpkg_layer.zip(app.dialogs.gpkg_instance);
+        let mut selected_instance = previous;
+        egui::ComboBox::from_id_salt(("source_edit_layer", prefix)).selected_text(selected).width(260.0).show_ui(ui, |ui| {
+            for (id, instance, name) in &layers {
+                if prefix == "gpkg" {
+                    ui.selectable_value(&mut selected_instance, Some((*id, *instance)), format!("{name} (#{id})"));
+                } else {
+                    ui.selectable_value(&mut app.dialogs.layer, name.clone(), name);
+                }
+            }
+        });
+        if prefix == "gpkg" && selected_instance != previous {
+            app.dialogs.gpkg_layer = selected_instance.map(|(id, _)| id);
+            app.dialogs.gpkg_instance = selected_instance.map(|(_, instance)| instance);
+            app.dialogs.error = None;
+        }
+        ui.end_row();
+        let counted =
+            if prefix == "gpkg" { app.dialogs.gpkg_layer.map(|id| id.to_string()).unwrap_or_default() } else { app.dialogs.layer.clone() };
+        let invalid = if prefix == "gpkg" { app.dialogs.gpkg_target(&app.session).err() } else { None };
+        if invalid.is_some()
+            || app.dialogs.counted != counted
+            || (prefix == "gpkg" && app.dialogs.counted_revision != Some(app.session.revision))
+            || (prefix == "gpkg" && app.dialogs.counted_instance != app.dialogs.gpkg_instance)
+        {
+            app.dialogs.counted = counted;
+            app.dialogs.counted_instance = app.dialogs.gpkg_instance;
+            let result = if let Some(error) = invalid {
+                Err(error)
+            } else {
+                let target = if prefix == "gpkg" { json!(app.dialogs.gpkg_layer) } else { json!(app.dialogs.layer) };
+                app.run(&format!("{prefix}.pendingEdits"), json!({"layer": target}))
+            };
+            app.dialogs.list = match result {
+                Ok(v) => {
+                    if prefix == "gpkg" && app.dialogs.error.as_deref().is_some_and(is_gpkg_target_error) {
+                        app.dialogs.error = None;
+                    }
+                    vec![
+                        v["table"].as_str().unwrap_or_default().to_string(),
+                        v["inserts"].to_string(),
+                        v["updates"].to_string(),
+                        v["deletes"].to_string(),
+                        v["file"].as_str().unwrap_or_default().to_string(),
+                    ]
+                }
+                Err(e) => {
+                    app.dialogs.error = Some(e);
+                    Vec::new()
+                }
+            };
+            app.dialogs.counted_revision = Some(app.session.revision);
+        }
+        let shown = app.dialogs.list.clone();
+        if let Some(file) = shown.get(4).filter(|file| !file.is_empty()) {
+            ui.label(tl!("File"));
+            ui.label(egui::RichText::new(file).strong());
+            ui.end_row();
+        }
+        for (label, value) in [
+            (tl!("Table"), shown.first()),
+            (tl!("New rows"), shown.get(1)),
+            (tl!("Changed rows"), shown.get(2)),
+            (tl!("Deleted rows"), shown.get(3)),
+        ] {
+            ui.label(label);
+            ui.label(egui::RichText::new(value.cloned().unwrap_or_default()).strong());
+            ui.end_row();
+        }
+    });
+}
+
+/// Save PostGIS Edits: a PostGIS layer's edits written to its table in one transaction, or none
+/// of them when a row changed there since.
+fn pg_save(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
+    ui.label(egui::RichText::new(tl!("Saves the layer's edits to its table in one transaction. When a row you changed or deleted was changed or deleted in the database since it was loaded, or a new row's key is taken, nothing is saved and the rows are listed.")).weak());
+    source_layer_edits(app, ui, "pg");
+    buttons(app, ui, "Save", |app| {
+        let r = app.run("pg.saveEdits", json!({"layer": app.dialogs.layer})).map(|_| ());
+        // Counted again, whatever happened.
+        app.dialogs.counted.clear();
+        r
+    })
+}
+
+/// Discard PostGIS Edits: a PostGIS layer's rows loaded again as they are in the database.
+fn pg_discard(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
+    ui.label(egui::RichText::new(tl!("Loads the layer's rows again as they are in the database now. Its edits that weren't saved are dropped (Undo brings them back).")).weak());
+    source_layer_edits(app, ui, "pg");
+    buttons(app, ui, "Discard", |app| app.run("pg.discardEdits", json!({"layer": app.dialogs.layer})).map(|_| ()))
+}
+
+/// Save a GeoPackage layer's edits to its table in one transaction.
+fn gpkg_save(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
+    ui.label(egui::RichText::new(tl!("Saves the layer's edits to its table in the GeoPackage file in one transaction. When a row you changed or deleted was changed or deleted in the file since it was loaded, nothing is saved and the rows are listed. Saving the project keeps edits in the project only; exporting writes a new file.")).weak());
+    source_layer_edits(app, ui, "gpkg");
+    buttons(app, ui, "Save", |app| {
+        let id = app.dialogs.gpkg_target(&app.session)?;
+        let r = app.run("gpkg.saveEdits", json!({"layer": id})).map(|_| ());
+        app.dialogs.counted.clear();
+        r
+    })
+}
+
+/// Reload a GeoPackage layer's rows as they are in the file.
+fn gpkg_discard(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
+    ui.label(
+        egui::RichText::new(tl!(
+            "Loads the layer's rows again as they are in the file now. Its edits that weren't saved are dropped (Undo brings them back)."
+        ))
+        .weak(),
+    );
+    source_layer_edits(app, ui, "gpkg");
+    buttons(app, ui, "Discard", |app| {
+        let id = app.dialogs.gpkg_target(&app.session)?;
+        app.run("gpkg.discardEdits", json!({"layer": id})).map(|_| ())
     })
 }
 
@@ -978,30 +1580,41 @@ fn add_tiles(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             }
         });
         ui.end_row();
-        ui.label(tl!("Type"));
+        let input_label = ui.label(tl!("Type"));
         let guessed = TileKind::guess(app.dialogs.text.trim());
         let shown = match app.dialogs.mode {
             "auto" | "new" => crate::i18n::fmt("Automatic ({kind})", &[("kind", tl_raw!(guessed.label()))]),
             code => TileKind::from_code(code).map(|k| tl!(k.label()).to_string()).unwrap_or_default(),
         };
-        egui::ComboBox::from_id_salt("tiles_kind").selected_text(shown).width(260.0).show_ui(ui, |ui| {
-            ui.selectable_value(&mut app.dialogs.mode, "auto", tl!("Automatic"));
-            for k in TileKind::ALL {
-                ui.selectable_value(&mut app.dialogs.mode, k.code(), tl!(k.label()));
-            }
-        });
+        egui::ComboBox::from_id_salt("tiles_kind")
+            .selected_text(shown)
+            .width(260.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut app.dialogs.mode, "auto", tl!("Automatic"));
+                for k in TileKind::ALL {
+                    ui.selectable_value(&mut app.dialogs.mode, k.code(), tl!(k.label()));
+                }
+            })
+            .response
+            .labelled_by(input_label.id);
         ui.end_row();
-        ui.label(tl!("Name"));
-        ui.add(egui::TextEdit::singleline(&mut app.dialogs.a).hint_text(tl!("from the address")).desired_width(400.0));
+        let input_label = ui.label(tl!("Name"));
+        ui.add(egui::TextEdit::singleline(&mut app.dialogs.a).hint_text(tl!("from the address")).desired_width(400.0))
+            .labelled_by(input_label.id);
         ui.end_row();
-        ui.label(tl!("Attribution"));
-        ui.add(egui::TextEdit::singleline(&mut app.dialogs.b).hint_text("© OpenStreetMap contributors").desired_width(400.0));
+        let input_label = ui.label(tl!("Attribution"));
+        ui.add(egui::TextEdit::singleline(&mut app.dialogs.b).hint_text("© OpenStreetMap contributors").desired_width(400.0))
+            .labelled_by(input_label.id);
         ui.end_row();
-        ui.label(tl!("Maximum zoom"));
-        ui.add(egui::TextEdit::singleline(&mut app.dialogs.c).hint_text(tl!("from the service")).desired_width(60.0));
+        let input_label = ui.label(tl!("Maximum zoom"));
+        ui.add(egui::TextEdit::singleline(&mut app.dialogs.c).hint_text(tl!("from the service")).desired_width(60.0))
+            .labelled_by(input_label.id);
         ui.end_row();
     });
-    ui.checkbox(&mut app.dialogs.flag, tl!("Overlay (a transparent layer kept on top, such as labels or roads)"));
+    ui.checkbox(
+        &mut app.dialogs.flag,
+        tl!("Overlay (on top of the map's layers, such as labels, roads or a WMS layer; otherwise a basemap under them)"),
+    );
     buttons(app, ui, "Add", |app| {
         let mut p = json!({"url": app.dialogs.text.trim(), "overlay": app.dialogs.flag});
         if !matches!(app.dialogs.mode, "auto" | "new") {
@@ -1078,14 +1691,19 @@ fn field_chips(app: &mut RustGisApp, ui: &mut egui::Ui) {
 fn select_by_attributes(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) -> bool {
     let layers: Vec<String> = app.session.map().layers.iter().map(|l| l.name.clone()).collect();
     egui::Grid::new("sba").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
-        ui.label(tl!("Input Rows"));
-        egui::ComboBox::from_id_salt("sba_layer").selected_text(app.dialogs.layer.clone()).width(260.0).show_ui(ui, |ui| {
-            for l in &layers {
-                ui.selectable_value(&mut app.dialogs.layer, l.clone(), l);
-            }
-        });
+        let input_label = ui.label(tl!("Input Rows"));
+        egui::ComboBox::from_id_salt("sba_layer")
+            .selected_text(app.dialogs.layer.clone())
+            .width(260.0)
+            .show_ui(ui, |ui| {
+                for l in &layers {
+                    ui.selectable_value(&mut app.dialogs.layer, l.clone(), l);
+                }
+            })
+            .response
+            .labelled_by(input_label.id);
         ui.end_row();
-        ui.label(tl!("Selection Type"));
+        let input_label = ui.label(tl!("Selection Type"));
         egui::ComboBox::from_id_salt("sba_mode")
             .selected_text(match app.dialogs.mode {
                 "add" => tl!("Add To Current Selection"),
@@ -1103,7 +1721,9 @@ fn select_by_attributes(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) -> 
                 ] {
                     ui.selectable_value(&mut app.dialogs.mode, m, l);
                 }
-            });
+            })
+            .response
+            .labelled_by(input_label.id);
         ui.end_row();
     });
     ui.label(egui::RichText::new(tl!("Where")).font(semibold(12.5)));
@@ -1138,18 +1758,53 @@ fn select_by_attributes(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) -> 
     })
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+/// Asks for a file to open with the system's dialog, offering `exts` under `label` (and all
+/// files); `None` when cancelled.
+#[cfg(all(not(target_arch = "wasm32"), not(test)))]
 pub fn pick_open(exts: &[&str], label: &str) -> Option<String> {
-    rfd::FileDialog::new().add_filter(label, exts).add_filter("All files", &["*"]).pick_file().map(|p| p.display().to_string())
+    let dialog = rfd::FileDialog::new();
+    let dialog = if exts.is_empty() { dialog } else { dialog.add_filter(label, exts) };
+    dialog.add_filter("All files", &["*"]).pick_file().map(|p| p.display().to_string())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+pub fn pick_folder() -> Option<String> {
+    rfd::FileDialog::new().pick_folder().map(|p| p.display().to_string())
+}
+
+/// Asks where to save, suggesting file `name`, with the system's dialog; `None` when cancelled.
+#[cfg(all(not(target_arch = "wasm32"), not(test)))]
 pub fn pick_save(name: &str, exts: &[&str], label: &str) -> Option<String> {
     rfd::FileDialog::new().set_file_name(name).add_filter(label, exts).save_file().map(|p| p.display().to_string())
 }
 
+// Unit tests can't answer the system's file dialogs: a picker answers what the test put in
+// `PICKED` instead, once, and is cancelled when it holds nothing.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PICKED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// In a unit test: the path the test put in [`PICKED`], or cancelled.
+#[cfg(all(not(target_arch = "wasm32"), test))]
+pub fn pick_open(_: &[&str], _: &str) -> Option<String> {
+    PICKED.with(|p| p.borrow_mut().take())
+}
+
+/// In a unit test: the path the test put in [`PICKED`], or cancelled.
+#[cfg(all(not(target_arch = "wasm32"), test))]
+pub fn pick_save(_: &str, _: &[&str], _: &str) -> Option<String> {
+    PICKED.with(|p| p.borrow_mut().take())
+}
+
 #[cfg(target_arch = "wasm32")]
 pub fn pick_open(_: &[&str], _: &str) -> Option<String> {
+    None
+}
+
+#[cfg(target_arch = "wasm32")]
+#[allow(dead_code)]
+pub fn pick_folder() -> Option<String> {
     None
 }
 
@@ -1189,8 +1844,10 @@ fn coordinate_system(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) -> boo
             });
             ui.separator();
             ui.horizontal(|ui| {
-                ui.label(tl!("EPSG or ESRI code"));
-                let r = ui.add(egui::TextEdit::singleline(&mut app.dialogs.a).hint_text("3035").desired_width(110.0));
+                let input_label = ui.label(tl!("EPSG or ESRI code"));
+                let r = ui
+                    .add(egui::TextEdit::singleline(&mut app.dialogs.a).hint_text("3035, vn2000tm3").desired_width(120.0))
+                    .labelled_by(input_label.id);
                 if r.changed() && !app.dialogs.a.trim().is_empty() {
                     app.dialogs.text = typed_crs(&app.dialogs.a);
                 }
@@ -1227,16 +1884,38 @@ fn coordinate_system(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) -> boo
     close
 }
 
+/// Formats degrees as an integer if whole (e.g. 105°), or with decimal places if fractional (e.g. 105.75°).
+pub(crate) fn format_degrees(deg: f64) -> String {
+    if (deg - deg.round()).abs() < 1e-6 { format!("{:.0}°", deg) } else { format!("{deg}°") }
+}
+
 /// The chosen preset's parameters (opengeos/RustGIS#517): the central meridian, and a conic's
 /// standard parallels, each written back into the chosen code. Nothing for a preset without any.
 fn preset_fields(app: &mut RustGisApp, ui: &mut egui::Ui) {
-    use rustgis_engine::map::projection::{parse_preset, preset_code, preset_params, preset_value};
+    use rustgis_engine::map::projection::{VN2000_UI_PROVINCES, parse_preset, preset_code, preset_params, preset_value};
+    // A province typed by name is already the preset (`typed_crs`), and `vn2000:hanoi` is one too.
     let Ok(Some((id, params))) = parse_preset(&app.dialogs.text) else { return };
     let takes = preset_params(id);
     if takes.is_empty() {
         return;
     }
     let mut next = params.clone();
+    if id == "vn2000tm3" {
+        let default_lon = preset_value(id, "lon_0").unwrap_or(105.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new(tl!("Provinces:")).weak());
+            for &(p_name, lon) in VN2000_UI_PROVINCES {
+                let label = crate::i18n::fmt("{name} ({lon})", &[("name", p_name), ("lon", &format_degrees(lon))]);
+                if ui.small_button(&label).clicked() {
+                    next.retain(|(k, _)| *k != "lon_0");
+                    if (lon - default_lon).abs() > 1e-6 {
+                        next.push(("lon_0", lon));
+                    }
+                }
+            }
+        });
+        ui.add_space(2.0);
+    }
     egui::Grid::new("preset_params").num_columns(2).spacing(vec2(10.0, 6.0)).show(ui, |ui| {
         for p in takes {
             let label = match p.key {
@@ -1244,9 +1923,11 @@ fn preset_fields(app: &mut RustGisApp, ui: &mut egui::Ui) {
                 "lat_1" => tl!("First standard parallel"),
                 _ => tl!("Second standard parallel"),
             };
-            ui.label(label);
+            let input_label = ui.label(label);
             let mut v = params.iter().find(|(k, _)| *k == p.key).map(|(_, v)| *v).or_else(|| preset_value(id, p.key)).unwrap_or(0.0);
-            let r = ui.add(egui::DragValue::new(&mut v).range(p.min..=p.max).speed(0.5).max_decimals(4).suffix("°"));
+            let r = ui
+                .add(egui::DragValue::new(&mut v).range(p.min..=p.max).speed(0.5).max_decimals(4).suffix("°"))
+                .labelled_by(input_label.id);
             r.widget_info(|| egui::WidgetInfo { label: Some(label.to_string()), ..egui::WidgetInfo::drag_value(true, v) });
             if r.changed() {
                 next.retain(|(k, _)| *k != p.key);
@@ -1270,10 +1951,17 @@ fn preset_fields(app: &mut RustGisApp, ui: &mut egui::Ui) {
 }
 
 /// A typed coordinate system code: `ESRI:102033` or `Epsg: 3035` as it is (`lookup` reads the
-/// prefix in any case and spacing), a bare number as an EPSG code.
+/// prefix in any case and spacing), a bare number as an EPSG code, or a Vietnamese province with
+/// the `vn2000:` prefix (`vn2000:hanoi`); a bare name such as `hue` is not taken for one.
 pub(crate) fn typed_crs(text: &str) -> String {
     let text = text.trim();
-    if text.starts_with(|c: char| c.is_ascii_digit()) { format!("EPSG:{text}") } else { text.to_string() }
+    if text.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("EPSG:{text}")
+    } else if let Some(lon) = rustgis_engine::map::projection::resolve_vn2000_alias(text) {
+        format!("vn2000tm3 +lon_0={lon}")
+    } else {
+        text.to_string()
+    }
 }
 
 /// What a coordinate system is: its kind, area of use, definition and epsg.io page.
@@ -1297,29 +1985,43 @@ fn crs_details(ui: &mut egui::Ui, chosen: &str, current: &str, t: &Tokens) {
     let preset = rustgis_engine::map::projection::parse_preset(&code).ok().flatten();
     let tuned = preset.as_ref().is_some_and(|(_, p)| !p.is_empty());
     let (kind, page): (&str, Option<String>) = match preset.map_or(code.as_str(), |(id, _)| id) {
-        "mercator" => ("World, conformal: the usual web map; areas grow towards the poles.", Some("3857".into())),
-        "globe" => ("A 3D globe seen from space.", None),
-        "equirectangular" => ("World, cylindrical: equal steps of longitude and latitude.", Some("4087".into())),
-        "miller" => ("World, cylindrical: a compromise between Mercator and equal steps.", Some("54003".into())),
-        "mollweide" => ("World, equal-area: true sizes, shapes bend towards the edges.", Some("54009".into())),
-        "cylindricalEqualArea" => ("World, equal-area, cylindrical: true sizes, flattened near the poles.", Some("54034".into())),
-        "robinson" => ("World, compromise: neither equal-area nor conformal, balanced for wall maps.", Some("54030".into())),
-        "equalEarth" => ("World, equal-area: true sizes with a Robinson-like look.", Some("8857".into())),
-        "naturalEarth" => ("World, compromise: rounded corners, gentle shapes near the poles.", None),
-        "winkelTripel" => ("World, compromise: low overall distortion, used for world atlases.", Some("54042".into())),
-        "eckertIV" => ("World, equal-area: true sizes with rounded poles.", Some("54012".into())),
-        "northPolar" => ("Polar, conformal: the Arctic and the northern lands.", None),
-        "southPolar" => ("Polar, conformal: Antarctica and the Southern Ocean.", Some("3031".into())),
-        "europeEqualArea" => ("Regional, equal-area: the European standard for statistics.", Some("3035".into())),
-        "usaAlbers" => ("Regional, equal-area: the contiguous United States.", Some("5070".into())),
-        "albers" => ("Conic, equal-area: true sizes across a mid-latitude region; set its meridian and parallels to the region.", None),
-        "lambertConformal" => {
-            ("Conic, conformal: true shapes across a mid-latitude region; set its meridian and parallels to the region.", None)
+        "mercator" => (tl!("World, conformal: the usual web map; areas grow towards the poles."), Some("3857".into())),
+        "globe" => (tl!("A 3D globe seen from space."), None),
+        "equirectangular" => (tl!("World, cylindrical: equal steps of longitude and latitude."), Some("4087".into())),
+        "miller" => (tl!("World, cylindrical: a compromise between Mercator and equal steps."), Some("54003".into())),
+        "mollweide" => (tl!("World, equal-area: true sizes, shapes bend towards the edges."), Some("54009".into())),
+        "cylindricalEqualArea" => (tl!("World, equal-area, cylindrical: true sizes, flattened near the poles."), Some("54034".into())),
+        "robinson" => (tl!("World, compromise: neither equal-area nor conformal, balanced for wall maps."), Some("54030".into())),
+        "equalEarth" => (tl!("World, equal-area: true sizes with a Robinson-like look."), Some("8857".into())),
+        "naturalEarth" => (tl!("World, compromise: rounded corners, gentle shapes near the poles."), None),
+        "winkelTripel" => (tl!("World, compromise: low overall distortion, used for world atlases."), Some("54042".into())),
+        "eckertIV" => (tl!("World, equal-area: true sizes with rounded poles."), Some("54012".into())),
+        "northPolar" => (tl!("Polar, conformal: the Arctic and the northern lands."), None),
+        "southPolar" => (tl!("Polar, conformal: Antarctica and the Southern Ocean."), Some("3031".into())),
+        "europeEqualArea" => (tl!("Regional, equal-area: the European standard for statistics."), Some("3035".into())),
+        "usaAlbers" => (tl!("Regional, equal-area: the contiguous United States."), Some("5070".into())),
+        "albers" => {
+            (tl!("Conic, equal-area: true sizes across a mid-latitude region; set its meridian and parallels to the region."), None)
         }
-        _ => ("A projected coordinate system.", epsg.clone()),
+        "lambertConformal" => {
+            (tl!("Conic, conformal: true shapes across a mid-latitude region; set its meridian and parallels to the region."), None)
+        }
+        "vn2000tm3" => (
+            tl!(
+                "Vietnam national coordinate system (VN-2000) using 3-degree Transverse Mercator with a 7-parameter Helmert shift to WGS 84."
+            ),
+            Some("5897".into()),
+        ),
+        "vn2000Utm48" => {
+            (tl!("Vietnam national coordinate system (VN-2000) UTM zone 48N (102°E–108°E, central meridian 105°E)."), Some("3405".into()))
+        }
+        "vn2000Utm49" => {
+            (tl!("Vietnam national coordinate system (VN-2000) UTM zone 49N (108°E–114°E, central meridian 111°E)."), Some("3406".into()))
+        }
+        _ => (tl!("A projected coordinate system."), epsg.clone()),
     };
     let page = page.filter(|_| !tuned);
-    ui.label(tl!(kind));
+    ui.label(kind);
     if let Ok(p) = Projector::new(&code) {
         let area = match p.domain() {
             Domain::World => tl!("Area of use: the whole world").to_string(),
@@ -1424,5 +2126,70 @@ mod tests {
         h.get_by_label("Apply").click();
         h.run_steps(3);
         assert_eq!(h.state().session.map().projection.code(), "robinson +lon_0=150");
+    }
+
+    #[test]
+    fn vn2000_in_coordinate_system_dialog() {
+        let mut app = RustGisApp::with_sample();
+        app.run("ui.dialog", json!({"name": "coordinateSystem"})).unwrap();
+        // A bare "vn2000" names no projection: it is passed on, and refused as ambiguous.
+        app.dialogs.a = "vn2000".into();
+        app.dialogs.text = typed_crs(&app.dialogs.a);
+        assert_eq!(app.dialogs.text, "vn2000");
+        let err = rustgis_engine::map::Projection::from_code(&app.dialogs.text).unwrap_err();
+        assert!(err.contains("ambiguous"), "{err}");
+
+        // Explicit "vn2000tm3" resolves to VN-2000 TM-3 preset
+        app.dialogs.a = "vn2000tm3".into();
+        app.dialogs.text = typed_crs(&app.dialogs.a);
+        assert_eq!(app.dialogs.text, "vn2000tm3");
+        let proj = rustgis_engine::map::Projection::from_code(&app.dialogs.text).unwrap();
+        assert_eq!(proj.label(), "VN-2000 / TM-3 (Vietnam)");
+
+        // Explicit "VN-2000 / UTM zone 48N" resolves to UTM 48N
+        let proj_utm = rustgis_engine::map::Projection::from_code("VN-2000 / UTM zone 48N").unwrap();
+        assert_eq!(proj_utm.label(), "VN-2000 / UTM zone 48N");
+
+        // A province with the vn2000: prefix, in ASCII or Vietnamese.
+        for (name, code) in [
+            ("vn2000:hanoi", "vn2000tm3"),
+            ("vn2000:Hà Nội", "vn2000tm3"),
+            ("VN2000/Đà Nẵng", "vn2000tm3 +lon_0=107.75"),
+            ("vn2000:tphcm", "vn2000tm3 +lon_0=105.75"),
+            ("vn2000:vithanh", "vn2000tm3"),
+            ("vn2000:vitri", "vn2000tm3"),
+        ] {
+            app.dialogs.a = name.into();
+            app.dialogs.text = typed_crs(&app.dialogs.a);
+            let proj_p = rustgis_engine::map::Projection::from_code(&app.dialogs.text).unwrap();
+            assert!(proj_p.label().contains("VN-2000"), "{name}");
+            assert_eq!(proj_p.code(), code, "{name}");
+        }
+        // A bare province name is not a coordinate system: words such as "hue" stay as typed,
+        // as `map.projection` reads them.
+        for name in ["hanoi", "Hà Nội", "hue", "vinh", "tphcm", "vithanh", "vitri", "vietnam"] {
+            assert_eq!(typed_crs(name), name);
+            assert!(rustgis_engine::map::Projection::from_code(name).is_err(), "{name}");
+        }
+        // A prefixed province given to the command is saved as the preset too.
+        app.run("map.projection", json!({"type": "VN2000/Đà Nẵng"})).unwrap();
+        assert_eq!(app.session.map().projection.code(), "vn2000tm3 +lon_0=107.75");
+
+        // Applying VN-2000 TM-3
+        app.run("map.projection", json!({"type": "vn2000tm3"})).unwrap();
+        assert_eq!(app.session.map().projection.code(), "vn2000tm3");
+
+        // Custom meridian for HCMC (105.75)
+        app.run("map.projection", json!({"type": "vn2000tm3 +lon_0=105.75"})).unwrap();
+        assert_eq!(app.session.map().projection.code(), "vn2000tm3 +lon_0=105.75");
+    }
+
+    #[test]
+    fn ui_degree_formatting_preserves_fractions() {
+        assert_eq!(format_degrees(105.0), "105°");
+        assert_eq!(format_degrees(107.0), "107°");
+        assert_eq!(format_degrees(105.75), "105.75°");
+        assert_eq!(format_degrees(108.5), "108.5°");
+        assert_eq!(format_degrees(104.25), "104.25°");
     }
 }

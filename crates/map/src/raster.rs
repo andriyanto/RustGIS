@@ -29,7 +29,9 @@ pub struct RasterLayer {
     /// For a raster GDAL reads: the subdataset added (a NetCDF variable), so it is read again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subdataset: Option<String>,
-    /// For a raster GDAL reads: the coordinate system given for a file that doesn't say.
+    /// The coordinate system given for a file or store that doesn't say: for a raster GDAL reads
+    /// (applied when it's read again from its path), and for a Zarr slice (which its series and
+    /// summaries read the store with; a slice kept as its GeoTIFF's bytes has it written in).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crs: Option<String>,
     /// A Zarr variable that follows the time slider: its slice is the step the slider shows,
@@ -44,15 +46,23 @@ pub struct RasterLayer {
     /// The pixels; `None` when the source couldn't be read.
     #[serde(skip)]
     pub data: Option<Arc<Raster>>,
+    /// The last reload failure; transient, like the decoded pixels.
+    #[serde(skip)]
+    pub error: Option<String>,
     /// Statistics of the pixels the style's mask leaves, worked out on the first draw.
     #[serde(skip)]
     masked: MaskedStats,
+    /// A remote reload shared with render snapshots, never serialized.
+    #[serde(skip)]
+    opening: Option<RasterRead>,
 }
 
 /// The renderer bands' statistics without the masked pixels, and what they were worked out for:
 /// the mask, the renderer's bands and the pixels (held weakly, so their address isn't reused).
 #[derive(Clone, Default)]
 struct MaskedStats(Arc<Mutex<Option<(RasterMask, Vec<usize>, Weak<Raster>, Arc<Vec<BandStats>>)>>>);
+
+type RasterRead = Arc<Mutex<Option<Result<Arc<Raster>, String>>>>;
 
 impl std::fmt::Debug for RasterLayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -65,6 +75,45 @@ impl std::fmt::Debug for RasterLayer {
 }
 
 impl RasterLayer {
+    /// Reads a replacement without silently changing the renderer or resetting its style.
+    pub fn relinked(&self, path: &str, subdataset: Option<&str>) -> Result<RasterLayer, String> {
+        if self.embedded.is_some() {
+            return Err("the raster's data is kept in the project: there's no file to repair".into());
+        }
+        let sub = subdataset.or(self.subdataset.as_deref());
+        let r = rustgis_data::raster::read_path_with(std::path::Path::new(path), sub, self.crs.as_deref())
+            .and_then(|r| placed(r, self.placement))
+            .map_err(|e| format!("{path}: {e}"))?;
+        let need = self.style.renderer.bands().into_iter().max().map_or(1, |b| b.saturating_add(1));
+        if r.band_count() < need {
+            return Err(format!(
+                "{path} has {} band(s); the layer's style draws band {need}: choose a raster with at least {need} bands",
+                r.band_count()
+            ));
+        }
+        if matches!(self.style.renderer, RasterRenderer::Colormap) && !matches!(r.color, ColorHint::Palette(_)) {
+            return Err(format!(
+                "{path} has no color palette; the layer's Colormap style uses the file's palette: choose a raster with a color palette"
+            ));
+        }
+        let mut style = self.style.clone();
+        style.repair(&r);
+        Ok(RasterLayer {
+            path: Some(path.into()),
+            file_name: None,
+            embedded: None,
+            subdataset: sub.map(String::from),
+            crs: self.crs.clone(),
+            time_zarr: None,
+            placement: self.placement,
+            style,
+            data: Some(Arc::new(r)),
+            error: None,
+            masked: MaskedStats::default(),
+            opening: None,
+        })
+    }
+
     /// A raster read from a file on disk.
     pub fn from_path(raster: Raster, path: impl Into<String>) -> RasterLayer {
         let style = RasterStyle::default_for(&raster);
@@ -78,7 +127,9 @@ impl RasterLayer {
             placement: None,
             style,
             data: Some(Arc::new(raster)),
+            error: None,
             masked: MaskedStats::default(),
+            opening: None,
         }
     }
 
@@ -95,7 +146,9 @@ impl RasterLayer {
             placement: None,
             style,
             data: Some(Arc::new(raster)),
+            error: None,
             masked: MaskedStats::default(),
+            opening: None,
         }
     }
 
@@ -103,6 +156,40 @@ impl RasterLayer {
     /// layer that follows the time slider is left to the engine, which reads the step shown.
     pub fn reload(&mut self) -> Result<(), String> {
         if self.time_zarr.is_some() {
+            return Ok(());
+        }
+        self.opening = None;
+        self.error = None;
+        if self.embedded.is_none()
+            && let Some(path) = self
+                .path
+                .as_deref()
+                .filter(|p| rustgis_data::s3_address::is_wrapper(p) || p.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("s3://")))
+        {
+            let name = rustgis_data::s3_address::inner(path).split(['?', '#']).next().unwrap_or("raster.tif").to_string();
+            let placement = self.placement;
+            let slot = Arc::new(Mutex::new(None));
+            let land = slot.clone();
+            self.data = None;
+            self.opening = Some(slot);
+            rustgis_data::source::remote::fetch_whole(
+                path,
+                Box::new(move |result| {
+                    let result = result
+                        .map_err(|e| match e {
+                            rustgis_data::source::remote::Failed::Other(message) => message,
+                            _ => "The raster could not be downloaded.".to_string(),
+                        })
+                        .and_then(|bytes| {
+                            rustgis_data::raster::read_bytes(&name, &bytes)
+                                .and_then(|r| placed(r, placement))
+                                .map(Arc::new)
+                                .map_err(|e| e.to_string())
+                        });
+                    *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+                    crate::source::landed();
+                }),
+            );
             return Ok(());
         }
         let r = if let Some(bytes) = &self.embedded {
@@ -113,15 +200,7 @@ impl RasterLayer {
             return Err("the raster has no source".into());
         };
         // A scan goes back where it was laid (a GeoTIFF opened `as` a scan is one again).
-        let r = r.and_then(|mut r| {
-            if let Some(bbox) = self.placement {
-                if r.georeferenced {
-                    r = r.into_scan()?;
-                }
-                r.place(bbox)?;
-            }
-            Ok(r)
-        });
+        let r = r.and_then(|r| placed(r, self.placement));
         match r {
             Ok(r) => {
                 self.style.repair(&r);
@@ -129,10 +208,26 @@ impl RasterLayer {
                 Ok(())
             }
             Err(e) => {
+                self.error = Some(e.to_string());
                 self.data = None;
                 Err(e.to_string())
             }
         }
+    }
+
+    /// Installs a completed remote read; each render copy can observe the same shared result.
+    pub(crate) fn poll_reload(&mut self) -> bool {
+        let Some(slot) = self.opening.as_ref() else { return false };
+        let Some(result) = slot.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return true };
+        self.opening = None;
+        match result {
+            Ok(raster) => {
+                self.style.repair(&raster);
+                self.data = Some(raster);
+            }
+            Err(error) => self.error = Some(error),
+        }
+        false
     }
 
     /// Statistics of the renderer's bands (one per band, in its order) without the pixels the
@@ -159,6 +254,17 @@ impl RasterLayer {
         }
         Some(stats)
     }
+}
+
+/// Reapplies a scan's placement to pixels read again, without copying their bands.
+fn placed(mut raster: Raster, placement: Option<[f64; 4]>) -> rustgis_data::Result<Raster> {
+    if let Some(bbox) = placement {
+        if raster.georeferenced {
+            raster = raster.into_scan()?;
+        }
+        raster.place(bbox)?;
+    }
+    Ok(raster)
 }
 
 /// The most steps a Zarr layer following the time slider lists (as the slider itself does).
@@ -254,10 +360,13 @@ pub enum Stretch {
     /// Values as they are (0–255 for 8-bit data, otherwise minimum to maximum).
     None,
     MinMax,
-    /// Fixed bounds in the data's own units, whatever the layer's statistics.
+    /// Fixed bounds in the data's own units, whatever the layer's statistics. `bands` holds one
+    /// `[min, max]` pair per RGB channel when they differ; `min`/`max` are then the red channel's.
     Custom {
         min: f64,
         max: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bands: Option<[[f64; 2]; 3]>,
     },
     /// Clip the lowest and highest percent of pixels.
     PercentClip {
@@ -279,6 +388,16 @@ impl Default for Stretch {
 }
 
 impl Stretch {
+    /// One pair of bounds for every band.
+    pub fn custom(min: f64, max: f64) -> Stretch {
+        Stretch::Custom { min, max, bands: None }
+    }
+
+    /// A custom stretch with a pair of bounds per RGB channel.
+    pub fn custom_bands(bands: [[f64; 2]; 3]) -> Stretch {
+        Stretch::Custom { min: bands[0][0], max: bands[0][1], bands: Some(bands) }
+    }
+
     pub const KINDS: [(&'static str, &'static str); 6] = [
         ("none", "None"),
         ("minMax", "Minimum Maximum"),
@@ -318,7 +437,7 @@ impl Stretch {
         Some(match code.trim().to_ascii_lowercase().replace([' ', '_', '-'], "").as_str() {
             "none" => Stretch::None,
             "minmax" | "minimummaximum" => Stretch::MinMax,
-            "custom" | "custommin/max" => Stretch::Custom { min: min.or(stats.map(|s| s.min))?, max: max.or(stats.map(|s| s.max))? },
+            "custom" | "custommin/max" => Stretch::custom(min.or(stats.map(|s| s.min))?, max.or(stats.map(|s| s.max))?),
             "percentclip" => Stretch::PercentClip { low: pct(low), high: pct(high) },
             "standarddeviation" | "stddev" => Stretch::StandardDeviation { n: n.unwrap_or(2.0).clamp(0.1, 10.0) },
             "histogramequalize" | "histogramequalization" => Stretch::HistogramEqualize,
@@ -430,7 +549,7 @@ impl RasterRenderer {
 
 /// How a newly added single-band raster of continuous values is drawn: a colour ramp stretch with
 /// these settings (`raster.setDefaultStyle`). The app keeps them with its preferences, not the
-/// project; the default is an inverted grey stretch clipping 0.5 % at each end.
+/// project; the default is a black-to-white grey stretch clipping 0.5 % at each end.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RasterDefaults {
@@ -443,7 +562,7 @@ pub struct RasterDefaults {
 
 impl Default for RasterDefaults {
     fn default() -> Self {
-        RasterDefaults { ramp: Ramp::Greys, invert: true, stretch: Stretch::default(), resampling: Resampling::Nearest }
+        RasterDefaults { ramp: Ramp::gray(), invert: false, stretch: Stretch::default(), resampling: Resampling::Nearest }
     }
 }
 
@@ -698,11 +817,20 @@ pub struct Normalizer {
 
 impl Normalizer {
     pub fn new(stretch: Stretch, s: &BandStats, data_type: &str) -> Normalizer {
+        Normalizer::for_channel(stretch, 0, s, data_type)
+    }
+
+    /// The normaliser of renderer channel `channel` (red 0, green 1, blue 2): the same as
+    /// [`Normalizer::new`], but a custom stretch with bounds per channel uses that channel's.
+    pub fn for_channel(stretch: Stretch, channel: usize, s: &BandStats, data_type: &str) -> Normalizer {
         let (lo, hi) = match stretch {
             Stretch::None if data_type == "UInt8" => (0.0, 255.0),
             Stretch::None | Stretch::MinMax | Stretch::HistogramEqualize => (s.min, s.max),
             // Fixed bounds ignore the statistics, so DRA's view statistics don't move them.
-            Stretch::Custom { min, max } => (min, max),
+            Stretch::Custom { min, max, bands } => match bands.as_ref().and_then(|b| b.get(channel)) {
+                Some([lo, hi]) => (*lo, *hi),
+                None => (min, max),
+            },
             Stretch::PercentClip { low, high } => (s.percentile(low), s.percentile(100.0 - high)),
             Stretch::StandardDeviation { n } => ((s.mean - n * s.std_dev).max(s.min), (s.mean + n * s.std_dev).min(s.max)),
         };
@@ -771,7 +899,7 @@ impl<'a> Colorizer<'a> {
             .enumerate()
             .map(|(i, b)| {
                 let s = view_stats.and_then(|v| v.get(i)).or_else(|| r.bands.get(*b).map(|b| &b.stats));
-                s.map(|s| Normalizer::new(style.stretch, s, &r.data_type)).unwrap_or(Normalizer { lo: 0.0, hi: 1.0, cdf: None })
+                s.map(|s| Normalizer::for_channel(style.stretch, i, s, &r.data_type)).unwrap_or(Normalizer { lo: 0.0, hi: 1.0, cdf: None })
             })
             .collect();
         let ramp_lut = match &style.renderer {
@@ -898,6 +1026,8 @@ impl RasterLayer {
     pub fn legend(&self) -> Vec<RasterLegend> {
         let Some(r) = &self.data else { return Vec::new() };
         let band_name = |b: usize| r.bands.get(b).map(|b| b.name.clone()).unwrap_or_default();
+        // A class's name in the file (GDAL's category names), or else its value.
+        let class_label = |b: usize, v: f64| r.bands.get(b).and_then(|b| b.class_name(v)).map_or_else(|| fmt_num(v), str::to_owned);
         // The first renderer band's statistics, without the masked pixels.
         let masked = self.masked_stats();
         let stats = |band: usize| masked.as_ref().and_then(|m| m.first()).or_else(|| r.bands.get(band).map(|b| &b.stats));
@@ -932,17 +1062,17 @@ impl RasterLayer {
                     })
                     .collect()
             }
-            RasterRenderer::UniqueValues { values, .. } => values
+            RasterRenderer::UniqueValues { band, values, .. } => values
                 .iter()
                 .filter(|(v, _)| !mask.hides(*v as f32))
-                .map(|(v, c)| RasterLegend::Class { color: *c, label: fmt_num(*v) })
+                .map(|(v, c)| RasterLegend::Class { color: *c, label: class_label(*band, *v) })
                 .collect(),
             RasterRenderer::Colormap => {
                 let ColorHint::Palette(p) = &r.color else { return Vec::new() };
                 let cats = r.bands.first().and_then(|b| b.stats.categories.clone()).unwrap_or_default();
                 cats.iter()
                     .filter(|v| !mask.hides(**v as f32))
-                    .filter_map(|v| p.get(*v as usize).map(|c| RasterLegend::Class { color: Rgba(*c), label: fmt_num(*v) }))
+                    .filter_map(|v| p.get(*v as usize).map(|c| RasterLegend::Class { color: Rgba(*c), label: class_label(0, *v) }))
                     .collect()
             }
         }
@@ -954,6 +1084,34 @@ mod tests {
     use rustgis_data::raster::{Crs, GeoTransform};
 
     use super::*;
+
+    /// The legend names a class as the file does (#889), and gives the value of one it doesn't.
+    #[test]
+    fn legend_labels_classes_with_their_names() {
+        let gt = GeoTransform { origin_x: 10.0, origin_y: 50.0, pixel_width: 0.5, pixel_height: -0.5 };
+        let mut palette = vec![[0, 0, 0, 0]; 256];
+        palette[1..4].copy_from_slice(&[[239, 235, 221, 255], [255, 231, 160, 255], [253, 190, 110, 255]]);
+        let mut r =
+            Raster::new("slope", 3, 1, vec![vec![1.0, 2.0, 3.0]], gt, Crs::LonLat, None, ColorHint::Palette(palette), "UInt8").unwrap();
+        r.bands[0].classes = vec!["no data".into(), "0-5 %".into(), String::new(), "15-30 %".into()];
+        let labels = |rl: &RasterLayer| -> Vec<String> {
+            rl.legend()
+                .into_iter()
+                .map(|e| match e {
+                    RasterLegend::Class { label, .. } => label,
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        let mut rl = RasterLayer::from_path(r.clone(), "slope.tif");
+        rl.style.renderer = RasterRenderer::Colormap;
+        assert_eq!(labels(&rl), ["0-5 %", "2", "15-30 %"]);
+        rl.style.renderer = unique_values(&r, 0, Ramp::Harbour);
+        assert_eq!(labels(&rl), ["0-5 %", "2", "15-30 %"]);
+        r.bands[0].classes.clear();
+        rl.data = Some(Arc::new(r));
+        assert_eq!(labels(&rl), ["1", "2", "3"], "no names: the values, as before");
+    }
 
     /// A following layer's dates are its steps from `offset` on, one each: repair keeps them as
     /// they are when they are in order, and follows none rather than the wrong step otherwise.
@@ -994,7 +1152,7 @@ mod tests {
         let c = Colorizer::new(&s, &r, None);
         let lo = c.color(&[0.0], None).unwrap();
         let hi = c.color(&[6.0], None).unwrap();
-        assert!(lo[0] < hi[0], "inverted greys: low is dark ({lo:?} vs {hi:?})");
+        assert!(lo[0] < hi[0], "grey: low is dark ({lo:?} vs {hi:?})");
         assert_eq!(c.color(&[f32::NAN], None), None);
         assert_eq!(c.color(&[], None), None);
 
@@ -1071,7 +1229,7 @@ mod tests {
         }
         // Bounds read from a hand-edited project can be reversed, equal or not numbers.
         for (min, max) in [(5.0, 1.0), (2.0, 2.0), (f64::NAN, 1.0), (0.0, f64::INFINITY)] {
-            let n = Normalizer::new(Stretch::Custom { min, max }, st, "Float32");
+            let n = Normalizer::new(Stretch::custom(min, max), st, "Float32");
             assert!((0.0..=1.0).contains(&n.t(3.0)) && (0.0..=1.0).contains(&n.t(f64::NAN).max(0.0)), "{min} {max}");
         }
         assert_eq!(Stretch::from_code("custom", None, None, None, None, None, None), None);
@@ -1081,6 +1239,68 @@ mod tests {
         let bright = enhancement_lut(50.0, 0.0, 1.0);
         assert!(bright[100] > flat[100]);
         let _ = enhancement_lut(f64::NAN, f64::INFINITY, f64::NAN);
+    }
+
+    fn rgb() -> Raster {
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let bands = vec![vec![0.0, 100.0], vec![0.0, 200.0], vec![0.0, 50.0]];
+        Raster::new("rgb", 2, 1, bands, gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap()
+    }
+
+    #[test]
+    fn custom_stretch_bounds_per_channel() {
+        let r = rgb();
+        let mut style = RasterStyle::default_for(&r);
+        style.renderer = RasterRenderer::Rgb { red: 0, green: 1, blue: 2 };
+        // One pair for every channel: the same value draws differently only by band, never by bounds.
+        style.stretch = Stretch::custom(0.0, 100.0);
+        let shared = Colorizer::new(&style, &r, None).color(&[50.0, 50.0, 50.0], None).unwrap();
+        assert_eq!(shared[..3], [128, 128, 128]);
+        // A pair per channel: each channel scales by its own bounds.
+        style.stretch = Stretch::custom_bands([[0.0, 100.0], [0.0, 200.0], [0.0, 50.0]]);
+        let c = Colorizer::new(&style, &r, None).color(&[50.0, 50.0, 50.0], None).unwrap();
+        assert_eq!(c[..3], [128, 64, 255]);
+        // The red channel's bounds are the plain pair, so a single band reads them.
+        assert_eq!(style.stretch, Stretch::Custom { min: 0.0, max: 100.0, bands: style_bands(&style) });
+        let n = Normalizer::for_channel(style.stretch, 1, &r.bands[1].stats, "Float32");
+        assert_eq!((n.lo, n.hi), (0.0, 200.0));
+        let n = Normalizer::new(style.stretch, &r.bands[1].stats, "Float32");
+        assert_eq!((n.lo, n.hi), (0.0, 100.0));
+    }
+
+    fn style_bands(style: &RasterStyle) -> Option<[[f64; 2]; 3]> {
+        match style.stretch {
+            Stretch::Custom { bands, .. } => bands,
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn custom_stretch_files_stay_compatible() {
+        // Saved by a version that had one pair of bounds.
+        let old: Stretch = serde_json::from_str(r#"{"Custom":{"min":1.0,"max":2.0}}"#).unwrap();
+        assert_eq!(old, Stretch::custom(1.0, 2.0));
+        assert_eq!(serde_json::to_string(&old).unwrap(), r#"{"Custom":{"min":1.0,"max":2.0}}"#);
+        let per = Stretch::custom_bands([[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]]);
+        let back: Stretch = serde_json::from_str(&serde_json::to_string(&per).unwrap()).unwrap();
+        assert_eq!(back, per);
+        // Read as one pair (an older version ignoring `bands`) it is the red channel's.
+        let json: serde_json::Value = serde_json::to_value(per).unwrap();
+        assert_eq!(json["Custom"]["min"], 0.0);
+        assert_eq!(json["Custom"]["max"], 1.0);
+    }
+
+    #[test]
+    fn hostile_channel_bounds_never_panic() {
+        let r = rgb();
+        let st = &r.bands[0].stats;
+        let bad = [5.0, 1.0];
+        for pair in [bad, [2.0, 2.0], [f64::NAN, 1.0], [0.0, f64::INFINITY]] {
+            for ch in 0..5 {
+                let n = Normalizer::for_channel(Stretch::custom_bands([pair, pair, pair]), ch, st, "Float32");
+                assert!((0.0..=1.0).contains(&n.t(3.0)) && (0.0..=1.0).contains(&n.t(f64::NAN).max(0.0)), "{pair:?} {ch}");
+            }
+        }
     }
 
     #[test]

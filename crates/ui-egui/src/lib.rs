@@ -1,5 +1,5 @@
-//! L6: the RustGIS desktop front end, built around a ribbon (Home, Data, Style, Edit, Analyze,
-//! View, Publish), the Layers and Browser panes, a Tools pane, the map view, the
+//! L6: the RustGIS desktop front end, built around a ribbon (Home, Data, Style, Labeling, Edit,
+//! Analyze, View, Publish), the Layers and Browser panes, a Tools pane, the map view, the
 //! attribute table and the status bar.
 //!
 //! The UI is thin: it reads [`Session`] state and runs commands by id ([`RustGisApp::run`]).
@@ -11,33 +11,47 @@ pub mod i18n;
 #[cfg(not(target_arch = "wasm32"))]
 mod agentthreads;
 mod analysispane;
+mod arcgisui;
+#[cfg(not(target_arch = "wasm32"))]
+mod assistantkeys;
 mod assistantpane;
+mod autosave;
 mod backstage;
 mod bookmarkpane;
 mod catalogsui;
 mod chrome;
 mod comets;
+mod connectiontree;
+mod connectionui;
 #[cfg(not(target_arch = "wasm32"))]
 mod connectui;
 mod cswui;
+mod cubesui;
 mod dialogs;
 mod docpanes;
 mod earthaccessui;
 mod editpanes;
 mod embeddingsui;
 mod failureui;
+mod fieldmenu;
+mod fill_editor;
 mod geocodeui;
+mod geolibreui;
+mod geometrycalc;
 mod globe_drape;
 mod graphicformat;
 pub mod icons;
 mod keymap;
+mod labelfonts;
 mod labelpane;
+mod layerchooser;
 mod layoutview;
 #[cfg(not(target_arch = "wasm32"))]
 mod localagents;
 mod mapgpu;
 mod mapmenu;
 mod mapview;
+mod measure_units;
 mod modelbuilder;
 mod navui;
 mod nldiui;
@@ -48,13 +62,16 @@ mod pluginsui;
 mod portalsui;
 #[cfg(not(target_arch = "wasm32"))]
 mod relayshot;
+mod repairsource;
 mod reportpane;
 mod ribbon;
 mod s3ui;
+mod saveprompt;
 mod scriptcolor;
 mod scriptcomplete;
 mod searchbox;
 mod serviceui;
+mod shortcutui;
 mod showme;
 mod sourcespane;
 mod sqlbox;
@@ -64,6 +81,7 @@ mod table;
 mod textform;
 pub mod theme;
 mod tilelayer;
+mod tilelegend;
 mod tilt_drape;
 mod tilt_settle;
 mod timebar;
@@ -78,9 +96,36 @@ use rustgis_engine::render::rustgis_tiles::failure::Failure;
 use rustgis_engine::{Project, Session};
 use serde_json::{Value, json};
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use autosave::FolderStore;
+pub use autosave::{Recovery, RecoveryStore};
 pub use chrome::{DoubleClick, TitlebarMetrics};
 pub use rustgis_assistant;
 pub use rustgis_engine;
+pub use widgets::big_split_menu;
+
+/// Reconciles only command-result wrappers, not parameters or other arbitrary JSON.
+/// Script and model results retain their structure while file results become completed.
+fn complete_gp_file(result: Result<Value, String>, id: u64, completed: &Result<Value, String>) -> Result<Value, String> {
+    fn visit(result: &mut Value, id: u64, completed: &Result<Value, String>) -> Result<(), String> {
+        if result.get("download").and_then(Value::as_u64) == Some(id) {
+            *result = completed.as_ref().map_err(Clone::clone)?.clone();
+            return Ok(());
+        }
+        if let Some(ran) = result.get_mut("ran").and_then(Value::as_array_mut) {
+            for step in ran {
+                visit(step, id, completed)?;
+            }
+        }
+        if let Some(result) = result.get_mut("result") {
+            visit(result, id, completed)?;
+        }
+        Ok(())
+    }
+    let mut result = result?;
+    visit(&mut result, id, completed)?;
+    Ok(result)
+}
 
 /// Files read asynchronously (browser uploads, drops) waiting to be opened: (file name, bytes).
 pub type Inbox = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
@@ -88,6 +133,10 @@ pub type Inbox = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
 /// Starts the name of a file the web shell's `"text"` picker (Add Delimited Text) put in the
 /// inbox, so the dialog's options go with that file and no other (a drop, another picker).
 pub const DELIMITED_PICK: &str = "\u{1}delimited:";
+
+/// Marks files returned by the source-CRS picker, so its override never applies to a drop or
+/// another picker. Several selected Shapefiles share the same import options.
+pub const SHAPEFILE_PICK: &str = "\u{1}shapefile:";
 
 /// The `open_async` purpose for a tool's file parameter, followed by the extensions it offers
 /// (`toolfile:nc,nc4`; none for any file).
@@ -200,15 +249,20 @@ pub fn parse_extent(text: &str) -> Option<[f64; 4]> {
 /// supplies an asynchronous file picker (results arrive in `inbox`) and browser downloads.
 #[derive(Default)]
 pub struct Services {
-    /// Opens a file picker for `"data"` or `"project"`; the chosen file lands in `inbox`.
+    /// Opens a file picker for `"data"`, `"project"`, or `"shapefile"`; results land in `inbox`.
+    /// Shapefile picks carry [`SHAPEFILE_PICK`] after sidecars are gathered into ZIPs.
     pub open_async: Option<Box<dyn Fn(&str)>>,
-    /// Hands bytes to the user as a download named `file_name`.
-    pub download: Option<Box<dyn Fn(&str, Vec<u8>)>>,
+    /// Offers bytes as a download named `file_name`; success means submission to the host's
+    /// download mechanism. Browsers do not expose confirmation that the file was saved.
+    pub download: Option<Box<dyn Fn(&str, Vec<u8>) -> Result<(), String>>>,
     pub inbox: Option<Inbox>,
     /// Reads a saved preference (`language`, …).
     pub load_pref: Option<Box<dyn Fn(&str) -> Option<String>>>,
     /// Saves a preference.
     pub save_pref: Option<Box<dyn Fn(&str, &str)>>,
+    /// The system's secret store (see `docs/architecture.md` › Secrets): the desktop's keychain.
+    /// `None` in the browser and on the command line, where secrets last for the session only.
+    pub secrets: Option<std::sync::Arc<dyn rustgis_engine::data::secrets::SecretStore>>,
     /// Downloads a font by URL (web); the bytes land in `font_inbox`.
     pub fetch_font: Option<Box<dyn Fn(&str)>>,
     pub font_inbox: Option<Inbox>,
@@ -222,6 +276,18 @@ pub struct Services {
     /// Makes an HTTP request (the AI assistant's calls to its model) and puts the response, of any
     /// status, in the slot (the browser's fetch; the desktop sends it on a thread).
     pub http: Option<Box<dyn Fn(rustgis_assistant::HttpRequest, Slot<Result<rustgis_assistant::HttpResponse, rustgis_assistant::Error>>)>>,
+    /// Where autosave keeps the recovery copy of unsaved work (the desktop's recovery folder).
+    /// `None` turns autosave off: the browser for now, and a second copy of the desktop app
+    /// running alongside the first, which mustn't touch its copy.
+    pub recovery: Option<Box<dyn RecoveryStore>>,
+    /// Reads the system clipboard's text into the slot (the browser's `navigator.clipboard`,
+    /// which may ask the user first), for a text field's Paste; `None` where the window sends
+    /// it (the desktop) or the browser can't read it (a page not served over HTTPS).
+    pub read_clipboard: Option<Box<dyn Fn(Slot<Result<String, String>>)>>,
+    /// Signs in to an ArcGIS portal (its address and an OAuth client id, either blank for ArcGIS
+    /// Online and RustGIS's own app) in a pop-up window, putting who signed in, or why not, in the
+    /// slot (the browser; the desktop runs `arcgis.signIn`).
+    pub arcgis_sign_in: Option<Box<dyn Fn(String, String, Slot<Result<String, String>>)>>,
 }
 
 /// A new private folder for one print job: unique, created fresh (never an existing path) and,
@@ -289,11 +355,6 @@ pub struct ServiceConn {
     pub error: Option<String>,
     /// A capabilities request that failed, with what the server said (#509).
     pub failure: Option<Failure>,
-    /// An OGC API layer whose advertised tile template is being read before it is added.
-    pub resolving: Option<TilesResolve>,
-    /// A WCS coverage whose description is being read before it is asked for: `service.coverage`'s
-    /// parameters and the description on its way.
-    pub describing: Option<(Value, Slot<Result<Vec<u8>, String>>)>,
 }
 
 /// How Add From Service's list is browsed.
@@ -303,6 +364,12 @@ pub struct ServiceBrowse {
     pub filter: String,
     /// The date time-enabled layers are added at (their default when empty).
     pub time: String,
+    /// Time-enabled layers are added at a fixed date (`time`, or their default when empty) rather
+    /// than following the time slider, as they do by default.
+    pub fixed: bool,
+    /// Feature layers are asked only for the features crossing the map's view (Only the map's
+    /// area), not whole.
+    pub area: bool,
     /// The directories (and their types) opened before the one shown, the last most recent.
     pub back: Vec<(String, &'static str)>,
 }
@@ -320,6 +387,17 @@ pub struct TilesResolve {
     /// The usual-path template, when the advertised one can't be read.
     pub fallback: String,
     pub slot: Slot<Result<Vec<u8>, String>>,
+}
+
+/// A service layer waiting on a document before it is added. `dialog` tells whether the add came
+/// from the add-service dialog (its result shows there) or from the Connections tree (a notice);
+/// `origin` is the connection a tree add is for, named in Recent once the layer is added.
+pub enum ServiceStep {
+    /// An OGC API layer whose advertised tile template is being read.
+    Tiles { resolve: TilesResolve, dialog: bool, origin: Option<String> },
+    /// A WCS coverage whose description is being read before it is asked for: `service.coverage`'s
+    /// parameters and the description on its way.
+    Coverage { params: Value, slot: Slot<Result<Vec<u8>, String>>, dialog: bool, origin: Option<String> },
 }
 
 /// Fetches an address into a slot, off the frame.
@@ -363,7 +441,7 @@ pub enum LayersView {
 }
 
 /// Retains the GUI's legacy XML decoding while refusing malformed JSON text.
-fn service_text(bytes: Vec<u8>) -> Result<String, std::string::FromUtf8Error> {
+pub(crate) fn service_text(bytes: Vec<u8>) -> Result<String, std::string::FromUtf8Error> {
     String::from_utf8(bytes).or_else(|error| {
         let bytes = error.as_bytes();
         let without_bom = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
@@ -397,6 +475,8 @@ pub enum RightPane {
     Tasks,
     Jobs,
     Profile,
+    /// A Zarr variable's time series at points clicked on the map (#555).
+    TimeSeries,
     Diagnostics,
     Infographics,
     Report,
@@ -411,10 +491,39 @@ pub enum RightPane {
     Format,
     /// The selected feature layer's labels (#617).
     Labeling,
-    /// A Home › Web Data service: the one `UiState::web_data` names.
+    /// A Home › Add › Web Data service: the one `UiState::web_data` names.
     WebData,
     /// A plugin's panel: the one `UiState::plugin_panel` names.
     Plugin,
+}
+
+/// A Unique Values field choice scoped to the layer and renderer that opened it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingUniqueSymbology {
+    project: u64,
+    map: usize,
+    layer: u32,
+    renderer: std::sync::Arc<rustgis_engine::map::Renderer>,
+    pub field: String,
+}
+
+impl PendingUniqueSymbology {
+    fn new(session: &Session, layer: &rustgis_engine::map::Layer, field: String) -> Self {
+        Self {
+            project: session.opened,
+            map: session.project.active_map,
+            layer: layer.id,
+            renderer: std::sync::Arc::new(layer.renderer.clone()),
+            field,
+        }
+    }
+
+    fn is_current(&self, session: &Session) -> bool {
+        self.project == session.opened
+            && self.map == session.project.active_map
+            && Some(self.layer) == session.active_layer
+            && session.map().layer(self.layer).is_some_and(|layer| layer.renderer == *self.renderer)
+    }
 }
 
 pub struct UiState {
@@ -431,6 +540,8 @@ pub struct UiState {
     /// `panes::web_data_name`).
     pub web_data: &'static str,
     pub dark: bool,
+    /// Live measurement and map scale-bar units, chosen in Home › Measure.
+    pub measurement_imperial: bool,
     /// The theme follows the system's light or dark setting until the user picks one.
     pub dark_follows_system: bool,
     /// Interface language preference: a language code or `auto`.
@@ -440,6 +551,10 @@ pub struct UiState {
     pub worldview: String,
     /// Start-up preference: what RustGIS opens with.
     pub start_with: StartWith,
+    /// Whether a file holding several layers asks which to add (#934), or adds them all.
+    pub ask_layers: bool,
+    /// Files whose layers are being listed or chosen, the first one shown.
+    pub choosing: Vec<layerchooser::Chooser>,
     /// The project last opened or saved on this computer, for Start With › Last Project.
     pub last_project: Option<String>,
     /// Start-up preference: the projection the first map starts in (a [`Projection`] code);
@@ -465,7 +580,14 @@ pub struct UiState {
     pub shortcuts: bool,
     /// The keyboard shortcuts.
     pub keymap: keymap::Keymap,
+    pub(crate) shortcut_editor: shortcutui::Editor,
+    /// Preserve unreadable saved shortcuts until the user explicitly resets them.
+    pub(crate) shortcut_preferences_blocked: bool,
+    /// The shortcut changes are too many to save: they apply only to this session.
+    pub(crate) shortcut_preferences_full: bool,
     pub tab_strip_rect: Option<egui::Rect>,
+    /// Where the left and right panes were drawn on the last frame, while they show.
+    pub pane_rects: [Option<egui::Rect>; 2],
     /// Tabs hidden from the ribbon (Settings › Customize › Ribbon).
     pub hidden_tabs: Vec<String>,
     /// Extra Quick Access Toolbar commands.
@@ -481,6 +603,13 @@ pub struct UiState {
     /// The active layer the filter hid (so it stopped being active), selected again once the
     /// filter shows it, unless another layer was picked meanwhile.
     pub layer_filter_hid: Option<u32>,
+    /// The Layers pane's layer selection as the frame began (the rows tint from it), the layers its
+    /// rows list in the order drawn (what a Shift+click spans), the row a Shift+click spans from,
+    /// and the one it was made on, resolved once the rows are all drawn.
+    pub layer_picked: Vec<u32>,
+    pub layer_rows: Vec<u32>,
+    pub layer_anchor: Option<u32>,
+    pub layer_range: Option<u32>,
     /// How the Layers pane lists the layers (#301). Kept for the session, not saved.
     pub layers_view: LayersView,
     /// The command an item picked in the browser opens with (web).
@@ -490,7 +619,9 @@ pub struct UiState {
     /// Add Delimited Text, for the file being picked (web): `null` opens its dialog for the file,
     /// a script's options are read with it.
     pub pending_csv: Option<Value>,
-    /// Data downloading from web addresses (Add Data › From URL): the address, the parameters to
+    /// CRS override for the next Shapefile picked by Import Shapefile with Projection.
+    pub pending_shapefile: Option<Value>,
+    /// Data downloading from web addresses (Home › Add › Add Data › From URL): the address, the parameters to
     /// add it with, and where the download lands.
     pub downloads: Vec<(u64, String, Value, Slot<Result<Vec<u8>, String>>)>,
     /// A project downloading from its web address (`ui.openUrl`, a `?project=` link): the
@@ -503,6 +634,8 @@ pub struct UiState {
     /// that can be read in place are added so, others downloaded (the `ui.addUrl` parameters,
     /// and the answer).
     pub cog_probes: Vec<(Value, Slot<Result<bool, String>>)>,
+    /// Service layers whose features are being read page by page, after their first page landed.
+    pub service_pages: Vec<serviceui::PageRead>,
     /// A link's data (`?data=`) has zoomed the map: the first of its files to land with something
     /// to show does, whichever it is.
     pub link_zoomed: bool,
@@ -511,6 +644,9 @@ pub struct UiState {
     /// Add From Service's list: its filter, a time-enabled layer's date, and the directories
     /// opened on the way to the service shown (Back returns to them).
     pub service_browse: ServiceBrowse,
+    /// Service layers added from the dialog or the Connections tree that wait on a document
+    /// (a tileset list, a coverage's description) before they are added.
+    pub service_steps: Vec<ServiceStep>,
     /// The Web Data panels of single services (NASA Earthdata, EnviroAtlas, FEMA NFHL, The
     /// National Map, Fields of the World): their documents, searches and choices.
     pub web_services: webdataui::State,
@@ -520,8 +656,19 @@ pub struct UiState {
     pub csw: cswui::State,
     /// STAC Search: its choices, results and the request under way.
     pub stac: stacui::State,
+    /// WMS and WMTS layers' legend pictures, as the Layers pane shows them (#942).
+    pub tile_legends: tilelegend::Legends,
+    /// A text field's right-click menu: the field it's open on, and the row picked.
+    pub field_menu: fieldmenu::FieldMenu,
     /// S3…: the connection form, the bucket browsed and the listing under way.
     pub s3: s3ui::State,
+    /// New/Edit Connection: the form and the Test under way.
+    pub connection: connectionui::State,
+    /// Choose S3 connection: the saved connection picked for each bucket the project's S3
+    /// sources wait on, for the project open.
+    pub s3_chooser: connectionui::Chooser,
+    /// The datasets saved connections list under Data Sources › Connections, and the selection.
+    pub connection_tree: connectiontree::State,
     /// OpenStreetMap and Boundaries: their choices and the request under way.
     pub portals: portalsui::State,
     /// Overture Maps and Source Cooperative: choices, results and the request under way.
@@ -530,8 +677,12 @@ pub struct UiState {
     pub opendata: opendataui::State,
     /// Satellite Embeddings: the dataset, its choices, the read under way and the tiles found.
     pub embeddings: embeddingsui::State,
+    /// Data Cubes: the filters, the period, and what the last action said.
+    pub cubes: cubesui::State,
     /// NASA Earthaccess: the dataset, the granules found and the request under way.
     pub earthaccess: earthaccessui::State,
+    /// Add From Service › Sign in to ArcGIS.
+    pub arcgis: arcgisui::State,
     /// USGS NLDI: the point traced, its COMID, the navigation and the request under way.
     pub nldi: nldiui::State,
     /// Find Place searches and Geocode Addresses runs under way.
@@ -547,10 +698,13 @@ pub struct UiState {
     /// The Data Sources pane's boxes, and the sources' generation last kept in the preferences.
     pub sources: sourcespane::State,
     pub sources_saved: u64,
+    pub connections_saved: u64,
     /// The default raster style last kept in the preferences.
     pub raster_defaults_saved: rustgis_engine::map::RasterDefaults,
-    /// Add Data › Zarr…: its store, choices and fetches.
+    /// Home › Add › Add Data › Zarr…: its store, choices and fetches.
     pub zarr: zarrui::State,
+    /// Independent Zarr reads for imported GeoLibre layers; does not share the picker state.
+    pub geolibre_zarr: Vec<geolibreui::Read>,
     /// A layout picture waiting for its image file (web).
     pub pending_layout_picture: bool,
     /// The corners of a picture graphic waiting for its image file.
@@ -566,6 +720,8 @@ pub struct UiState {
     pub copy_image: Option<egui::ColorImage>,
     /// The scale being typed into the status bar, while its box has focus.
     pub scale_text: Option<String>,
+    /// A field chosen in the Symbology pane before applying Unique Values.
+    pub symbology_pending: Option<PendingUniqueSymbology>,
 }
 
 impl UiState {
@@ -600,6 +756,7 @@ impl UiState {
 }
 
 impl Default for UiState {
+    /// Starts on Home with no pending picker or download, keeping transient imports out of saved state.
     fn default() -> Self {
         UiState {
             tab: "Home".into(),
@@ -610,10 +767,13 @@ impl Default for UiState {
             right_open: Vec::new(),
             web_data: "opendata",
             dark: false,
+            measurement_imperial: false,
             dark_follows_system: true,
             language: i18n::AUTO.into(),
             worldview: i18n::AUTO.into(),
             start_with: StartWith::Sample,
+            ask_layers: true,
+            choosing: Vec::new(),
             last_project: None,
             start_projection: String::new(),
             start_projection_input: String::new(),
@@ -626,7 +786,11 @@ impl Default for UiState {
             about: false,
             shortcuts: false,
             keymap: keymap::Keymap::default(),
+            shortcut_editor: shortcutui::Editor::default(),
+            shortcut_preferences_blocked: false,
+            shortcut_preferences_full: false,
             tab_strip_rect: None,
+            pane_rects: [None; 2],
             copy_out: None,
             open_url: None,
             copy_image: None,
@@ -635,24 +799,34 @@ impl Default for UiState {
             pending_open: None,
             web_file: None,
             pending_csv: None,
+            pending_shapefile: None,
             downloads: Vec::new(),
             project_download: None,
             sql: Default::default(),
             cog_probes: Vec::new(),
+            service_pages: Vec::new(),
             link_zoomed: false,
             service: None,
             service_browse: ServiceBrowse::default(),
+            service_steps: Vec::new(),
             web_services: Default::default(),
             service_import: None,
             service_group_name: "My OGC Layer".into(),
             csw: Default::default(),
             stac: Default::default(),
+            tile_legends: Default::default(),
+            field_menu: Default::default(),
             s3: Default::default(),
+            connection: Default::default(),
+            s3_chooser: Default::default(),
+            connection_tree: Default::default(),
             portals: Default::default(),
             catalogs: Default::default(),
             opendata: Default::default(),
             embeddings: Default::default(),
+            cubes: Default::default(),
             earthaccess: Default::default(),
+            arcgis: Default::default(),
             nldi: Default::default(),
             geocode: Default::default(),
             nav: Default::default(),
@@ -661,8 +835,10 @@ impl Default for UiState {
             search: Default::default(),
             sources: Default::default(),
             sources_saved: 0,
+            connections_saved: 0,
             raster_defaults_saved: Default::default(),
             zarr: Default::default(),
+            geolibre_zarr: Vec::new(),
             hidden_tabs: Vec::new(),
             quick_access: Vec::new(),
             titlebar: None,
@@ -670,9 +846,14 @@ impl Default for UiState {
             layer_filter: String::new(),
             layer_filter_map: String::new(),
             layer_filter_hid: None,
+            layer_picked: Vec::new(),
+            layer_rows: Vec::new(),
+            layer_anchor: None,
+            layer_range: None,
             layers_view: LayersView::DrawingOrder,
             dynamic_text: None,
             scale_text: None,
+            symbology_pending: None,
         }
     }
 }
@@ -711,6 +892,10 @@ pub struct RustGisApp {
     pub quit_requested: bool,
     logo: Option<egui::TextureHandle>,
     pub services: Services,
+    /// Autosave's interval, its last copy, and the copy an earlier run left (#873).
+    pub(crate) autosave: autosave::AutosaveState,
+    /// The question asked before unsaved changes are discarded, and a quit the user agreed to.
+    pub(crate) save_prompt: saveprompt::SavePromptState,
     /// The MCP relay for `rustgis-cli mcp --attach`: a loopback listener on the session this app
     /// already has open, started by the `ui.mcpRelay` command and off until then.
     #[cfg(not(target_arch = "wasm32"))]
@@ -722,6 +907,9 @@ pub struct RustGisApp {
     /// A screen snapshot an agent attached through the relay asked for, while it is captured.
     #[cfg(not(target_arch = "wasm32"))]
     relay_shot: Option<relayshot::Shot>,
+    /// Where the relay snapshot's window screenshot lands.
+    #[cfg(not(target_arch = "wasm32"))]
+    relay_arrived: relayshot::Arrived,
     /// The frame's `egui::Context`, kept so `ui.mcpRelay` can hand the relay its wake callback:
     /// a queued message asks for a repaint, or it waits for the user to move the mouse.
     #[cfg(not(target_arch = "wasm32"))]
@@ -743,6 +931,8 @@ pub struct RustGisApp {
     fonts_failed: Vec<String>,
     /// Fonts were installed this frame: `set_fonts` only takes effect on the next one.
     fonts_pending: bool,
+    /// Whether the installed font families were indexed by a frame (see `families::warm_up`).
+    label_fonts_indexed: bool,
     /// The language the interface is drawn in. It trails the chosen one until a font for its
     /// script is active, so switching to Chinese never draws a frame of missing-glyph boxes.
     shown_lang: i18n::Lang,
@@ -751,13 +941,55 @@ pub struct RustGisApp {
 }
 
 impl RustGisApp {
+    /// The Ctrl (⌘) shortcuts the keymap takes, as (Alt, Shift, key), the clipboard's left out:
+    /// in a browser, what the web app keeps from the browser's own shortcuts (⌘D bookmarking
+    /// the page, ⌘Y opening its history, ⌘= zooming it), as design tools in the browser do.
+    pub fn command_keys(&self) -> Vec<(bool, bool, egui::Key)> {
+        let mut keys: Vec<(bool, bool, egui::Key)> = self
+            .ui
+            .keymap
+            .bindings
+            .iter()
+            .map(|b| b.chord)
+            .filter(|c| c.command && !keymap::is_clipboard(*c))
+            .map(|c| (c.alt, c.shift, c.key))
+            .collect();
+        keys.sort_by_key(|k| (k.0, k.1, k.2 as u32));
+        keys.dedup();
+        keys
+    }
+
+    /// A fingerprint of the keymap's key combinations: cheap to take every frame (no
+    /// allocation), it changes when a shortcut is added, removed or rebound, so a caller can
+    /// rebuild [`RustGisApp::command_keys`] only then.
+    pub fn shortcuts_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for b in &self.ui.keymap.bindings {
+            b.chord.hash(&mut h);
+        }
+        self.ui.keymap.bindings.len().hash(&mut h);
+        h.finish()
+    }
+
+    /// Whether a browser key press (its `key` and `code`, Ctrl or ⌘ held, Alt, Shift) is one of
+    /// [`RustGisApp::command_keys`]: as egui matches a shortcut, an extra Alt or Shift doesn't
+    /// stop it (⌘+ is ⌘⇧= on most keyboards).
+    pub fn takes_browser_key(keys: &[(bool, bool, egui::Key)], key: &str, code: &str, command: bool, alt: bool, shift: bool) -> bool {
+        command
+            && keymap::browser_key(key, code).is_some_and(|k| keys.iter().any(|&(a, s, bound)| bound == k && (!a || alt) && (!s || shift)))
+    }
+
     /// egui's wgpu render state from the host (`frame.wgpu_render_state()`), feeding the GPU
     /// map backend. Cheap to call every frame: the state is Arc-backed.
     pub fn set_render_state(&mut self, rs: Option<egui_wgpu::RenderState>) {
         self.map.set_render_state(rs);
     }
 
+    /// The app around `session`, with no platform hooks (see [`Self::with_services`]).
     pub fn new(session: Session) -> Self {
+        // The installed fonts a label can be drawn in, indexed while the app starts.
+        rustgis_engine::render::families::warm_up();
         let mut s = session;
         if s.active_layer.is_none() {
             s.active_layer = s.map().layers.first().map(|l| l.id);
@@ -772,7 +1004,7 @@ impl RustGisApp {
             table: table::TableState::default(),
             layout: layoutview::LayoutView::default(),
             graphic_format: graphicformat::GraphicFormat::default(),
-            forms: editpanes::Forms::default(),
+            forms: editpanes::Forms { distance_units: "Meters".into(), ..editpanes::Forms::default() },
             workflow: analysispane::Workflow::default(),
             mb: modelbuilder::ModelBuilder::default(),
             ws: workspacepanes::WorkspaceState::default(),
@@ -795,6 +1027,8 @@ impl RustGisApp {
             #[cfg(not(target_arch = "wasm32"))]
             relay_shot: None,
             #[cfg(not(target_arch = "wasm32"))]
+            relay_arrived: relayshot::Arrived::default(),
+            #[cfg(not(target_arch = "wasm32"))]
             connect: Default::default(),
             #[cfg(not(target_arch = "wasm32"))]
             frame_ctx: None,
@@ -806,13 +1040,23 @@ impl RustGisApp {
             fonts_requested: Vec::new(),
             fonts_failed: Vec::new(),
             fonts_pending: false,
+            label_fonts_indexed: false,
             shown_lang: i18n::Lang::EN,
             seen_project: None,
+            autosave: Default::default(),
+            save_prompt: Default::default(),
         }
     }
 
+    /// Installs the shell's platform hooks and reads what they keep: preferences, saved
+    /// connections and the recovery copy an earlier run left.
     pub fn with_services(mut self, services: Services) -> Self {
+        // Both saved database passwords and S3 keys use the same store, installed before prefs.
+        self.session.database_logins.set_store(services.secrets.clone());
         self.services = services;
+        shortcutui::load(&mut self);
+        sourcespane::load_connections(&mut self);
+        autosave::load(&mut self);
         if let Some(lang) = self.services.load_pref.as_ref().and_then(|load| load("language")) {
             self.ui.language = lang;
         }
@@ -830,6 +1074,7 @@ impl RustGisApp {
             self.ui.start_with = StartWith::Sample;
         }
         self.ui.last_project = self.services.load_pref.as_ref().and_then(|load| load("last_project")).filter(|p| !p.trim().is_empty());
+        self.ui.ask_layers = self.services.load_pref.as_ref().and_then(|load| load("ask_file_layers")).is_none_or(|v| v != "off");
         // A stored projection this version can't use means Web Mercator.
         if let Some(code) = self.services.load_pref.as_ref().and_then(|load| load("start_projection"))
             && let Ok(p) = rustgis_engine::map::Projection::from_code(&code)
@@ -844,6 +1089,17 @@ impl RustGisApp {
             self.session.raster_defaults = d.sanitized();
         }
         self.ui.raster_defaults_saved = self.session.raster_defaults.clone();
+        self.forms.distance_units = self
+            .services
+            .load_pref
+            .as_ref()
+            .and_then(|load| load(editpanes::DISTANCE_UNITS_PREF))
+            .and_then(|value| {
+                editpanes::DISTANCE_UNITS.iter().find(|unit| unit.eq_ignore_ascii_case(value.trim())).map(|unit| (*unit).to_owned())
+            })
+            .unwrap_or_else(|| "Meters".into());
+        self.ui.measurement_imperial =
+            self.services.load_pref.as_ref().and_then(|load| load("measurement_units")).as_deref() == Some("imperial");
         // The GPU map backend: RUSTGIS_GPU forces it on, else the saved preference.
         self.map.gpu_enabled = std::env::var_os("RUSTGIS_GPU").is_some()
             || self.services.load_pref.as_ref().and_then(|load| load("ui.map.gpu")).as_deref() == Some("1");
@@ -888,7 +1144,8 @@ impl RustGisApp {
     fn can_draw(&self, lang: i18n::Lang) -> bool {
         let Some(region) = Self::script_region(lang.script()) else { return true };
         let have = self.extra_fonts.iter().any(|(_, _, r)| *r == Some(region));
-        (have || self.services.fetch_font.is_none()) && !self.fonts_pending && self.installed_region == Some(region)
+        let can_fetch = self.services.fetch_font.is_some() && rustgis_engine::render::fonts::script_font_url(region).is_some();
+        (have || !can_fetch) && !self.fonts_pending && self.installed_region == Some(region)
     }
 
     /// On the desktop, an installed CJK face as a last-resort fallback, so CJK text (language names
@@ -907,6 +1164,20 @@ impl RustGisApp {
         }
     }
 
+    /// On the desktop, an installed symbol face as a last-resort fallback, so marks the interface
+    /// faces lack (Segoe UI has no "✓") don't draw as boxes. The bytes are borrowed from the font
+    /// cache, not copied.
+    fn add_symbol_fallback(&mut self) {
+        if self.extra_fonts.iter().any(|(n, _, _)| n == "symbol-fallback") {
+            return;
+        }
+        if let Some((bytes, index)) = rustgis_engine::render::fonts::symbol_font() {
+            let mut face = egui::FontData::from_static(bytes);
+            face.index = *index;
+            self.extra_fonts.push(("symbol-fallback".into(), std::sync::Arc::new(face), None));
+        }
+    }
+
     /// The script face the current language needs, if any.
     fn current_region(&self) -> Option<rustgis_engine::render::fonts::ScriptFont> {
         Self::script_region(self.chosen_lang().script())
@@ -920,6 +1191,7 @@ impl RustGisApp {
             i18n::Script::Cjk(i18n::CjkFont::Japanese) => Some(ScriptFont::Cjk(CjkRegion::Japanese)),
             i18n::Script::Cjk(i18n::CjkFont::Korean) => Some(ScriptFont::Cjk(CjkRegion::Korean)),
             i18n::Script::Arabic => Some(ScriptFont::Arabic),
+            i18n::Script::Bengali => Some(ScriptFont::Bengali),
             i18n::Script::Alphabetic => None,
         }
     }
@@ -944,8 +1216,8 @@ impl RustGisApp {
             face.index = *index;
             self.extra_fonts.push((name, std::sync::Arc::new(face), Some(region)));
             self.fonts_dirty = true;
-        } else if let Some(fetch) = &self.services.fetch_font {
-            fetch(script_font_url(region));
+        } else if let (Some(fetch), Some(url)) = (&self.services.fetch_font, script_font_url(region)) {
+            fetch(url);
         } else {
             log::warn!("no {region:?} font installed; text in that script may not display");
         }
@@ -984,11 +1256,24 @@ impl RustGisApp {
 
     /// Opens a file from the inbox: one the `"text"` picker marked ([`DELIMITED_PICK`]) opens Add
     /// Delimited Text for it, or is read with a script's options; one the tool file picker marked
-    /// ([`TOOL_FILE_PICK`]) goes to the Tools pane.
+    /// ([`TOOL_FILE_PICK`]) goes to the Tools pane. Source-CRS picks carry [`SHAPEFILE_PICK`].
     pub fn open_picked(&mut self, name: &str, bytes: &[u8]) -> Result<Value, String> {
         if let Some(name) = name.strip_prefix(TOOL_FILE_PICK) {
             panes::received_file(self, name, bytes);
             return Ok(Value::Null);
+        }
+        if let Some(name) = name.strip_prefix(SHAPEFILE_PICK) {
+            if !name.to_ascii_lowercase().ends_with(".zip") {
+                let error = tl!("Choose a zipped Shapefile, or pick its .shp and .dbf together.").to_string();
+                self.session.notify(error.clone(), true);
+                return Err(error);
+            }
+            let Some(options) = self.ui.pending_shapefile.clone() else {
+                let error = tl!("Choose the source coordinate system before importing").to_string();
+                self.session.notify(error.clone(), true);
+                return Err(error);
+            };
+            return self.open_bytes_with(name, bytes, Some(options));
         }
         match name.strip_prefix(DELIMITED_PICK) {
             Some(name) => match self.ui.pending_csv.take() {
@@ -999,6 +1284,7 @@ impl RustGisApp {
         }
     }
 
+    /// Opens file bytes with picker options, forwarding source CRS overrides before ZIP parsing.
     fn open_bytes_with(&mut self, name: &str, bytes: &[u8], csv: Option<Value>) -> Result<Value, String> {
         let lower = name.to_ascii_lowercase();
         // A plugin package: ask before installing it.
@@ -1008,6 +1294,8 @@ impl RustGisApp {
         }
         // Project items picked or dropped in the browser.
         let item = [
+            (".geolibre", "project.importGeolibre"),
+            (".geolibre.json", "project.importGeolibre"),
             (".rgismap", "map.import"),
             (".rgismpk", "map.import"),
             (".rgislyr", "layer.addLayerFile"),
@@ -1053,7 +1341,7 @@ impl RustGisApp {
         }
         if lower.ends_with(".rgispkg") {
             let text = rustgis_engine::cmd::items::package_text(bytes)?;
-            let r = self.run("project.openText", json!({"text": text}));
+            let r = self.run("project.openText", json!({"text": text, "package": true}));
             self.map.invalidate();
             return r;
         }
@@ -1083,8 +1371,9 @@ impl RustGisApp {
             use base64::Engine;
             let data = base64::engine::general_purpose::STANDARD.encode(bytes);
             let mut p = json!({"fileName": name, "data": data});
-            // A spreadsheet picked for Add Delimited Text takes its options.
-            if let Some(Value::Object(opts)) = csv.filter(|_| rustgis_engine::data::sheets::is_sheet_name(name)) {
+            // A picked spreadsheet or Shapefile ZIP takes its import options.
+            if let Some(Value::Object(opts)) = csv.filter(|_| rustgis_engine::data::sheets::is_sheet_name(name) || lower.ends_with(".zip"))
+            {
                 for (k, v) in opts {
                     p[k] = v;
                 }
@@ -1129,16 +1418,29 @@ impl RustGisApp {
         // Not an undoable edit: saving names the project, as `project.saveAs` does, once the
         // file is written.
         let old = std::mem::replace(&mut self.session.project.name, stem.clone());
-        let text = match serde_json::to_string(&self.session.project) {
-            Ok(text) => text,
+        let (text, stripped) = match self.session.project.saved_text(None) {
+            Ok(saved) => saved,
             Err(e) => {
                 self.session.project.name = old;
                 return Err(e.to_string());
             }
         };
         let file = format!("{stem}.rgis");
-        self.download(&file, text.into_bytes());
-        self.session.dirty = false;
+        if let Err(e) = self.services.download.as_ref().ok_or(tl!("no download service"))?(&file, text.into_bytes()) {
+            self.session.project.name = old;
+            return Err(e);
+        }
+        self.session.notify(crate::i18n::fmt("Downloaded {name}", &[("name", &file)]), false);
+        if stripped > 0 {
+            self.session.notify(
+                crate::i18n::fmt(
+                    "{n} layer address(es) were saved without their keys, tokens or passwords: after RustGIS closes, add those layers again to give them",
+                    &[("n", &stripped.to_string())],
+                ),
+                false,
+            );
+        }
+        self.session.mark_saved();
         self.ui.web_file = Some(file);
         Ok(())
     }
@@ -1152,12 +1454,40 @@ impl RustGisApp {
     fn download(&mut self, name: &str, bytes: Vec<u8>) -> bool {
         match &self.services.download {
             Some(d) => {
-                d(name, bytes);
+                if let Err(e) = d(name, bytes) {
+                    self.session.notify(e, true);
+                    return false;
+                }
                 self.session.notify(crate::i18n::fmt("Downloaded {name}", &[("name", name)]), false);
                 true
             }
             None => false,
         }
+    }
+
+    /// Delivers exports from all command entry points, including scripts and the assistant.
+    /// The engine records success only after the service submits the file to the host.
+    fn deliver_gp_files(&mut self, mut requested: Result<Value, String>) -> Result<Value, String> {
+        for (id, name, bytes) in self.session.take_gp_files() {
+            let delivered = match &self.services.download {
+                Some(download) => download(&name, bytes),
+                None => Err(tl!("this build has no download service").into()),
+            };
+            let mut params = json!({"id": id});
+            if let Err(error) = &delivered {
+                params["error"] = json!(error);
+            }
+            let completed = self.session.run("gp.fileDelivered", &params);
+            let result = delivered.and(completed);
+            self.gp.last = Some(match &result {
+                Ok(_) => (true, self.session.project.gp_history.last().map(|h| h.messages.clone()).unwrap_or_default()),
+                Err(error) => (false, vec![error.clone()]),
+            });
+            // gp.fileDelivered reports delivery failures from the history record and its
+            // own acknowledgment errors through Session::run; neither needs a second notice.
+            requested = complete_gp_file(requested, id, &result);
+        }
+        requested
     }
 
     /// The RustGIS logo as a texture (rasterised once from `rustgis_render::logo`).
@@ -1184,7 +1514,7 @@ impl RustGisApp {
         rustgis_engine::sample::apply_worldview(if cfg!(test) { "default" } else { i18n::AUTO });
         let mut s = Session::new(Project::default());
         let _ = s.run("project.sample", &Value::Null);
-        s.dirty = false;
+        s.mark_saved();
         RustGisApp::new(s)
     }
 
@@ -1285,6 +1615,12 @@ impl RustGisApp {
         }
     }
 
+    /// A clean exit (the desktop app's `on_exit`): the recovery copy of this run's unsaved work
+    /// is removed, as recovery is for a run that didn't close. Call it once, as the app closes.
+    pub fn end_autosave(&mut self) {
+        autosave::end(self);
+    }
+
     /// Whether this shell opens files by path (the desktop app; the web app picks them in the
     /// browser instead).
     pub(crate) fn opens_files(&self) -> bool {
@@ -1310,6 +1646,18 @@ impl RustGisApp {
         self.ui.last_project = Some(path);
     }
 
+    /// Runs a command the user asked for in the interface (a button, a menu, a shortcut, Command
+    /// Search, a file dropped on the window): one that would replace a project with unsaved
+    /// changes asks to save them first, and runs once answered. Scripts, the AI Assistant and
+    /// attached agents run commands without asking ([`Self::run`]).
+    pub fn run_by_user(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        if saveprompt::asks(self, id) {
+            saveprompt::ask(self, saveprompt::Discard::Replace(id.to_string(), params));
+            return Ok(Value::Null);
+        }
+        self.run(id, params)
+    }
+
     /// Runs a command by id: `ui.*` here, everything else in the engine.
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
         if !matches!(id, "ui.menu" | "ui.ribbon" | "ui.language" | "ui.worldview") {
@@ -1331,9 +1679,18 @@ impl RustGisApp {
         // of another, so it ends when the open layout changes (or layouts come and go).
         let open_layout = |app: &Self| (app.session.active_layout, app.session.project.layouts.len());
         let layout_before = open_layout(self);
-        let r = if id.starts_with("ui.") { self.run_ui(id, &params) } else { self.session.run(id, &params) };
+        let mut r = if id.starts_with("ui.") { self.run_ui(id, &params) } else { self.session.run(id, &params) };
+        r = self.deliver_gp_files(r);
+        if r.is_ok() && id == "tool.set" {
+            self.map.cancel_sketch();
+        }
         if let Err(e) = &r {
             log::info!("{id}: {e}");
+        }
+        // Commands can replace the project, switch maps or change the renderer while the pane
+        // is closed. A field picked for the old context must not overwrite the new renderer.
+        if self.ui.symbology_pending.as_ref().is_some_and(|pending| !pending.is_current(&self.session)) {
+            self.ui.symbology_pending = None;
         }
         // A project replacing this one hasn't been saved in the browser yet (opening a file
         // names it again).
@@ -1350,6 +1707,9 @@ impl RustGisApp {
                 );
                 self.session.notify(text, true);
             }
+            // A probe still under way is for an address added to the old project: dropped, so
+            // its layer never lands in the new one.
+            self.ui.cog_probes.clear();
         }
         // Undo and redo can move vertices: an index chosen before may now name another vertex.
         // A step moved or deleted, from the pane, Command Search, the assistant or a script: the
@@ -1400,6 +1760,7 @@ impl RustGisApp {
         self.note_last_project();
         // Sources added, saved or made favourites are kept with the preferences.
         sourcespane::save(self);
+        sourcespane::save_connections(self);
         self.save_raster_defaults();
         r
     }
@@ -1420,7 +1781,7 @@ impl RustGisApp {
         let active = self.session.active_layer.take();
         let needs = (spec.enabled)(&self.session).is_some();
         self.session.active_layer = active;
-        if !defaults && !(needs && (spec.enabled)(&self.session).is_none()) {
+        if !(defaults || needs && (spec.enabled)(&self.session).is_none()) {
             return None;
         }
         let map = self.session.map();
@@ -1457,7 +1818,9 @@ impl RustGisApp {
         let Some(spec) = self.session.registry.get(id).filter(|c| c.mutates).copied() else { return };
         // Downloaded data is kept for this session only, and adding it uses it up: a task
         // couldn't add it again.
-        if id == "layer.addDownload" {
+        // A result handed over by the app (`ran`: a summary worked out on a thread) is used up
+        // the same way.
+        if id == "layer.addDownload" || (matches!(id, "layer.addZarr" | "cube.trend") && params.get("ran").is_some_and(|r| !r.is_null())) {
             let text = crate::i18n::fmt(
                 "{command} isn't recorded: the downloaded data is kept for this session only, so a task couldn't add it again.",
                 &[("command", tl_raw!(spec.label))],
@@ -1522,10 +1885,11 @@ impl RustGisApp {
         // updates its step; anything else, a second selection on the same layer included, is a
         // step of its own.
         if let Some(last) = steps.last_mut()
-            && matches!(id, "layer.color" | "layer.outline" | "layer.lineStrokes" | "layer.transparency")
+            && matches!(id, "layer.color" | "layer.outline" | "layer.lineStrokes" | "layer.fillLayers" | "layer.transparency")
             && last.command == id
             && params.get("layer").is_some()
             && last.params.get("layer") == params.get("layer")
+            && ["value", "index", "other"].iter().all(|k| last.params.get(*k) == params.get(*k))
         {
             last.params = params.clone();
             return;
@@ -1563,6 +1927,7 @@ impl RustGisApp {
         }
     }
 
+    /// Runs a `ui.*` command: panes, dialogs and the app's own settings.
     fn run_ui(&mut self, id: &str, p: &Value) -> Result<Value, String> {
         // A pane's command toggles it; `{"close": true}` closes it, in view or not (a tab's ✕),
         // whatever else the command is given (SQL to run, a question to ask).
@@ -1683,6 +2048,25 @@ impl RustGisApp {
                 }
                 self.apply_worldview();
             }
+            "ui.autosave" => return autosave::command(self, p),
+            // Adds a file as a drop or Add Data does: one holding several layers asks which (#934).
+            "ui.addFile" => {
+                let path = p.get("path").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty()).ok_or("path is required")?;
+                return layerchooser::add_file(self, path);
+            }
+            // Whether a file holding several layers asks which to add.
+            "ui.askLayers" => {
+                // Without `on` it toggles; a value that isn't true or false is refused.
+                self.ui.ask_layers = match p.get("on") {
+                    None | Some(Value::Null) => !self.ui.ask_layers,
+                    Some(v) => v.as_bool().ok_or("on must be true or false")?,
+                };
+                if let Some(save) = &self.services.save_pref {
+                    save("ask_file_layers", if self.ui.ask_layers { "on" } else { "off" });
+                }
+                return Ok(json!({"on": self.ui.ask_layers}));
+            }
+            "ui.recover" => return autosave::recover(self, p),
             "ui.startup" => {
                 // `project` (#377) or, as before, `blank`; `project` wins when both are given.
                 let start_with = match p.get("project") {
@@ -1751,6 +2135,30 @@ impl RustGisApp {
             "ui.theme" => {
                 self.ui.dark = p.get("dark").and_then(Value::as_bool).unwrap_or(!self.ui.dark);
                 self.ui.dark_follows_system = false;
+            }
+            "ui.measurementUnits" => {
+                let imperial = match p.get("units") {
+                    None => !self.ui.measurement_imperial,
+                    Some(Value::String(v)) if v.eq_ignore_ascii_case("metric") => false,
+                    Some(Value::String(v)) if v.eq_ignore_ascii_case("imperial") => true,
+                    _ => return Err(tl!("Measurement units must be metric or imperial").into()),
+                };
+                self.ui.measurement_imperial = imperial;
+                if let Some(save) = &self.services.save_pref {
+                    save("measurement_units", if imperial { "imperial" } else { "metric" });
+                }
+            }
+            "ui.moveSharedVertices" => {
+                let on = match p.get("on") {
+                    None => !self.map.move_shared_vertices,
+                    Some(Value::Bool(on)) => *on,
+                    _ => return Err(tl!("Shared vertices must be on or off").into()),
+                };
+                if on != self.map.move_shared_vertices {
+                    self.map.cancel_vertex_drag();
+                    self.map.move_shared_vertices = on;
+                }
+                return Ok(serde_json::json!({"on": on}));
             }
             "ui.map.gpu" => {
                 self.map.gpu_enabled = p.get("on").and_then(Value::as_bool).unwrap_or(!self.map.gpu_enabled);
@@ -1847,12 +2255,13 @@ impl RustGisApp {
                 let v = self.session.run("identify", &json!({"lon": lon, "lat": lat, "tolerancePx": 5}))?;
                 if let (false, Some(lon), Some(lat)) = (v.is_null(), lon.as_f64(), lat.as_f64()) {
                     let map = self.session.project.active_map;
-                    self.map.popup = Some(mapview::Popup { info: v, at: rustgis_engine::geom::Coord::new(lon, lat), index: 0, map });
+                    self.map.popup = Some(mapview::Popup::new(v, rustgis_engine::geom::Coord::new(lon, lat), map, self.session.opened));
                 } else {
                     self.map.popup = None;
                 }
             }
             "ui.shortcuts" => self.ui.shortcuts = true,
+            "ui.customizeShortcuts" => self.ui.shortcut_editor.open = true,
             // Copy, cut and copy path also put their text on the system clipboard.
             "ui.copy" | "ui.cut" | "ui.copyPath" => {
                 let cmd = match id {
@@ -1900,13 +2309,20 @@ impl RustGisApp {
                 }
             }
             // A project by its web address (a `?project=` link): downloaded off the frame, opened
-            // when it lands, in place of the open project (see `poll_downloads`).
+            // when it lands: native projects replace it; GeoLibre imports add a map (see `poll_downloads`).
             "ui.openUrl" => {
                 let url = p.get("url").and_then(Value::as_str).map(str::trim).filter(|u| !u.is_empty()).ok_or("url is required")?;
+                let url = rustgis_engine::map::geolibre::download_url(url);
+                let url = url.as_str();
                 let slot: Slot<Result<Vec<u8>, String>> = Slot::default();
                 let land = slot.clone();
-                rustgis_engine::render::rustgis_tiles::cache::download(
+                rustgis_engine::render::rustgis_tiles::cache::download_limited(
                     url,
+                    if rustgis_engine::map::geolibre::is_project_file(url) {
+                        rustgis_engine::map::geolibre::MAX_TEXT
+                    } else {
+                        rustgis_engine::render::rustgis_tiles::cache::MAX_DOWNLOAD
+                    },
                     Box::new(move |r| *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r)),
                 );
                 self.session.notify(i18n::fmt("Opening {url}…", &[("url", url)]), false);
@@ -1938,17 +2354,34 @@ impl RustGisApp {
             // Data by its web address: the dialog, then (with an address) the download, off the
             // frame; it's added when it lands. A PMTiles archive is a tile layer, never downloaded.
             "ui.addUrl" => {
+                if p.get("geolibreZarr").and_then(Value::as_bool) == Some(true) {
+                    if let Err(e) = geolibreui::start(self, p) {
+                        rustgis_engine::cmd::geolibre::discard_pending(&mut self.session, p);
+                        return Err(e);
+                    }
+                    return Ok(Value::Null);
+                }
+                // The connection a Connections tree add is for (named in Recent once it is added).
+                let origin = connectiontree::take_origin(self);
                 let Some(url) = p.get("url").and_then(Value::as_str).map(str::trim).filter(|u| !u.is_empty()) else {
                     return self.run("ui.dialog", json!({"name": "addUrl"}));
                 };
                 if url.to_ascii_lowercase().split(['?', '#']).next().is_some_and(|u| u.ends_with(".pmtiles")) {
-                    return self.run("layer.addUrl", p.clone());
+                    return connectiontree::run_named(self, "layer.addUrl", p.clone(), origin.as_deref());
                 }
                 // A GeoTIFF, FlatGeobuf or GeoParquet: its header (or footer) first, off the
                 // frame; one that can be read in place is, another is downloaded (see
-                // `poll_downloads`).
+                // `poll_downloads`). An address without a file name (an API answering with a
+                // file, such as Vantor's `…/geotiff?…`) is probed as a GeoTIFF too, and downloaded
+                // as before when it doesn't answer as one.
                 let remote = rustgis_engine::data::source::is_remote_name(url);
-                if (remote || rustgis_engine::cmd::layer::is_tiff_url(url)) && p.get("whole").and_then(Value::as_bool) != Some(true) {
+                let tiff = rustgis_engine::cmd::layer::is_tiff_url(url);
+                let unnamed = !remote
+                    && !tiff
+                    && rustgis_engine::cmd::layer::is_unnamed_url(url)
+                    && matches!(p.get("as"), None | Some(Value::Null))
+                    && ["service", "coverage"].iter().all(|k| p.get(*k).and_then(Value::as_bool) != Some(true));
+                if (remote || tiff || unnamed) && p.get("whole").and_then(Value::as_bool) != Some(true) {
                     let slot: Slot<Result<bool, String>> = Slot::default();
                     let land = slot.clone();
                     if remote {
@@ -1966,22 +2399,39 @@ impl RustGisApp {
                     } else {
                         rustgis_engine::render::rustgis_tiles::cog::probe(
                             url,
-                            Box::new(move |r| *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r)),
+                            Box::new(move |r| {
+                                let r = if unnamed { Ok(r.unwrap_or(false)) } else { r };
+                                *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+                            }),
                         );
                     }
-                    self.session.notify(i18n::fmt("Reading {url}…", &[("url", url)]), false);
-                    self.ui.cog_probes.push((p.clone(), slot));
+                    // An address read through a saved S3 connection is said as the address it wraps.
+                    let shown = rustgis_engine::data::s3_address::inner(url);
+                    self.session.notify(i18n::fmt("Reading {url}…", &[("url", shown)]), false);
+                    let mut probe = p.clone();
+                    if let Some(o) = probe.as_object_mut() {
+                        o.remove(connectiontree::ORIGIN);
+                        if let Some(origin) = &origin {
+                            o.insert(connectiontree::ORIGIN.into(), json!(origin));
+                        }
+                    }
+                    self.ui.cog_probes.push((probe, slot));
                     return Ok(Value::Null);
                 }
                 let url = url.to_string();
                 let slot: Slot<Result<Vec<u8>, String>> = Slot::default();
                 let land = slot.clone();
-                rustgis_engine::render::rustgis_tiles::cache::download(
+                rustgis_engine::render::rustgis_tiles::cache::download_limited(
                     &url,
+                    if p.get("geolibreProject").and_then(Value::as_bool) == Some(true) {
+                        rustgis_engine::map::geolibre::MAX_TEXT
+                    } else {
+                        rustgis_engine::render::rustgis_tiles::cache::MAX_DOWNLOAD
+                    },
                     Box::new(move |r| *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r)),
                 );
                 let mut q = json!({});
-                for k in ["name", "layer"] {
+                for k in ["name", "layer", "crs"] {
                     if let Some(v) = p.get(k).filter(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())) {
                         q[k] = v.clone();
                     }
@@ -1994,10 +2444,32 @@ impl RustGisApp {
                         q[k] = json!(true);
                     }
                 }
-                self.session.notify(i18n::fmt("Downloading {url}…", &[("url", &url)]), false);
+                for key in ["geolibreProject", "geolibreLayer"] {
+                    if let Some(value) = p.get(key) {
+                        q[key] = value.clone();
+                    }
+                }
+                if let Some(origin) = &origin {
+                    q[connectiontree::ORIGIN] = json!(origin);
+                }
+                let shown = rustgis_engine::data::s3_address::inner(&url);
+                self.session.notify(i18n::fmt("Downloading {url}…", &[("url", shown)]), false);
                 let id = self.session.download_started();
                 self.ui.downloads.push((id, url, q, slot));
             }
+            "ui.connection" => {
+                if let Some(id) = p.get("id").and_then(Value::as_str) {
+                    connectionui::open_edit(self, id)?;
+                } else {
+                    connectionui::open_new(self, p.get("kind").and_then(Value::as_str).unwrap_or("service"))?;
+                }
+                if p.get("test").and_then(Value::as_bool) == Some(true) {
+                    connectionui::start_test(self);
+                }
+            }
+            // Choose S3 connection: the saved connection that reads the project's S3 sources
+            // waiting for a choice (`connection.resolveS3` does it).
+            "ui.s3Connections" => connectionui::open_chooser(self)?,
             // A map or feature service: the dialog, then (with an address) its capabilities,
             // fetched off the frame; the dialog lists its layers when they land.
             "ui.importService" => serviceui::start(self, p, false)?,
@@ -2027,7 +2499,7 @@ impl RustGisApp {
                     "arcgis" => "arcgis",
                     _ => "auto",
                 };
-                // Opened from a menu (Home › Web Data): the dialog with it.
+                // Opened from a menu (Home › Add › Web Data): the dialog with it.
                 if self.dialogs.open != Some("addService") {
                     self.run("ui.dialog", json!({"name": "addService"}))?;
                 }
@@ -2051,9 +2523,21 @@ impl RustGisApp {
                     listing: None,
                     error: None,
                     failure: None,
-                    resolving: None,
-                    describing: None,
                 });
+            }
+            "ui.importShapefile" => {
+                let text = p.get("crs").and_then(Value::as_str).ok_or(tl!("Source coordinate system is required"))?;
+                rustgis_engine::data::raster::Crs::parse(text)?;
+                if let Some(open) = &self.services.open_async {
+                    self.ui.pending_layout_picture = false;
+                    self.ui.pending_picture = None;
+                    self.ui.pending_open = None;
+                    self.ui.pending_csv = None;
+                    self.ui.pending_shapefile = Some(json!({"crs": text}));
+                    open("shapefile");
+                } else if let Some(path) = dialogs::pick_open(&["shp", "zip"], tl!("Shapefile")) {
+                    return self.run("layer.addData", json!({"path": path, "crs": text}));
+                }
             }
             "ui.addData" => {
                 if let Some(open) = &self.services.open_async {
@@ -2118,7 +2602,7 @@ impl RustGisApp {
                     .concat(),
                     tl!("Vector and raster data"),
                 ) {
-                    return self.run("layer.addData", json!({"path": path}));
+                    return layerchooser::add_file(self, &path);
                 }
             }
             "ui.open" => {
@@ -2129,10 +2613,24 @@ impl RustGisApp {
                     self.ui.pending_open = None;
                     open("project");
                     self.ui.backstage = false;
-                } else if let Some(path) = dialogs::pick_open(&["rgis", "rgisx", "rgispkg"], tl!("RustGIS project")) {
-                    let r = self.run("project.open", json!({"path": path}));
-                    self.ui.backstage = false;
-                    self.map.invalidate();
+                } else if let Some(path) = dialogs::pick_open(
+                    &["rgis", "rgisx", "rgispkg", "qgs", "qgz", "geolibre", "json"],
+                    tl!("Projects and JSON data (RustGIS, QGIS, GeoLibre)"),
+                ) {
+                    // A QGIS project opens as a new map of this one.
+                    let lower = path.to_ascii_lowercase();
+                    let cmd = if lower.ends_with(".qgs") || lower.ends_with(".qgz") {
+                        "project.importQgis"
+                    } else {
+                        rustgis_engine::project::open_command(&path)
+                    };
+                    let r = self.run_by_user(cmd, json!({"path": path}));
+                    // Asking to save first: the Project tab stays until the answer, so Cancel
+                    // goes back to it.
+                    if !saveprompt::waiting(self) {
+                        self.ui.backstage = false;
+                        self.map.invalidate();
+                    }
                     return r;
                 }
             }
@@ -2141,7 +2639,11 @@ impl RustGisApp {
             "ui.save" | "ui.saveAs" if self.services.download.is_some() => {
                 let name = format!("{}.rgis", self.session.project.name);
                 if id == "ui.save" && self.ui.web_file.as_deref() == Some(name.as_str()) {
-                    self.save_download(&name)?;
+                    // The keyboard caller discards the result, so the failure is shown here too.
+                    if let Err(error) = self.save_download(&name) {
+                        self.session.notify(error.clone(), true);
+                        return Err(error);
+                    }
                 } else {
                     self.dialogs.open("saveProject", &self.session)?;
                 }
@@ -2158,7 +2660,7 @@ impl RustGisApp {
                     return self.run("project.saveAs", json!({"path": path}));
                 }
             }
-            // Layouts: export (PNG/PDF), print, save and import layout files, draw frames.
+            // Layouts: export (PDF/PNG/SVG), print, save and import layout files, draw frames.
             "ui.exportLayout" | "ui.printLayout" => {
                 let li = self.session.active_layout.ok_or("open a layout first")?;
                 let name = self.session.project.layouts.get(li).map(|l| l.name.clone()).unwrap_or_default();
@@ -2177,8 +2679,9 @@ impl RustGisApp {
                     open_with_system(&path)?;
                     self.session.notify(i18n::fmt("Opened {name} for printing", &[("name", &path.display().to_string())]), false);
                 } else {
-                    let exts: &[&str] = if pdf_only { &["pdf"] } else { &["pdf", "png"] };
-                    if let Some(path) = dialogs::pick_save(&format!("{name}.pdf"), exts, tl!("PDF or PNG")) {
+                    let (exts, kinds): (&[&str], _) =
+                        if pdf_only { (&["pdf"], tl!("PDF")) } else { (&["pdf", "png", "svg"], tl!("PDF, PNG or SVG")) };
+                    if let Some(path) = dialogs::pick_save(&format!("{name}.pdf"), exts, kinds) {
                         return self.run("layout.export", json!({"layout": li, "path": path, "dpi": 200}));
                     }
                 }
@@ -2275,6 +2778,9 @@ impl RustGisApp {
                     "styles" => ("style.add", &["rgisstyle"], "RustGIS styles"),
                     "ramps" => ("ramp.add", &["rgisramp", "xml", "qml", "txt", "clr", "cpt"], "Colour ramps (RustGIS, QGIS, GDAL, GMT)"),
                     "importStyles" => ("style.import", &["rgislyr", "rgismap", "rgis", "rgisx"], "RustGIS layers, maps and projects"),
+                    "geolibreProject" => ("project.importGeolibre", &["geolibre", "json"], "GeoLibre project"),
+                    "qgisProject" => ("project.importQgis", &["qgs", "qgz"], "QGIS project"),
+                    "qgisStyle" => ("style.importQgis", &["qml"], "QGIS layer style"),
                     "template" => ("project.fromTemplate", &["rgistemplate"], "RustGIS project template"),
                     "task" => ("task.import", &["rgistask"], "RustGIS task"),
                     "bookmarks" => ("bookmark.import", &["rgisbookmarks"], "RustGIS bookmarks"),
@@ -2286,9 +2792,14 @@ impl RustGisApp {
                 };
                 if let Some(open) = &self.services.open_async {
                     self.ui.pending_open = Some(cmd);
-                    open(if kind == "ramps" { "ramp" } else { "item" });
+                    open(match kind {
+                        "ramps" => "ramp",
+                        "geolibreProject" => "project",
+                        "qgisProject" => "qgisProject",
+                        _ => "item",
+                    });
                 } else if let Some(path) = dialogs::pick_open(exts, tl!(label)) {
-                    let r = self.run(cmd, json!({"path": path}));
+                    let r = self.run_by_user(cmd, json!({"path": path}));
                     self.map.invalidate();
                     return r;
                 }
@@ -2384,6 +2895,7 @@ impl RustGisApp {
             },
             "ui.pane.jobs" => toggle_right(&mut self.ui, RightPane::Jobs),
             "ui.pane.profile" => toggle_right(&mut self.ui, RightPane::Profile),
+            "ui.pane.timeSeries" => toggle_right(&mut self.ui, RightPane::TimeSeries),
             "ui.pane.diagnostics" => toggle_right(&mut self.ui, RightPane::Diagnostics),
             "ui.pane.infographics" => toggle_right(&mut self.ui, RightPane::Infographics),
             "ui.pane.report" => toggle_right(&mut self.ui, RightPane::Report),
@@ -2729,6 +3241,44 @@ impl RustGisApp {
             }
             "ui.dialog" => {
                 let which = p.get("name").and_then(Value::as_str).unwrap_or("");
+                if which == "calculateGeometry" {
+                    let id = self.session.layer_id(p)?;
+                    let form = geometrycalc::Form::new(&self.session, id)?;
+                    self.dialogs = dialogs::Dialogs { open: Some("calculateGeometry"), geometry: Some(form), ..Default::default() };
+                    return Ok(Value::Null);
+                }
+                if matches!(which, "repairSource" | "repairTiles") {
+                    let form = (|| {
+                        let target = if which == "repairSource" {
+                            repairsource::Target::Layer(self.session.layer_id(p)?)
+                        } else {
+                            let tiles = &self.session.map().tiles;
+                            let index = if let Some(index) = p.get("index") {
+                                index
+                                    .as_u64()
+                                    .and_then(|i| usize::try_from(i).ok())
+                                    .ok_or_else(|| tl!("Give a valid tile archive index.").to_string())?
+                            } else {
+                                tiles
+                                    .iter()
+                                    .position(|t| t.archive_file().is_some() && t.error.is_some())
+                                    .or_else(|| tiles.iter().position(|t| t.archive_file().is_some()))
+                                    .ok_or_else(|| tl!("The map has no tile archive read from a file.").to_string())?
+                            };
+                            repairsource::Target::Tiles(index)
+                        };
+                        repairsource::Form::new(&self.session, target)
+                    })();
+                    let form = match form {
+                        Ok(form) => form,
+                        Err(e) => {
+                            self.session.notify(e.clone(), true);
+                            return Err(e);
+                        }
+                    };
+                    self.dialogs = dialogs::Dialogs { open: Some("repairSource"), repair: Some(form), ..Default::default() };
+                    return Ok(Value::Null);
+                }
                 // A Web Data service opens in the right pane, beside the map it searches.
                 if let Some(name) = panes::web_data_name(which) {
                     // A Web Data panel opened on a search.
@@ -2808,7 +3358,7 @@ impl RustGisApp {
         Ok(Value::Null)
     }
 
-    /// Adds the data downloads that have landed (Add Data › From URL). The bytes go to the session
+    /// Adds the data downloads that have landed (Home › Add › Add Data › From URL). The bytes go to the session
     /// as they are; a download of a project that has since been closed is dropped.
     fn poll_downloads(&mut self) {
         let landed = self.ui.project_download.as_ref().and_then(|(id, url, slot)| {
@@ -2838,13 +3388,19 @@ impl RustGisApp {
     /// keeping its own name when the address has none). Unlike [`Self::open_bytes`], it never takes
     /// a picker's pending item: the download isn't the file the user is picking.
     fn open_project_bytes(&mut self, file: Option<&str>, bytes: &[u8]) -> Result<Value, String> {
+        if file.is_some_and(rustgis_engine::map::geolibre::is_project_file) {
+            let text = std::str::from_utf8(bytes).map_err(|_| tl!("Not a GeoLibre project").to_string())?;
+            let result = self.run("project.importGeolibre", json!({"text":text}));
+            self.map.invalidate();
+            return result;
+        }
         let package = file.is_some_and(|f| f.to_ascii_lowercase().ends_with(".rgispkg"));
         let text = if package {
             rustgis_engine::cmd::items::package_text(bytes)?
         } else {
             std::str::from_utf8(bytes).map_err(|_| "not a RustGIS project".to_string())?.to_string()
         };
-        let mut p = json!({"text": text});
+        let mut p = json!({"text": text, "package": package});
         if let Some(f) = file.filter(|_| !package) {
             p["fileName"] = json!(f);
         }
@@ -2856,6 +3412,8 @@ impl RustGisApp {
         r
     }
 
+    /// Consumes completed probes and downloads on the app frame, finalizing imports in their
+    /// reserved map or discarding failed reservations even when another map is active.
     fn poll_data_downloads(&mut self) {
         // GeoTIFFs, FlatGeobufs and GeoParquets whose headers are in: read in place, or
         // downloaded whole.
@@ -2868,16 +3426,23 @@ impl RustGisApp {
             None => true,
         });
         for (mut p, r) in probed {
+            let origin = connectiontree::take_origin_key(&mut p);
             let url = p.get("url").and_then(Value::as_str).unwrap_or("").to_string();
             match r {
                 Ok(true) => {
+                    // A GeoTIFF by its first bytes, whatever its address is named.
+                    if !rustgis_engine::data::source::is_remote_name(&url) {
+                        p["cog"] = json!(true);
+                    }
+                    let before = self.session.sources.generation;
                     if self.run("layer.addUrl", p).is_ok() {
+                        connectiontree::name_recent(self, before, origin.as_deref());
                         self.map.invalidate();
                     }
                 }
                 Ok(false) => {
                     p["whole"] = json!(true);
-                    let _ = self.run("ui.addUrl", p);
+                    let _ = connectiontree::run_add_url(self, p, origin.as_deref());
                 }
                 Err(e) => self.session.notify(if e.starts_with(&url) { e } else { format!("{url}: {e}") }, true),
             }
@@ -2891,93 +3456,119 @@ impl RustGisApp {
             None => true,
         });
         for (id, url, mut p, r) in landed {
+            let origin = connectiontree::take_origin_key(&mut p);
             match r {
-                Ok(bytes) => {
-                    if !self.session.download_landed(id, bytes) {
-                        self.session.notify(
-                            i18n::fmt("{url}: downloaded after its project was closed, so it wasn't added", &[("url", &url)]),
-                            false,
-                        );
-                        continue;
-                    }
-                    p["id"] = json!(id);
-                    p["url"] = json!(url);
-                    let zoom = p.get("zoom").and_then(Value::as_bool) == Some(true);
-                    if zoom && self.ui.link_zoomed {
-                        p["zoom"] = json!(false);
-                    }
-                    match self.run("layer.addDownload", p) {
-                        Ok(r) => {
-                            if r.get("zoomed").and_then(Value::as_bool) == Some(true) {
-                                self.ui.link_zoomed = true;
-                            }
-                            self.map.invalidate();
-                        }
-                        Err(e) => self.session.notify(if e.starts_with(&url) { e } else { format!("{url}: {e}") }, true),
-                    }
+                // A service's features: the pages after the first are read, off the frame, first.
+                Ok(bytes) if p.get("service").and_then(Value::as_bool) == Some(true) => {
+                    serviceui::read_pages(self, serviceui::Landed { id, url, params: p, origin }, bytes);
                 }
+                Ok(bytes) => self.add_landed(serviceui::Landed { id, url, params: p, origin }, bytes),
                 Err(e) => {
                     self.session.download_failed(id);
+                    rustgis_engine::cmd::geolibre::discard_pending(&mut self.session, &p);
                     self.session.notify(if e.starts_with(&url) { e } else { format!("{url}: {e}") }, true);
                 }
             }
         }
     }
 
-    /// Moves an OGC API layer's template reading along: the list, then the tileset when the list
-    /// doesn't carry the template; the layer is added with the template read, or the usual path.
-    fn poll_tiles_resolve(&mut self) {
-        use rustgis_engine::data::ogc::{TilesStep, resolve_tiles};
-        let Some(conn) = &mut self.ui.service else { return };
-        let Some(res) = &mut conn.resolving else { return };
-        let Some(r) = res.slot.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
-        let step = r.ok().and_then(|body| resolve_tiles(&res.list, &res.doc, &body, res.vector));
-        let template = match step {
-            Some(TilesStep::Next(next)) if res.read < 2 => {
-                res.read += 1;
-                res.doc = next.clone();
-                res.slot = fetch_into(&next);
-                return;
-            }
-            Some(TilesStep::Template(t)) => t,
-            _ => res.fallback.clone(),
-        };
-        let Some(res) = conn.resolving.take() else { return };
-        let mut p = res.params;
-        p["tiles"] = json!(template);
-        let title = p["name"].as_str().unwrap_or("").to_string();
-        match self.run("service.add", p) {
-            Ok(_) => self.dialogs.info = Some(format!("{} {title}", tl!("Added"))),
-            Err(e) => self.dialogs.error = Some(e),
+    /// Adds a download that landed (`layer.addDownload`), named in Recent after the connection it
+    /// came from; one whose project was closed meanwhile is said and dropped.
+    pub(crate) fn add_landed(&mut self, landed: serviceui::Landed, bytes: Vec<u8>) {
+        let serviceui::Landed { id, url, params: mut p, origin } = landed;
+        if !self.session.download_landed(id, bytes) {
+            self.session.notify(i18n::fmt("{url}: downloaded after its project was closed, so it wasn't added", &[("url", &url)]), false);
+            return;
         }
-        self.map.invalidate();
+        p["id"] = json!(id);
+        p["url"] = json!(url);
+        let zoom = p.get("zoom").and_then(Value::as_bool) == Some(true);
+        if zoom && self.ui.link_zoomed {
+            p["zoom"] = json!(false);
+        }
+        let before = self.session.sources.generation;
+        let pending = p.clone();
+        match self.run("layer.addDownload", p) {
+            Ok(r) => {
+                connectiontree::name_recent(self, before, origin.as_deref());
+                if r.get("zoomed").and_then(Value::as_bool) == Some(true) {
+                    self.ui.link_zoomed = true;
+                }
+                self.map.invalidate();
+            }
+            Err(e) => {
+                rustgis_engine::cmd::geolibre::discard_pending(&mut self.session, &pending);
+                self.session.notify(if e.starts_with(&url) { e } else { format!("{url}: {e}") }, true);
+            }
+        }
     }
 
-    /// Asks for a WCS coverage once its description has arrived: its GetCoverage address for the
-    /// view, downloaded as From URL… does.
-    fn poll_describe(&mut self) {
-        let Some(conn) = &mut self.ui.service else { return };
-        let Some((_, slot)) = &conn.describing else { return };
-        let Some(r) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
-        let Some((mut p, _)) = conn.describing.take() else { return };
-        let title = p["name"].as_str().unwrap_or("").to_string();
-        let r = r.and_then(|bytes| {
-            p["describe"] = json!(String::from_utf8_lossy(&bytes));
-            // Not `self.run`: an error belongs in the dialog, not the notices.
-            let c = self.session.run("service.coverage", &p)?;
-            let get = c.get("url").and_then(Value::as_str).unwrap_or("").to_string();
-            self.run("ui.addUrl", json!({"url": get, "name": title, "coverage": true}))
-        });
-        match r {
-            Ok(_) => self.dialogs.info = Some(format!("{} {title}", tl!("Downloading…"))),
-            Err(e) => self.dialogs.error = Some(e),
+    /// Tells how a service layer added outside the add-service dialog (or in it) went: in the
+    /// dialog's own line, or as a notice for the Connections tree.
+    fn report_step(&mut self, dialog: bool, r: Result<String, String>) {
+        match (dialog, r) {
+            (true, Ok(m)) => self.dialogs.info = Some(m),
+            (true, Err(e)) => self.dialogs.error = Some(e),
+            (false, Ok(m)) => self.session.notify(m, false),
+            (false, Err(e)) => self.session.notify(e, true),
+        }
+    }
+
+    /// Moves the service layers waiting on a document along: an OGC API layer's tile template
+    /// (read from its tileset list, then the tileset when the list doesn't carry it; the layer is
+    /// added with the template read, or the usual path) and a WCS coverage's description (the
+    /// coverage is then asked for the view and downloaded as From URL… does).
+    fn poll_service_steps(&mut self) {
+        use rustgis_engine::data::ogc::{TilesStep, resolve_tiles};
+        for step in std::mem::take(&mut self.ui.service_steps) {
+            match step {
+                ServiceStep::Tiles { mut resolve, dialog, origin } => {
+                    let Some(r) = resolve.slot.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+                        self.ui.service_steps.push(ServiceStep::Tiles { resolve, dialog, origin });
+                        continue;
+                    };
+                    let next = r.ok().and_then(|body| resolve_tiles(&resolve.list, &resolve.doc, &body, resolve.vector));
+                    let template = match next {
+                        Some(TilesStep::Next(next)) if resolve.read < 2 => {
+                            resolve.read += 1;
+                            resolve.doc = next.clone();
+                            resolve.slot = fetch_into(&next);
+                            self.ui.service_steps.push(ServiceStep::Tiles { resolve, dialog, origin });
+                            continue;
+                        }
+                        Some(TilesStep::Template(t)) => t,
+                        _ => resolve.fallback.clone(),
+                    };
+                    let mut p = resolve.params;
+                    p["tiles"] = json!(template);
+                    let title = p["name"].as_str().unwrap_or("").to_string();
+                    let r =
+                        connectiontree::run_named(self, "service.add", p, origin.as_deref()).map(|_| format!("{} {title}", tl!("Added")));
+                    self.report_step(dialog, r);
+                    self.map.invalidate();
+                }
+                ServiceStep::Coverage { mut params, slot, dialog, origin } => {
+                    let Some(r) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+                        self.ui.service_steps.push(ServiceStep::Coverage { params, slot, dialog, origin });
+                        continue;
+                    };
+                    let title = params["name"].as_str().unwrap_or("").to_string();
+                    let r = r.and_then(|bytes| {
+                        params["describe"] = json!(String::from_utf8_lossy(&bytes));
+                        // Not `self.run`: an error belongs where the step reports, not the notices.
+                        let c = self.session.run("service.coverage", &params)?;
+                        let get = c.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+                        connectiontree::run_add_url(self, json!({"url": get, "name": title, "coverage": true}), origin.as_deref())
+                    });
+                    self.report_step(dialog, r.map(|_| format!("{} {title}", tl!("Downloading…"))));
+                }
+            }
         }
     }
 
     /// Lists a service's layers once its capabilities have arrived.
     fn poll_service(&mut self) {
-        self.poll_tiles_resolve();
-        self.poll_describe();
+        self.poll_service_steps();
         let Some(conn) = &mut self.ui.service else { return };
         let Some(r) = conn.slot.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
         let document = conn.pending.take().unwrap_or_else(|| conn.url.clone());
@@ -3055,6 +3646,8 @@ impl RustGisApp {
         }
         // A project an agent or a script opened, before the frame draws the old one's fields.
         layoutview::follow_project(self);
+        // A project's S3 sources waiting for a choice of saved connection: asked once.
+        connectionui::follow_project(self);
         // Fonts installed last frame are active now.
         self.fonts_pending = false;
         i18n::set_current(self.lang());
@@ -3062,13 +3655,14 @@ impl RustGisApp {
         panes::poll_geolibre(self, ctx);
         panes::poll_plugin_run(self, ctx);
         self.poll_downloads();
+        let _ = self.deliver_gp_files(Ok(Value::Null));
         // A value picked under Dynamic Text lasts while the text tool does, however the tool
         // changes (Esc, another tool, a text placed without Keep Tool, a command).
         if self.session.tool != rustgis_engine::Tool::Graphic("text") {
             self.ui.dynamic_text = None;
         }
         // Addresses commands asked for where they couldn't download themselves (the browser):
-        // fetched off the frame and added when they land, as Add Data › From URL does.
+        // fetched off the frame and added when they land, as Home › Add › Add Data › From URL does.
         for p in self.session.take_url_requests() {
             if let Err(e) = self.run("ui.addUrl", p) {
                 self.session.notify(e, true);
@@ -3092,13 +3686,17 @@ impl RustGisApp {
         sqlpane::poll(self, ctx);
         self.poll_service();
         serviceui::poll(self, ctx);
+        serviceui::poll_pages(self, ctx);
         // Sources the AI Assistant or a background add brought in (not through `run`) are kept
         // too: a generation compared each frame. So is a default raster style it set.
         sourcespane::save(self);
+        sourcespane::save_connections(self);
         self.save_raster_defaults();
         cswui::poll(self);
         stacui::poll(self, ctx);
         s3ui::poll(self, ctx);
+        connectionui::poll(self, ctx);
+        connectiontree::poll(self, ctx);
         portalsui::poll(self, ctx);
         catalogsui::poll(self, ctx);
         opendataui::poll(self, ctx);
@@ -3108,12 +3706,15 @@ impl RustGisApp {
         geocodeui::poll(self, ctx);
         navui::poll(self, ctx);
         zarrui::poll(self, ctx);
+        geolibreui::poll(self, ctx);
         pluginsui::poll(self, ctx);
         assistantpane::poll(self, ctx);
         // A project the MCP relay, the assistant or a plugin opened or saved this frame (they run
         // on the session directly) becomes Last Project now, not a frame later the app may not
         // reach.
         self.note_last_project();
+        saveprompt::close_requested(self, ctx);
+        autosave::tick(self, ctx);
         self.ensure_script_font();
         // Fonts downloaded by the web app.
         let fonts: Vec<(String, Vec<u8>)> = match &self.services.font_inbox {
@@ -3125,8 +3726,8 @@ impl RustGisApp {
             let region = [CjkRegion::SimplifiedChinese, CjkRegion::Japanese, CjkRegion::Korean]
                 .map(ScriptFont::Cjk)
                 .into_iter()
-                .chain([ScriptFont::Arabic])
-                .find(|r| script_font_url(*r) == url);
+                .chain([ScriptFont::Arabic, ScriptFont::Bengali])
+                .find(|r| script_font_url(*r) == Some(url.as_str()));
             if bytes.is_empty() || !valid_font(&bytes, 0) {
                 // A failed download: say so; picking the language again retries.
                 log::error!("{url}: no usable font downloaded");
@@ -3159,6 +3760,26 @@ impl RustGisApp {
             self.fonts_pending = true;
             self.map.invalidate();
         }
+        // The label fonts the last frame's labels asked for (after the interface fonts, which
+        // would replace them). Not in a frame that set the interface fonts: those take effect on
+        // the next, and setting fonts now, from the definitions in effect, would undo them.
+        if self.fonts_pending {
+            ctx.request_repaint();
+        } else {
+            labelfonts::install_pending(ctx);
+        }
+        // Labels and layout texts in a named family draw in the label font, or the text's
+        // fallback, until the installed fonts are indexed (`families::warm_up`); then the map and
+        // the layout page are drawn again in theirs.
+        if !self.label_fonts_indexed {
+            if rustgis_engine::render::families::installed_now().is_some() {
+                self.label_fonts_indexed = true;
+                self.map.invalidate();
+                self.layout.redraw();
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            }
+        }
         // Files from the async picker or browser drops.
         let arrived: Vec<(String, Vec<u8>)> = match &self.services.inbox {
             Some(inbox) => std::mem::take(&mut *inbox.lock().unwrap_or_else(|e| e.into_inner())),
@@ -3170,10 +3791,18 @@ impl RustGisApp {
         // Files dropped on the desktop window arrive as paths. (The web shell reads browser drops
         // asynchronously and passes them through the inbox instead.)
         if !cfg!(target_arch = "wasm32") {
-            let dropped = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
+            let mut dropped = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
+            // A project first, so the data dropped with it goes into that project, not the one
+            // it replaces. While the save prompt asks about replacing this one, the rest wait.
+            dropped.sort_by_key(|f| rustgis_engine::project::open_command(&f.path().display().to_string()) != "project.open");
+            let mut held = 0usize;
             for f in dropped {
                 let p = f.path().display().to_string();
                 if p.is_empty() {
+                    continue;
+                }
+                if saveprompt::waiting(self) {
+                    held += 1;
                     continue;
                 }
                 if p.to_ascii_lowercase().ends_with(".rgplugin") {
@@ -3183,12 +3812,25 @@ impl RustGisApp {
                     }
                     continue;
                 }
-                let _ = self.run(rustgis_engine::project::open_command(&p), json!({"path": p}));
+                let _ = layerchooser::add_file(self, &p);
                 self.map.invalidate();
+            }
+            if held == 1 {
+                self.session.notify(
+                    tl!("Another dropped file wasn't opened: drop it again once you've answered about the unsaved changes."),
+                    false,
+                );
+            } else if held > 1 {
+                let text = crate::i18n::fmt(
+                    "{n} other dropped files weren't opened: drop them again once you've answered about the unsaved changes.",
+                    &[("n", &held.to_string())],
+                );
+                self.session.notify(text, false);
             }
         }
         if self.fonts_frames == 0 {
             self.add_cjk_fallback();
+            self.add_symbol_fallback();
             self.installed_region = self.current_region();
             theme::install_fonts(ctx, &self.extra_fonts, self.installed_region);
             self.fonts_pending = true;
@@ -3226,6 +3868,8 @@ impl RustGisApp {
         }
         i18n::set_current(self.lang());
         let t = theme::Tokens::get(&ctx);
+        // Before the shortcuts and the fields: the row picked in a text field's menu, as its keys.
+        fieldmenu::play(self, &ctx);
         chrome::shortcuts(self, &ctx);
         panes::follow_layer_filter(self);
         if self.ui.backstage {
@@ -3246,15 +3890,21 @@ impl RustGisApp {
         layoutview::save_drafts(self);
         graphicformat::save_draft(self);
         dialogs::show(self, &ctx);
+        layerchooser::show(self, &ctx);
         mapview::confirm_delete(self, &ctx);
+        autosave::offer(self, &ctx);
+        saveprompt::show(self, &ctx);
         pluginsui::show(self, &ctx);
         update::show(self, &ctx);
         showme::tick(self, &ctx);
         chrome::command_search(self, &ctx);
+        shortcutui::show(self, &ctx);
         chrome::about(self, &ctx);
         #[cfg(not(target_arch = "wasm32"))]
         agentthreads::windows(self, &ctx);
         chrome::notices(self, &ctx);
+        // After every field is drawn: one right-clicked opens its menu.
+        fieldmenu::show(self, &ctx);
         if let Some(text) = self.ui.copy_out.take() {
             ctx.copy_text(text);
         }
@@ -3264,7 +3914,7 @@ impl RustGisApp {
         if let Some(url) = self.ui.open_url.take() {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }
-        let title = format!("{}{} - RustGIS", self.session.project.name, if self.session.dirty { " •" } else { "" });
+        let title = format!("{}{} - RustGIS", self.session.project.name, if self.session.dirty() { " •" } else { "" });
         if title != self.sent_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.sent_title = title;
@@ -3277,7 +3927,7 @@ impl RustGisApp {
 fn project_file_name(url: &str) -> Option<&str> {
     let path = url.split(['?', '#']).next().unwrap_or("");
     let last = path.rsplit('/').next().unwrap_or("");
-    rustgis_engine::project::opens_as_project(last).then_some(last)
+    (rustgis_engine::project::opens_as_project(last) || rustgis_engine::map::geolibre::is_project_file(last)).then_some(last)
 }
 
 #[cfg(test)]
@@ -3360,11 +4010,19 @@ const DEFAULTS_TO_ACTIVE_LAYER: &[&str] = &[
     "select.layerFromSelection",
     "data.similar",
     "layer.geocode",
+    "layer.repairSource",
     "report.new",
     "report.open",
     "share.webLayer",
     "share.webStyle",
     "share.locator",
+    "pg.saveEdits",
+    "pg.discardEdits",
+    "gpkg.saveEdits",
+    "gpkg.discardEdits",
+    "zarr.reduce",
+    "cube.trend",
+    "cube.reduce",
 ];
 
 #[cfg(test)]
@@ -3527,5 +4185,87 @@ mod vertex_undo_tests {
         app.map.vertex = Some((id, row, VertexId::new(0, 0, 1)));
         app.run("edit.redo", Value::Null).unwrap();
         assert_eq!(app.map.vertex, None, "redo");
+    }
+}
+
+#[cfg(test)]
+mod download_service_tests {
+    use super::{RustGisApp, Services, complete_gp_file};
+    use serde_json::json;
+
+    #[test]
+    fn rejected_download_does_not_announce_success_or_rename_project() {
+        let mut app = RustGisApp::with_sample()
+            .with_services(Services { download: Some(Box::new(|_, _| Err("browser rejected download".into()))), ..Default::default() });
+        let name = app.session.project.name.clone();
+        let saved_name = app.ui.web_file.clone();
+        assert!(app.save_download("renamed.rgis").is_err());
+        assert_eq!(app.session.project.name, name);
+        assert_eq!(app.ui.web_file, saved_name);
+        assert!(!app.session.notices.iter().any(|n| n.text.contains("Downloaded")));
+        assert!(!app.download("archive.pmtiles", vec![1, 2, 3]));
+        assert!(app.session.notices.iter().any(|n| n.error && n.text.contains("browser rejected download")));
+        assert!(!app.session.notices.iter().any(|n| n.text.contains("Downloaded")));
+    }
+
+    #[test]
+    fn direct_file_result_reports_delivery_instead_of_pending() {
+        let pending = json!({"pending": true, "download": 7, "file": "cities.pmtiles"});
+        let completed = json!({"file": "cities.pmtiles", "delivered": true, "messages": ["Exported cities"]});
+        assert_eq!(complete_gp_file(Ok(pending.clone()), 7, &Ok(completed.clone())), Ok(completed));
+        assert_eq!(complete_gp_file(Ok(pending), 7, &Err("browser rejected download".into())), Err("browser rejected download".into()));
+    }
+
+    #[test]
+    fn delivered_script_and_model_results_keep_their_wrappers_and_other_outputs() {
+        let script = json!({
+            "ran": [
+                {"line": 1, "command": "model.run", "result": {
+                    "model": "Export cities",
+                    "ran": [
+                        {"step": 1, "node": "export", "tool": "vectorToPmtiles",
+                            "result": {"pending": true, "download": 7, "file": "cities.pmtiles"}},
+                        {"step": 2, "node": "buffer", "tool": "buffer", "result": {"layer": 42}}
+                    ],
+                    "outputs": [{"node": "buffer", "layer": 42}]
+                }},
+                {"line": 2, "command": "map.zoom", "result": {"zoom": 5}}
+            ]
+        });
+        let completed = json!({"file": "cities.pmtiles", "delivered": true, "messages": ["Exported cities"]});
+        let mut expected = script.clone();
+        expected["ran"][0]["result"]["ran"][0]["result"] = completed.clone();
+        assert_eq!(complete_gp_file(Ok(script), 7, &Ok(completed)), Ok(expected));
+    }
+
+    #[test]
+    fn any_matching_failed_export_fails_the_compound_command() {
+        let script = json!({"ran": [
+            {"line": 1, "command": "gp.run", "result": {"pending": true, "download": 7, "file": "cities.pmtiles"}},
+            {"line": 2, "command": "gp.run", "result": {"pending": true, "download": 8, "file": "roads.pmtiles"}}
+        ]});
+        let cities = Ok(json!({"file": "cities.pmtiles", "delivered": true, "messages": []}));
+        let after_first = complete_gp_file(Ok(script), 7, &cities);
+        assert_eq!(complete_gp_file(after_first, 8, &Err("roads download rejected".into())), Err("roads download rejected".into()));
+    }
+
+    #[test]
+    fn unrelated_delivery_failures_do_not_change_the_command_result() {
+        let script = json!({"ran": [
+            {"line": 1, "command": "gp.run", "result": {"pending": true, "download": 7, "file": "cities.pmtiles"}},
+            {"line": 2, "command": "layer.color", "params": {"download": 8}, "result": {"layer": 42}}
+        ]});
+        assert_eq!(complete_gp_file(Ok(script.clone()), 8, &Err("unrelated download failed".into())), Ok(script));
+        assert_eq!(
+            complete_gp_file(Err("script command failed".into()), 7, &Err("download failed".into())),
+            Err("script command failed".into())
+        );
+    }
+
+    #[test]
+    fn acknowledgment_errors_still_have_one_error_notice() {
+        let mut app = RustGisApp::with_sample();
+        assert_eq!(app.run("gp.fileDelivered", json!({"id": u64::MAX})), Err("no pending file with that id".into()));
+        assert_eq!(app.session.notices.iter().filter(|n| n.error && n.text == "no pending file with that id").count(), 1);
     }
 }

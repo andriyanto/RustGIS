@@ -29,6 +29,63 @@ fn cfg(provider: &str) -> Config {
     }
 }
 
+#[test]
+fn saved_key_obeys_desktop_consent_address_and_environment() {
+    use rustgis_engine::data::secrets::{MemorySecrets, Secret, SecretError, SecretStore};
+    let store = MemorySecrets::new();
+    store.save("assistant/anthropic", &Secret::new("stored-sentinel")).unwrap();
+    let mut cfg = Config::from_env("anthropic");
+    cfg.key.clear();
+    let mut prefs = serde_json::Map::new();
+    // A failing store makes any accidental read in a skipped branch observable.
+    let denied = MemorySecrets::failing(SecretError::Denied);
+    assert_eq!(saved_key(&cfg, &prefs, &denied).unwrap(), None);
+    prefs.insert(REMEMBER_KEY_PREF.into(), json!(remember_key_value(false)));
+    assert_eq!(saved_key(&cfg, &prefs, &denied).unwrap(), None);
+    prefs.insert(REMEMBER_KEY_PREF.into(), json!(remember_key_value(true)));
+    assert_eq!(saved_key(&cfg, &prefs, &store).unwrap(), Some(Secret::new("stored-sentinel")));
+    cfg.key = "env-key".into();
+    assert_eq!(saved_key(&cfg, &prefs, &denied).unwrap(), None);
+    cfg.key.clear();
+    cfg.base_url = "https://elsewhere.example/v1".into();
+    assert_eq!(saved_key(&cfg, &prefs, &denied).unwrap(), None);
+    prefs.insert(url_pref("anthropic"), json!("https://elsewhere.example/v1/"));
+    assert_eq!(saved_key(&cfg, &prefs, &store).unwrap(), Some(Secret::new("stored-sentinel")));
+    store.save("assistant/anthropic", &Secret::new(" \t")).unwrap();
+    assert_eq!(saved_key(&cfg, &prefs, &store).unwrap(), None);
+    let mut login = Config::from_env("chatgpt");
+    login.key.clear();
+    assert_eq!(saved_key(&login, &prefs, &denied).unwrap(), None);
+}
+
+#[test]
+fn command_line_provider_prefers_explicit_environment_and_keys_over_the_saved_choice() {
+    let mut desktop = serde_json::Map::new();
+    desktop.insert(PROVIDER_PREF.into(), json!("gemini"));
+    // Nothing explicit or in the environment: the saved choice only when it is given (the opt-in).
+    assert_eq!(choose(None, None, None, None), "ollama");
+    assert_eq!(choose(None, None, None, Some(&desktop)), "gemini");
+    // The command line, then RUSTGIS_ASSISTANT_PROVIDER, then a provider with an environment key.
+    assert_eq!(choose(Some("openai"), Some("custom"), Some("anthropic"), Some(&desktop)), "openai");
+    assert_eq!(choose(None, Some("custom"), Some("anthropic"), Some(&desktop)), "custom");
+    assert_eq!(choose(None, None, Some("anthropic"), Some(&desktop)), "anthropic");
+    // A choice the desktop saved that isn't a provider here, or isn't text, is ignored.
+    desktop.insert(PROVIDER_PREF.into(), json!("retired"));
+    assert_eq!(choose(None, None, None, Some(&desktop)), "ollama");
+    desktop.insert(PROVIDER_PREF.into(), json!(3));
+    assert_eq!(choose(None, None, None, Some(&desktop)), "ollama");
+}
+
+#[test]
+fn first_keyed_provider_is_the_first_key_provider_and_never_a_sign_in() {
+    let keyed = |ids: &'static [&'static str]| {
+        move |id: &str| Config { key: if ids.contains(&id) { "k".into() } else { String::new() }, ..cfg(id) }
+    };
+    assert_eq!(first_keyed(keyed(&["gemini", "openai"])), Some("openai"));
+    assert_eq!(first_keyed(keyed(&["chatgpt"])), None, "a sign-in is chosen, not assumed");
+    assert_eq!(first_keyed(keyed(&[])), None);
+}
+
 fn ok(v: Value) -> Result<HttpResponse, String> {
     Ok(HttpResponse { status: 200, body: v.to_string().into_bytes(), headers: vec![] })
 }
@@ -149,6 +206,114 @@ fn file_access_needs_approval() {
 }
 
 #[test]
+fn connection_management_requires_fresh_approval_but_can_run_in_app() {
+    let mut s = Session::new(Project::default());
+    let mut a = Agent::new(cfg("openai"), &s);
+    assert!(matches!(a.ask("save a connection", &s), Step::Send(_)));
+    let args = json!({"command":"connection.new","params":{"kind":"s3","name":"Approved connection"}});
+    assert_eq!(a.receive(a.generation(), ok(call("first", "run_command", args.clone())), &mut s), Step::Confirm);
+    assert!(s.connections.find("Approved connection").is_none());
+    assert!(!a.pending(&s).unwrap().2, "reserved commands cannot be allowed for the whole conversation");
+    assert!(matches!(a.decide(true, true, &mut s), Step::Send(_)));
+    assert_eq!(s.connections.find("Approved connection").unwrap().kind, "s3");
+    assert_eq!(a.receive(a.generation(), ok(call("again", "run_command", args)), &mut s), Step::Confirm);
+    assert!(matches!(a.decide(false, false, &mut s), Step::Send(_)));
+    assert_eq!(s.connections.connections.len(), 1, "declining a repeat must leave the approved connection unchanged");
+}
+
+#[test]
+fn connection_commands_require_fresh_approval_before_login_or_scripts() {
+    use rustgis_engine::render::rustgis_tiles::s3;
+
+    for command in ["connection.browse", "connection.test", "connection.login"] {
+        for scripted in [false, true] {
+            let mut s = Session::new(Project::default());
+            let name = format!("assistant-approval-{command}-{scripted}");
+            let c = s
+                .run(
+                    "connection.new",
+                    &json!({"kind": "s3", "name": name,
+                "options": {"credentials": "none", "buckets": "approval-bucket"}}),
+                )
+                .unwrap();
+            // Probes need no network, but browse/test still log in before returning the fetch address.
+            let params = json!({"id": c["id"], "probe": true});
+            let (tool, args) = if scripted {
+                ("run", json!({"script": format!("map.rename {{\"name\":\"Approved map\"}}\n{command} {params}")}))
+            } else {
+                ("run_command", json!({"command": command, "params": params}))
+            };
+            let mut a = Agent::new(cfg("openai"), &s);
+            assert!(matches!(a.ask("use this connection", &s), Step::Send(_)));
+            let map_name = s.map().name.clone();
+            assert_eq!(a.receive(a.generation(), ok(call("first", tool, args.clone())), &mut s), Step::Confirm, "{command}/{tool}");
+            assert!(s3::connection(&name).is_none(), "a pending call must not log in");
+            assert_eq!(s.map().name, map_name, "a script's earlier lines must wait too");
+            assert!(!a.pending(&s).unwrap().2, "connection operations cannot be allowed for the whole conversation");
+            assert!(matches!(a.decide(false, false, &mut s), Step::Send(_)));
+            assert!(s3::connection(&name).is_none(), "a declined call must not log in");
+            assert_eq!(s.map().name, map_name, "declining must leave every script line unexecuted");
+
+            assert_eq!(a.receive(a.generation(), ok(call("allowed", tool, args.clone())), &mut s), Step::Confirm);
+            assert!(matches!(a.decide(true, true, &mut s), Step::Send(_)));
+            assert!(s3::connection(&name).is_some(), "a once-approved call must execute");
+            if scripted {
+                assert_eq!(s.map().name, "Approved map");
+            }
+            s3::disconnect(&name);
+            assert_eq!(
+                a.receive(a.generation(), ok(call("again", tool, args)), &mut s),
+                Step::Confirm,
+                "asking to remember an approval must not bypass the next confirmation"
+            );
+            assert!(s3::connection(&name).is_none());
+            assert!(matches!(a.decide(false, false, &mut s), Step::Send(_)));
+            assert!(s3::connection(&name).is_none(), "declining a repeat must leave it disconnected");
+        }
+    }
+}
+
+#[test]
+fn remembered_database_forget_requires_fresh_direct_and_script_approval() {
+    use rustgis_engine::data::secrets::{MemorySecrets, SecretStore};
+    use std::sync::Arc;
+    for scripted in [false, true] {
+        let store = Arc::new(MemorySecrets::new());
+        let mut s = Session::new(Project::default());
+        s.database_logins.set_store(Some(store.clone()));
+        s.run(
+            "connection.new",
+            &json!({"kind":"postgres","name":"Private database","address":"postgres:host=127.0.0.1 port=1 user=approval"}),
+        )
+        .unwrap();
+        s.run("connection.login", &json!({"id":"c1","password":"forgotten-sentinel","remember":true})).unwrap();
+        let args = if scripted {
+            json!({"script":"map.rename {\"name\":\"Approved map\"}\nconnection.forgetPassword {\"id\":\"c1\"}"})
+        } else {
+            json!({"command":"connection.forgetPassword","params":{"id":"c1"}})
+        };
+        let tool = if scripted { "run" } else { "run_command" };
+        let mut a = Agent::new(cfg("openai"), &s);
+        assert!(matches!(a.ask("forget this database's saved password", &s), Step::Send(_)));
+        let name = s.map().name.clone();
+        assert_eq!(a.receive(a.generation(), ok(call("forget", tool, args.clone())), &mut s), Step::Confirm);
+        assert!(!a.pending(&s).unwrap().2);
+        assert!(store.load("connection/c1").unwrap().is_some());
+        assert_eq!(s.map().name, name);
+        a.decide(false, false, &mut s);
+        assert!(store.load("connection/c1").unwrap().is_some());
+        assert_eq!(a.receive(a.generation(), ok(call("allow", tool, args.clone())), &mut s), Step::Confirm);
+        let sent = a.decide(true, true, &mut s);
+        assert!(matches!(sent, Step::Send(_)));
+        assert!(!format!("{sent:?}").contains("forgotten-sentinel"));
+        assert_eq!(store.load("connection/c1").unwrap(), None);
+        assert!(!s.connections.find("c1").unwrap().remembered);
+        assert!(s.database_logins.has_session_password("c1"));
+        assert_eq!(a.receive(a.generation(), ok(call("again", tool, args)), &mut s), Step::Confirm);
+    }
+}
+
+#[test]
 fn gate_rules() {
     let s = sample();
     let g = |name: &str, args: Value| tools::gate(&s, &ToolCall { id: "x".into(), name: name.into(), args });
@@ -156,10 +321,27 @@ fn gate_rules() {
     assert!(g("run_command", json!({"command": "edit.undo"})).is_none());
     assert!(g("run_command", json!({"command": "layer.addData", "params": {"path": "/etc/passwd"}})).is_some());
     assert!(g("run_command", json!({"command": "project.new"})).is_some());
+    // File-producing built-ins need approval even with a plain name or a default filename.
+    for output in [None, Some("archive"), Some("cities.pmtiles")] {
+        let mut params = json!({"input": "Cities", "minZoom": 0, "maxZoom": 0});
+        if let Some(output) = output {
+            params["output"] = json!(output);
+        }
+        assert!(g("run_tool", json!({"tool": "vectorToPmtiles", "params": params})).is_some());
+        assert!(g("run_command", json!({"command": "gp.run", "params": {"tool": "vectorToPmtiles", "params": params}})).is_some());
+    }
+    // A QGIS project given as text names its files and addresses inside: asked, as with a path.
+    let qgis = g("run_command", json!({"command": "project.importQgis", "params": {"text": "<qgis/>"}}));
+    assert!(qgis.as_deref().is_some_and(|w| w.contains("QGIS project")), "{qgis:?}");
     assert!(g("run_command", json!({"command": "script.run", "params": {"script": "map.zoomFull {}"}})).is_some());
     assert!(g("run_command", json!({"command": "plugin.install", "params": {"path": "x.rgplugin"}})).is_some());
     assert!(g("run_command", json!({"command": "map.addTiles", "params": {"url": "https://tile.example/{z}/{x}/{y}.png"}})).is_some());
     assert!(g("run_command", json!({"command": "plugin:x/y"})).is_some());
+    // Saved S3 keys and the choice of a connection are the user's: asked for, every time.
+    for command in ["connection.forgetSavedKeys", "connection.resolveS3"] {
+        assert!(g("run_command", json!({"command": command, "params": {"id": "c1", "source": "s3://bucket/key"}})).is_some(), "{command}");
+    }
+    assert!(g("run_command", json!({"command": "connection.login", "params": {"id": "c1", "remember": true}})).is_some());
     let sql = g("run_command", json!({"command": "layer.addSql", "params": {"sql": "SELECT ST_Point(0, 0) AS g"}}));
     assert!(sql.as_deref().is_some_and(|w| w.contains("SQL") && w.contains("internet")), "{sql:?}");
     let sql = g("run_command", json!({"command": "layer.addSql", "params": {"sql": "FROM t", "database": "/data/x.duckdb"}}));
@@ -168,6 +350,20 @@ fn gate_rules() {
     assert!(g("list_layers", json!({})).is_none());
     assert!(g("run_command", json!({"command": "info.fileLayers", "params": {"path": "/etc/passwd"}})).is_some());
     assert!(g("run_command", json!({"command": "info.fileColumns", "params": {"path": "/etc/passwd"}})).is_some());
+    // Georeferencing and projecting are file commands only when they write a file.
+    let extent = json!({"layer": "r", "extent": [10.0, 45.0, 10.04, 45.04]});
+    assert!(g("run_command", json!({"command": "raster.georeference", "params": extent})).is_none());
+    let pts = json!({"layer": "r", "points": [[0, 0, 1, 1], [1, 0, 2, 1], [0, 1, 1, 2]], "transform": "affine", "crs": 32613});
+    assert!(g("run_command", json!({"command": "raster.georeference", "params": pts})).is_none());
+    let mut file = pts.clone();
+    file["path"] = json!("/tmp/x.tif");
+    assert!(g("run_command", json!({"command": "raster.georeference", "params": file})).is_some());
+    // So is projecting a raster.
+    let project = json!({"layer": "r", "crs": 31983, "cellSize": 100, "extent": "Countries"});
+    assert!(g("run_command", json!({"command": "raster.project", "params": project})).is_none());
+    let mut file = project.clone();
+    file["path"] = json!("/tmp/x.tif");
+    assert!(g("run_command", json!({"command": "raster.project", "params": file})).is_some());
 }
 
 /// What a command says beside its result reaches the model (issue #85).
@@ -255,6 +451,130 @@ fn map_switch_and_remove_do_not_report_layers_added() {
     assert!(added.is_some_and(|a| !a.is_empty()), "buffer must name the layer it added: {buffered}");
 }
 
+/// A pivot table answers "population by continent and income group" in two calls: `run_tool` names
+/// the table and `read_features` gives its rows, a field for each income group.
+#[test]
+fn read_features_reads_a_pivot_table() {
+    let mut s = sample();
+    let t = |name: &str, args: Value| ToolCall { id: "x".into(), name: name.into(), args };
+    let params = json!({"input": "Countries", "fields": "continent", "pivot": "income_grp", "value": "pop_est", "statistic": "SUM"});
+    let ran: Value =
+        serde_json::from_str(&tools::run(&mut s, &t("run_tool", json!({"tool": "pivotTable", "params": params}))).unwrap()).unwrap();
+    let name = ran["table"].as_str().map(str::to_string).unwrap_or_default();
+    assert_eq!(name, "Countries_Pivot", "{ran}");
+    let read: Value = serde_json::from_str(&tools::run(&mut s, &t("read_features", json!({"table": name}))).unwrap()).unwrap();
+    let rows = read["rows"].as_array().cloned().unwrap_or_default();
+    assert!(!rows.is_empty() && read["total"].as_u64() == Some(rows.len() as u64), "{read}");
+    let mut cells = 0.0;
+    for row in &rows {
+        let groups: Vec<f64> = row
+            .as_object()
+            .map(|o| o.iter().filter(|(k, _)| k.starts_with("income_grp")).filter_map(|(_, v)| v.as_f64()).collect())
+            .unwrap_or_default();
+        assert!(row["continent"].is_string() && !groups.is_empty(), "{row}");
+        cells += groups.iter().sum::<f64>();
+    }
+    // Every country's population is in one cell.
+    let countries = s.map().layer_by_name("Countries").map(|l| l.dataset.clone()).unwrap();
+    let pop = countries.field_index("pop_est").unwrap();
+    let total: f64 = (0..countries.features.len()).filter_map(|r| countries.value(r, pop).as_f64()).sum();
+    assert!((cells - total).abs() < 1.0, "{cells} != {total}");
+}
+
+/// A tool's output table is read back by the name `run_tool` gives, as `table` or as `layer` (the
+/// name a model passes as readily), without a layer's location columns; a table has no selection,
+/// and a map layer keeps its name over a table sharing it.
+#[test]
+fn read_features_reads_a_tools_output_table() {
+    let mut s = sample();
+    let t = |name: &str, args: Value| ToolCall { id: "x".into(), name: name.into(), args };
+    let stats = json!({"tool": "summaryStatistics", "params": {"input": "Countries", "field": "pop_est", "case": "continent"}});
+    let ran: Value = serde_json::from_str(&tools::run(&mut s, &t("run_tool", stats)).unwrap()).unwrap();
+    let name = ran["table"].as_str().map(str::to_string).unwrap_or_default();
+    assert!(!name.is_empty(), "run_tool must name the table it added: {ran}");
+    let groups = s.project.tables.last().map(|t| t.features.len()).unwrap_or_default();
+    assert!(groups > 1);
+    let id = s.project.tables.last().map(|t| t.id).unwrap_or_default();
+    for args in [
+        json!({"table": name}),
+        json!({"table": id}),
+        json!({"layer": name.to_uppercase()}),
+        json!({"layer": name, "where": "COUNT_pop_est > 0", "order_by": "SUM_pop_est DESC"}),
+    ] {
+        let read: Value = serde_json::from_str(&tools::run(&mut s, &t("read_features", args.clone())).unwrap()).unwrap();
+        assert_eq!(read["table"], json!(name), "{args}: {read}");
+        assert!(read.get("layer").is_none(), "{read}");
+        assert_eq!(read["total"].as_u64(), Some(groups as u64), "{read}");
+        let rows = read["rows"].as_array().cloned().unwrap_or_default();
+        assert!(!rows.is_empty() && rows.iter().all(|r| r.get("_lon").is_none() && r["continent"].is_string()), "{read}");
+    }
+    let sorted: Value =
+        serde_json::from_str(&tools::run(&mut s, &t("read_features", json!({"table": name, "order_by": "SUM_pop_est DESC"}))).unwrap())
+            .unwrap();
+    let sums: Vec<f64> = sorted["rows"].as_array().unwrap().iter().filter_map(|r| r["SUM_pop_est"].as_f64()).collect();
+    assert!(sums.windows(2).all(|w| w[0] >= w[1]), "{sums:?}");
+    let sel = tools::run(&mut s, &t("read_features", json!({"table": name, "selected": true})));
+    assert!(sel.as_ref().is_err_and(|e| e.contains("no selection")), "{sel:?}");
+    let missing = tools::run(&mut s, &t("read_features", json!({"layer": "No such thing"})));
+    assert!(missing.as_ref().is_err_and(|e| e.contains("no layer or standalone table named")), "{missing:?}");
+    assert!(tools::run(&mut s, &t("read_features", json!({"table": "Countries"}))).is_err(), "a layer is not a table");
+    assert!(tools::run(&mut s, &t("read_features", json!({}))).is_err());
+    // An unused `table` sent as null or empty text leaves `layer` in charge.
+    for unused in [json!(null), json!(""), json!("  ")] {
+        let read: Value = serde_json::from_str(
+            &tools::run(&mut s, &t("read_features", json!({"layer": "Cities", "table": unused, "limit": 1}))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read["layer"], json!("Cities"), "{unused}: {read}");
+    }
+    // `layer` finds a table by name as `table` does, exact case first, but not by id.
+    for (file, v) in [("stats.csv", 1), ("Stats.csv", 2)] {
+        s.run("layer.addDataText", &json!({"fileName": file, "text": format!("k,v\na,{v}\n")})).unwrap();
+    }
+    for name in ["stats", "Stats"] {
+        let by_layer = tools::run(&mut s, &t("read_features", json!({"layer": name}))).unwrap();
+        assert_eq!(by_layer, tools::run(&mut s, &t("read_features", json!({"table": name}))).unwrap(), "{name}");
+        assert!(by_layer.contains(&format!("\"table\":\"{name}\"")), "{by_layer}");
+    }
+    // Names are matched as written, by `layer` as by `table`: `stats ` and ` Stats` are tables of
+    // their own beside `stats` and `Stats`, and a name with a space nothing has is neither.
+    for (name, v) in [("stats ", 3), (" Stats", 4)] {
+        use rustgis_engine::data::{Dataset, Field, FieldType, GeometryType, Value as V};
+        let mut ds = Dataset::new(name, GeometryType::None, vec![Field::new("v", FieldType::Integer)]);
+        ds.push(None, vec![V::Int(v)]);
+        s.project.add_table(ds);
+    }
+    for (name, v) in [("stats", 1.0), ("Stats", 2.0), ("stats ", 3.0), (" Stats", 4.0)] {
+        for arg in ["layer", "table"] {
+            let args = Value::Object([(arg.to_string(), json!(name))].into_iter().collect());
+            let read: Value = serde_json::from_str(&tools::run(&mut s, &t("read_features", args)).unwrap()).unwrap();
+            assert_eq!((read["table"].as_str(), read["rows"][0]["v"].as_f64()), (Some(name), Some(v)), "{arg} {name:?}: {read}");
+        }
+    }
+    for name in ["stats  ", "  Stats"] {
+        let by_layer = tools::run(&mut s, &t("read_features", json!({"layer": name})));
+        assert!(by_layer.as_ref().is_err_and(|e| e.contains("no layer or standalone table named")), "{name:?}: {by_layer:?}");
+        let by_table = tools::run(&mut s, &t("read_features", json!({"table": name})));
+        assert!(by_table.as_ref().is_err_and(|e| e.contains("no standalone table named")), "{name:?}: {by_table:?}");
+    }
+    let id = s.project.tables.last().map(|t| t.id).unwrap_or_default();
+    // A layer with that id reads; otherwise it's an error, never the table.
+    let by_id = tools::run(&mut s, &t("read_features", json!({"layer": id.to_string()})));
+    let read_a_layer = match &by_id {
+        Ok(r) => r.contains("\"layer\"") && !r.contains("\"table\""),
+        Err(e) => e.contains("no layer or standalone table named"),
+    };
+    assert!(read_a_layer, "{by_id:?}");
+    assert!(tools::run(&mut s, &t("read_features", json!({"table": id.to_string()}))).is_ok());
+    // A table named like a layer: `layer` reads the layer.
+    s.run("layer.addDataText", &json!({"fileName": "Cities.csv", "text": "k,v\na,1\n"})).unwrap();
+    let city: Value =
+        serde_json::from_str(&tools::run(&mut s, &t("read_features", json!({"layer": "Cities", "limit": 1}))).unwrap()).unwrap();
+    assert_eq!(city["layer"], json!("Cities"), "{city}");
+    let tab: Value = serde_json::from_str(&tools::run(&mut s, &t("read_features", json!({"table": "Cities"}))).unwrap()).unwrap();
+    assert_eq!((tab["table"].as_str(), tab["total"].as_u64()), (Some("Cities"), Some(1)), "{tab}");
+}
+
 #[test]
 fn geoprocessing_and_reading_data() {
     let mut s = sample();
@@ -298,6 +618,11 @@ fn hostile_arguments_never_panic() {
         json!({"tool": "nope", "params": {"input": "Nope"}}),
         json!({"layer": "Cities", "where": "pop_max >", "limit": 1e20, "order_by": "", "fields": [1, null]}),
         json!({"layer": 99999, "selected": true}),
+        json!({"table": {"a": 1}, "layer": [1], "limit": 1e20}),
+        json!({"table": 1e20, "where": "x > 1"}),
+        json!({"table": [1], "selected": true, "order_by": 3}),
+        json!({"table": true, "layer": "  "}),
+        json!({"table": -1, "fields": [{"a": 1}]}),
         json!({"query": "∑≈ç√ 🙂 a b c d e f g h i j k l m n o p", "limit": 100000}),
         json!({"tool": "buffer", "params": {"input": "Cities", "distance": "far"}}),
     ];
@@ -1148,6 +1473,9 @@ fn chatgpt_credentials(expires_at: i64) -> chatgpt::Credentials {
         plan_declined: false,
         saved_at: "2026-10-14T00:00:00Z".into(),
         session: "session-1".into(),
+        rev: String::new(),
+        in_keychain: false,
+        kept: chatgpt::Kept::Nowhere,
     }
 }
 
@@ -1179,7 +1507,8 @@ fn responses_request_shape() {
     let Step::Send(req) = a.ask("Zoom to Paris", &s) else { panic!("expected a request") };
     assert_eq!(req.url, "https://api.openai.com/v1/responses");
     let h = |k: &str| req.headers.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
-    assert!(h("Authorization").is_some_and(|v| v.starts_with("Bearer ey")));
+    // No token: `chatgpt::send` authorizes each request with the current one.
+    assert_eq!(h("Authorization").map(str::to_string), Some(format!("Bearer {}", chatgpt::SIGNED_IN)));
     assert_eq!(req.headers.iter().filter(|(k, _)| !["Content-Type", "Accept", "Authorization"].contains(&k.as_str())).count(), 0);
     let b = body(&req);
     assert_eq!(b["model"], "gpt-6.1-sol");
@@ -1354,8 +1683,13 @@ fn responses_models_from_the_catalog() {
 fn chatgpt_credentials_file_shape() {
     let c = chatgpt_credentials(1_800_000_000);
     assert!(c.signed_in() && c.plan_allowed());
-    assert_eq!(chatgpt::Credentials::from_json(&c.to_json()).unwrap(), c);
-    assert_eq!(c.to_json()["issuer"], chatgpt::ISSUER);
+    // The file keeps the registration and never a token.
+    let saved = c.to_json();
+    for token in [&c.id_token, &c.access_token, &c.refresh_token] {
+        assert!(!saved.to_string().contains(token.as_str()));
+    }
+    assert_eq!(chatgpt::Credentials::from_json(&saved).unwrap(), c.without_tokens());
+    assert_eq!(saved["issuer"], chatgpt::ISSUER);
     assert!(!c.expires_soon(1_800_000_000 - 3600));
     assert!(c.expires_soon(1_800_000_000 - 60));
     assert!(chatgpt::Credentials { expires_at: 0, ..c.clone() }.expires_soon(0), "an unknown expiry means renew");
@@ -1509,7 +1843,7 @@ fn chatgpt_token_requests_and_replies() {
     let g = chatgpt::parse_grant(&resp(json!({"access_token": "a2", "refresh_token": "r2", "id_token": "i2", "expires_in": 3600,
         "scope": "openid email chatgpt.tokens.use.direct"})))
     .unwrap();
-    let account = chatgpt::Account { email: "ann@example.com".into(), subject: "user-1".into() };
+    let account = chatgpt::Account { email: "ann@example.com".into(), subject: "user-1".into(), ..Default::default() };
     let signed = chatgpt::signed_in("oaiapp_synthetic", &account, &g, 1_000);
     assert_eq!((signed.expires_at, signed.plan_allowed(), signed.plan_declined), (4_600, true, false));
     assert_eq!(signed.saved_at, "1970-01-01T00:16:40Z");
@@ -3923,12 +4257,32 @@ fn list_layers_includes_web_tile_layers() {
     assert!(radar.is_some_and(|t| t["url"].as_str().is_some_and(|u| u.contains("LAYERS=a") && !u.contains("s3cret"))), "{out}");
     assert!(s.run("map.tiles", &Value::Null).unwrap().to_string().contains("apikey=s3cret"));
     let ctx = tools::context(&s);
-    assert!(ctx.contains("\"Rain radar\" (index ") && ctx.contains("raster, overlay, hidden)"), "{ctx}");
+    // On top of the map's layers, as a new layer goes (#808): over Cities.
+    assert!(ctx.contains("\"Rain radar\" (index ") && ctx.contains("raster, overlay, over \"Cities\", hidden)"), "{ctx}");
+    assert_eq!(radar.map(|t| t["over"].clone()), Some(json!("Cities")), "{out}");
     // A long name (commands and project files cap them, but not everything that builds a map) is
     // cut, not the index and flags after it.
     if let Some(t) = s.map_mut().tiles.iter_mut().find(|t| t.name == "Rain radar") {
         t.name = "r".repeat(5000);
     }
     let ctx = tools::context(&s);
-    assert!(ctx.contains("characters in all)\" (index ") && ctx.contains("raster, overlay, hidden)"), "{ctx}");
+    assert!(ctx.contains("characters in all)\" (index ") && ctx.contains("raster, overlay, over \"Cities\", hidden)"), "{ctx}");
+}
+
+/// Callback completion and a forged UI project-download request disclose their file reach.
+#[test]
+fn geolibre_download_callbacks_require_import_approval() {
+    let s = Session::new(rustgis_engine::project::Project::default());
+    for (command, params) in
+        [("layer.addDownload", json!({"id":1})), ("ui.addUrl", json!({"url":"https://example.org/map.geolibre","geolibreProject":true}))]
+    {
+        let call = ToolCall { id: "callback".into(), name: "run_command".into(), args: json!({"command":command,"params":params}) };
+        assert!(tools::gate(&s, &call).is_some(), "{command}");
+    }
+    for key in ["geolibreProject", "geolibreLayer", "geolibreZarr"] {
+        let mut params = json!({"url":"https://example.org/data"});
+        params[key] = json!(true);
+        let call = ToolCall { id: key.into(), name: "run_command".into(), args: json!({"command":"ui.addUrl","params":params}) };
+        assert!(tools::gate(&s, &call).is_some(), "{key}");
+    }
 }

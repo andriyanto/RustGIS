@@ -46,12 +46,15 @@ pub struct Spec {
     /// MapLibre style layers (a JSON array) drawing vector tiles instead of their own colours,
     /// each from the tiles' source; empty for the default look.
     pub style_layers: String,
+    /// Source layers left out (`roads`, `pois`): the style layers drawing them are dropped, so
+    /// they neither draw nor are picked.
+    pub hidden_layers: Vec<String>,
 }
 
 impl Spec {
     fn key(&self) -> String {
         format!(
-            "{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            "{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             self.kind,
             self.url,
             self.subdomains.join(","),
@@ -62,7 +65,8 @@ impl Spec {
             self.attribution,
             // Each name with its length, so ["a,b"] and ["a", "b"] differ.
             self.layers.iter().map(|l| format!("{}:{l}", l.len())).collect::<String>(),
-            self.style_layers
+            self.style_layers,
+            self.hidden_layers.iter().map(|l| format!("{}:{l}", l.len())).collect::<String>()
         )
     }
 }
@@ -138,7 +142,7 @@ pub fn resolve(spec: &Spec) -> Resolve {
                     min_zoom: info.min_zoom,
                     max_zoom: info.max_zoom,
                     attribution: info.attribution(),
-                    layers: info.vector_layers(),
+                    layers: info.vector_layers().to_vec(),
                 };
                 match archive_style(spec, archive) {
                     Some(d) => d,
@@ -174,7 +178,7 @@ pub fn resolve(spec: &Spec) -> Resolve {
                     min_zoom: info.min_zoom,
                     max_zoom: info.max_zoom,
                     attribution: info.attribution.clone(),
-                    layers: info.vector_layers(),
+                    layers: info.vector_layers().to_vec(),
                 };
                 match archive_style(spec, archive) {
                     Some(d) => d,
@@ -188,6 +192,9 @@ pub fn resolve(spec: &Spec) -> Resolve {
         Ok(s) => s,
         Err(e) => return Resolve::Failed(format!("{}: {e}", spec.url)),
     };
+    if !spec.hidden_layers.is_empty() {
+        style.layers.retain(|l| l.source_layer.as_ref().is_none_or(|s| !spec.hidden_layers.contains(s)));
+    }
     // Sources given by a TileJSON address.
     let base = spec.url.clone();
     let mut pending = false;
@@ -293,6 +300,19 @@ pub fn resolve(spec: &Spec) -> Resolve {
     Resolve::Ready(r)
 }
 
+/// A vector archive's source layers, as its metadata lists them (`vector_layers`) and
+/// [`source_layers::of_metadata`](rustgis_data::source_layers::of_metadata) keeps them: the same
+/// names its default look draws from. `None` for other layers, an archive that can't be read,
+/// and while a PMTiles header is on its way (asking for it starts reading it in the background;
+/// an MBTiles file's metadata is read here, the first time it is asked for).
+pub fn source_layers(kind: Kind, url: &str) -> Option<Vec<String>> {
+    match kind {
+        Kind::PmTiles => pmtiles::info(url).ok().flatten().filter(|i| i.tile_type.is_vector()).map(|i| i.vector_layers().to_vec()),
+        Kind::MbTiles => mbtiles::info(url).ok().filter(|i| i.format.is_vector()).map(|i| i.vector_layers().to_vec()),
+        _ => None,
+    }
+}
+
 /// The document at `url`: `Ok(None)` while it is on its way.
 fn fetch_json(url: &str) -> Result<Option<Value>, String> {
     match cache::get(url, Want::Json) {
@@ -341,8 +361,8 @@ struct Archive {
 }
 
 /// The style for a tile archive: a raster layer for picture tiles; for vector tiles the
-/// built-in style when the archive has the layers it knows (a basemap), otherwise a layer for each
-/// of the archive's vector layers (points, lines and polygons each in their own colour).
+/// chosen source layers or style when given, else the built-in style for a known basemap, or a
+/// layer for each of the archive's vector layers (points, lines and polygons in their own colour).
 fn archive_style(spec: &Spec, info: Archive) -> Option<Value> {
     let tiles = vec![info.tiles];
     let (minzoom, maxzoom) = (info.min_zoom, info.max_zoom);
@@ -360,6 +380,9 @@ fn archive_style(spec: &Spec, info: Archive) -> Option<Value> {
     let source = json!({"type": "vector", "tiles": tiles, "minzoom": minzoom, "maxzoom": maxzoom, "attribution": attribution});
     if let Some(doc) = own_style(spec, &source) {
         return Some(doc);
+    }
+    if !spec.layers.is_empty() {
+        return Some(named_layers_style(spec, source, &spec.layers));
     }
     let names = info.layers;
     let known = [
@@ -488,6 +511,7 @@ mod tests {
             attribution: "&copy; <a href=\"x\">OSM</a>".into(),
             layers: Vec::new(),
             style_layers: String::new(),
+            hidden_layers: Vec::new(),
         }
     }
 
@@ -535,6 +559,35 @@ mod tests {
         own.style_layers = "{not json".into();
         let Resolve::Ready(v) = resolve(&own) else { panic!("not ready") };
         assert!(v.style.layers.len() > 10);
+    }
+
+    /// Explicit archive layers take precedence over metadata and the basemap guess; a custom
+    /// style still decides which source layers it draws, as for vector tile templates.
+    #[test]
+    fn archive_source_layers_are_drawn_instead_of_the_default_look() {
+        let archive = || Archive {
+            tiles: "pmtiles:{z}/{x}/{y}@atlas.pmtiles".into(),
+            vector: true,
+            min_zoom: 0,
+            max_zoom: 14,
+            attribution: String::new(),
+            layers: vec!["water".into(), "roads".into(), "buildings".into(), "fields".into()],
+        };
+        let mut selected = spec(Kind::PmTiles, "atlas.pmtiles");
+        let default = archive_style(&selected, archive()).unwrap();
+        for names in [vec!["fields"], vec!["water", "roads", "buildings"]] {
+            selected.layers = names.iter().map(|s| s.to_string()).collect();
+            let doc = archive_style(&selected, archive()).unwrap();
+            let layers = doc["layers"].as_array().unwrap();
+            assert_eq!(layers.len(), names.len() * 3, "fill, line and point for each chosen layer");
+            assert!(layers.iter().all(|l| names.contains(&l["source-layer"].as_str().unwrap())));
+            assert_ne!(doc["layers"], default["layers"]);
+        }
+        selected.style_layers = r#"[{"id":"own","type":"fill","source-layer":"fields"}]"#.into();
+        let doc = archive_style(&selected, archive()).unwrap();
+        assert_eq!(doc["layers"].as_array().unwrap().len(), 1);
+        assert_eq!(doc["layers"][0]["source-layer"], "fields");
+        assert_eq!(doc["layers"][0]["source"], "vector");
     }
 
     #[test]

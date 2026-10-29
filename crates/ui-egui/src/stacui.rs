@@ -25,16 +25,13 @@ type Answer = Slot<Result<Vec<u8>, String>>;
 
 /// What is being fetched.
 enum Asked {
-    Collections,
+    /// An API's collections, by the address as typed.
+    Collections(String),
     /// A search, by its address (which the answer's links are resolved against).
     Search(String),
     /// A token for an asset that needs signing: the token service's address, the asset's and the
     /// layer's name.
-    Token {
-        token_url: String,
-        href: String,
-        name: String,
-    },
+    Token { token_url: String, href: String, name: String },
     /// An item's or a collection's document (a `?stac=` link), by its address.
     Link(String),
     /// A static catalog's document, for its children, by its address.
@@ -133,6 +130,10 @@ pub struct State {
     pub cube_asset: String,
     pub cube_range: String,
     pub api: String,
+    /// The saved connection this dialog was opened on, by id (see `connectionui::picked`).
+    pub connection: Option<String>,
+    /// The API or catalog address whose collections or children last landed (what Save as Connection keeps).
+    pub listed: String,
     /// Collections the API offers: id and title.
     pub collections: Vec<(String, String)>,
     pub collection: String,
@@ -180,8 +181,10 @@ impl Default for State {
             cube_asset: String::new(),
             cube_range: String::new(),
             api: stac::EARTH_SEARCH.to_string(),
+            connection: None,
+            listed: String::new(),
             collections: Vec::new(),
-            collection: "sentinel-2-l2a".into(),
+            collection: "sentinel-2-c1-l2a".into(),
             from: String::new(),
             to: String::new(),
             use_view: true,
@@ -305,10 +308,11 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
     st.error = None;
     let previous = st.info.take();
     match asked {
-        Asked::Collections => match r.and_then(|b| stac::parse_collections(&b)) {
+        Asked::Collections(api) => match r.and_then(|b| stac::parse_collections(&b)) {
             Ok(c) => {
                 st.info = Some(i18n::fmt("{n} collections", &[("n", &c.len().to_string())]));
                 st.collections = c.into_iter().map(|c| (c.id, c.title)).collect();
+                st.listed = api;
             }
             Err(e) => st.error = Some(e),
         },
@@ -342,6 +346,9 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
             Ok(c) if st.walk.is_some() || (st.counted && !st.items.is_empty()) => {
                 st.info = previous;
                 st.children = c;
+                if url == st.api.trim() {
+                    st.listed = url.clone();
+                }
             }
             Ok(c) => {
                 st.info = Some(if c.is_empty() {
@@ -350,6 +357,9 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
                     i18n::fmt("{n} catalogs and collections", &[("n", &c.len().to_string())])
                 });
                 st.children = c;
+                if url == st.api.trim() {
+                    st.listed = url.clone();
+                }
             }
             Err(e) => {
                 st.children.clear();
@@ -663,6 +673,34 @@ pub fn title(app: &RustGisApp) -> &'static str {
     shown_preset(&app.ui.stac).map(Preset::title).unwrap_or("STAC Search")
 }
 
+fn switch_api(st: &mut State, url: &str) {
+    st.api = url.to_string();
+    drop_listing(st);
+}
+
+/// Forgets what was listed for the last API or catalog, and what is still on its way from it: a
+/// late answer would otherwise land under the new one. An asset being signed or a link being
+/// opened was asked for already and goes on.
+fn drop_listing(st: &mut State) {
+    st.collections.clear();
+    st.items.clear();
+    st.collection.clear();
+    (st.node, st.node_title) = (String::new(), String::new());
+    st.trail.clear();
+    st.children.clear();
+    // What Save as Connection would keep: listed again before it is offered.
+    st.listed.clear();
+    if st.waiting.as_ref().is_some_and(|(a, _)| matches!(a, Asked::Collections(_) | Asked::Search(_) | Asked::Children(_))) {
+        st.waiting = None;
+    }
+    st.walk = None;
+    // The last listing's status ("Showing 10 items") isn't the new API's; an asset being signed
+    // or a link being opened keeps its own.
+    if st.waiting.is_none() {
+        st.info = None;
+    }
+}
+
 /// The dialog.
 pub fn dialog(app: &mut RustGisApp, ui: &mut egui::Ui) {
     let busy = app.ui.stac.waiting.is_some() || app.ui.stac.walk.is_some();
@@ -675,32 +713,40 @@ pub fn dialog(app: &mut RustGisApp, ui: &mut egui::Ui) {
     if let Some(p) = shown_preset(&app.ui.stac) {
         ui.label(egui::RichText::new(tl!(p.hint())).weak());
     }
+    let connections = crate::sourcespane::connections_snapshot(app);
+    let current = crate::connectionui::picked(&connections, app.ui.stac.connection.as_deref(), &app.ui.stac.api);
     egui::Grid::new("stac").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
         let st = &mut app.ui.stac;
         ui.label(if is_static { tl!("STAC catalog") } else { tl!("STAC API") });
         ui.horizontal(|ui| {
             let named = APIS.iter().find(|(_, u)| *u == st.api.trim_end_matches('/')).map(|(l, _)| tl!(*l).to_string());
             egui::ComboBox::from_id_salt("stac_api")
-                .selected_text(named.unwrap_or_else(|| tl!("Other").to_string()))
+                .selected_text(current.map(|c| c.name.clone()).or(named).unwrap_or_else(|| tl!("Other").to_string()))
                 .width((ui.available_width() * 0.4).clamp(90.0, 150.0))
                 .show_ui(ui, |ui| {
                     for (label, url) in APIS {
                         if ui.selectable_label(st.api == url, tl!(label)).clicked() && st.api != url {
-                            st.api = url.to_string();
-                            st.collections.clear();
-                            // Nothing of the last catalog's browsing is kept.
-                            (st.node, st.node_title) = (String::new(), String::new());
-                            st.trail.clear();
-                            st.children.clear();
+                            switch_api(st, url);
                             api_changed = true;
                         }
                     }
-                });
+                    if connections.iter().any(|c| c.kind == "stac") {
+                        ui.separator();
+                    }
+                    for c in connections.iter().filter(|c| c.kind == "stac") {
+                        let selected = current.is_some_and(|x| x.id == c.id);
+                        if ui.selectable_label(selected, &c.name).on_hover_text(&c.address).clicked() && !selected {
+                            switch_api(st, &c.address);
+                            st.connection = Some(c.id.clone());
+                            api_changed = true;
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(tl!("Catalog"));
             // A catalog typed in is browsed with Browse, from its top.
             if ui.add(egui::TextEdit::singleline(&mut st.api).desired_width(ui.available_width().max(80.0))).changed() {
-                (st.node, st.node_title) = (String::new(), String::new());
-                st.trail.clear();
-                st.children.clear();
+                drop_listing(st);
             }
         });
         ui.end_row();
@@ -711,19 +757,26 @@ pub fn dialog(app: &mut RustGisApp, ui: &mut egui::Ui) {
                 // Its text is cut to the room left beside Browse.
                 let w = (ui.available_width() - 110.0).max(120.0);
                 ui.allocate_ui(vec2(w, 30.0), |ui| {
-                    egui::ComboBox::from_id_salt("stac_node").truncate().selected_text(shown).width(w).height(360.0).show_ui(ui, |ui| {
-                        for (i, (title, _)) in st.trail.iter().enumerate() {
-                            let title = if title.is_empty() { tl!("all of it").to_string() } else { title.clone() };
-                            if ui.selectable_label(false, format!("↑ {title}")).clicked() {
-                                go_up = Some(i);
+                    egui::ComboBox::from_id_salt("stac_node")
+                        .truncate()
+                        .selected_text(shown)
+                        .width(w)
+                        .height(360.0)
+                        .show_ui(ui, |ui| {
+                            for (i, (title, _)) in st.trail.iter().enumerate() {
+                                let title = if title.is_empty() { tl!("all of it").to_string() } else { title.clone() };
+                                if ui.selectable_label(false, format!("↑ {title}")).clicked() {
+                                    go_up = Some(i);
+                                }
                             }
-                        }
-                        for c in &st.children {
-                            if ui.selectable_label(false, &c.title).on_hover_text(&c.url).clicked() {
-                                go_to = Some((c.title.clone(), c.url.clone()));
+                            for c in &st.children {
+                                if ui.selectable_label(false, &c.title).on_hover_text(&c.url).clicked() {
+                                    go_to = Some((c.title.clone(), c.url.clone()));
+                                }
                             }
-                        }
-                    });
+                        })
+                        .response
+                        .on_hover_text(tl!("Catalog"));
                 });
                 list = ui.add_enabled(!busy, egui::Button::new(tl!("Browse"))).clicked();
             });
@@ -741,16 +794,20 @@ pub fn dialog(app: &mut RustGisApp, ui: &mut egui::Ui) {
                     let shown = if st.collection.is_empty() { tl!("any").to_string() } else { st.collection.clone() };
                     let w = (ui.available_width() - 110.0).max(100.0);
                     ui.allocate_ui(vec2(w, 30.0), |ui| {
-                        egui::ComboBox::from_id_salt("stac_collection").truncate().selected_text(shown).width(w).height(320.0).show_ui(
-                            ui,
-                            |ui| {
+                        egui::ComboBox::from_id_salt("stac_collection")
+                            .truncate()
+                            .selected_text(shown)
+                            .width(w)
+                            .height(320.0)
+                            .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut st.collection, String::new(), tl!("any"));
                                 for (id, title) in &st.collections {
                                     let label = if title.is_empty() { id.clone() } else { format!("{id} — {title}") };
                                     ui.selectable_value(&mut st.collection, id.clone(), label);
                                 }
-                            },
-                        );
+                            })
+                            .response
+                            .on_hover_text(tl!("Collection"));
                     });
                 }
                 list = ui.add_enabled(!busy, egui::Button::new(tl!("Collections"))).clicked();
@@ -764,12 +821,14 @@ pub fn dialog(app: &mut RustGisApp, ui: &mut egui::Ui) {
                     .hint_text("2024-06-01")
                     .desired_width(((ui.available_width() - 30.0) / 2.0).clamp(70.0, 110.0)),
             );
-            ui.label("–");
-            ui.add(egui::TextEdit::singleline(&mut st.to).hint_text("2024-06-30").desired_width(ui.available_width().clamp(70.0, 110.0)));
+            let input_label = ui.label("–");
+            ui.add(egui::TextEdit::singleline(&mut st.to).hint_text("2024-06-30").desired_width(ui.available_width().clamp(70.0, 110.0)))
+                .labelled_by(input_label.id);
         });
         ui.end_row();
-        ui.label(tl!("Most cloud cover (%)"));
-        ui.add(egui::TextEdit::singleline(&mut st.max_cloud).hint_text(tl!("any")).desired_width(ui.available_width().clamp(70.0, 110.0)));
+        let input_label = ui.label(tl!("Most cloud cover (%)"));
+        ui.add(egui::TextEdit::singleline(&mut st.max_cloud).hint_text(tl!("any")).desired_width(ui.available_width().clamp(70.0, 110.0)))
+            .labelled_by(input_label.id);
         ui.end_row();
         if is_static && (st.preset == Some(Preset::Vantor) || !st.phase.is_empty()) {
             ui.label(tl!("Phase"));
@@ -784,13 +843,23 @@ pub fn dialog(app: &mut RustGisApp, ui: &mut egui::Ui) {
         ui.checkbox(&mut st.use_view, tl!("Only where the map is"));
         ui.end_row();
     });
+    let st = &app.ui.stac;
+    let keepable = !st.listed.is_empty()
+        && st.listed == st.api.trim()
+        && crate::connectionui::picked(&connections, st.connection.as_deref(), &st.listed).is_none();
+    let mut keep = false;
     ui.horizontal(|ui| {
         search = ui.add_enabled(!busy, egui::Button::new(tl!("Find Items"))).clicked();
         if busy {
             ui.spinner();
         }
+        if keepable {
+            keep = crate::connectionui::keep_button(ui);
+        }
     });
-    if api_changed && catalog::is_static(&app.ui.stac.api) && !busy {
+    // A listing dropped by the switch no longer holds the new catalog's browsing up.
+    let busy_now = app.ui.stac.waiting.is_some() || app.ui.stac.walk.is_some();
+    if api_changed && catalog::is_static(&app.ui.stac.api) && !busy_now {
         browse(app, None);
     } else if let Some(to) = go_to {
         browse(app, Some(to));
@@ -800,12 +869,21 @@ pub fn dialog(app: &mut RustGisApp, ui: &mut egui::Ui) {
         fetch_children(app);
     } else if list {
         match stac::api(Some(app.ui.stac.api.as_str())) {
-            Ok(api) => app.ui.stac.waiting = Some((Asked::Collections, fetch(&stac::collections_url(&api)))),
+            Ok(api) => {
+                let typed = app.ui.stac.api.trim().to_string();
+                app.ui.stac.waiting = Some((Asked::Collections(typed), fetch(&stac::collections_url(&api))));
+            }
             Err(e) => app.ui.stac.error = Some(e),
         }
     }
     if search {
         find_items(app);
+    }
+    if keep {
+        match crate::connectionui::keep(app, json!({"kind": "stac", "address": app.ui.stac.listed.clone()})) {
+            Ok(id) => app.ui.stac.connection = Some(id),
+            Err(e) => app.ui.stac.error = Some(e),
+        }
     }
     #[cfg(not(target_arch = "wasm32"))]
     cube_row(app, ui, busy);
@@ -850,11 +928,16 @@ fn cube_row(app: &mut RustGisApp, ui: &mut egui::Ui, busy: bool) {
     }
     let mut add = false;
     ui.horizontal_wrapped(|ui| {
-        egui::ComboBox::from_id_salt("stac_cube_asset").selected_text(st.cube_asset.as_str()).width(110.0).show_ui(ui, |ui| {
-            for k in &keys {
-                ui.selectable_value(&mut st.cube_asset, k.clone(), k.as_str());
-            }
-        });
+        egui::ComboBox::from_id_salt("stac_cube_asset")
+            .selected_text(st.cube_asset.as_str())
+            .width(110.0)
+            .show_ui(ui, |ui| {
+                for k in &keys {
+                    ui.selectable_value(&mut st.cube_asset, k.clone(), k.as_str());
+                }
+            })
+            .response
+            .on_hover_text(tl!("Asset"));
         ui.add(egui::TextEdit::singleline(&mut st.cube_range).hint_text(tl!("range: 0, 0.9")).desired_width(90.0)).on_hover_text(tl!(
             "The values shown from black to white, the same for every date and tile (the band's own units). Empty: each file's own stretch."
         ));
@@ -1010,12 +1093,18 @@ fn results(app: &mut RustGisApp, ui: &mut egui::Ui) {
                                 zoom = Some(i);
                             }
                             if let Some(key) = st.chosen.get_mut(i) {
-                                egui::ComboBox::from_id_salt(("stac_asset", i)).selected_text(key.clone()).width(90.0).show_ui(ui, |ui| {
-                                    for a in &item.assets {
-                                        let label = if a.title.is_empty() { a.key.clone() } else { format!("{} — {}", a.key, a.title) };
-                                        ui.selectable_value(key, a.key.clone(), label);
-                                    }
-                                });
+                                egui::ComboBox::from_id_salt(("stac_asset", i))
+                                    .selected_text(key.clone())
+                                    .width(90.0)
+                                    .show_ui(ui, |ui| {
+                                        for a in &item.assets {
+                                            let label =
+                                                if a.title.is_empty() { a.key.clone() } else { format!("{} — {}", a.key, a.title) };
+                                            ui.selectable_value(key, a.key.clone(), label);
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(tl!("Asset"));
                             }
                             if ui.button(tl!("Add")).clicked() {
                                 add = Some(i);
@@ -1077,6 +1166,8 @@ mod tests {
             assert_eq!(Preset::from_id(p.id()), Some(p));
         }
         assert_eq!(Preset::from_id("nope"), None);
+        // The dialog opens on Collection 1: the legacy `sentinel-2-l2a` declares an offset that many of its files lack.
+        assert_eq!(State::default().collection, "sentinel-2-c1-l2a");
         let d = days_ago(0);
         assert!(d.len() == 10 && d.starts_with("20"), "{d}");
         let mut app = RustGisApp::with_sample();
@@ -1099,5 +1190,60 @@ mod tests {
         app.ui.stac.from = "soon".into();
         find_items(&mut app);
         assert!(app.ui.stac.walk.is_none() && app.ui.stac.error.is_some());
+    }
+
+    /// An answer asked of one API that lands after another was picked isn't shown under it; a
+    /// link being opened goes on.
+    #[test]
+    fn a_late_answer_from_the_previous_api_is_dropped() {
+        let mut app = RustGisApp::with_sample();
+        let ctx = egui::Context::default();
+        let late: Answer = Slot::default();
+        app.ui.stac.api = "https://one.example/stac".into();
+        app.ui.stac.waiting = Some((Asked::Collections("https://one.example/stac".into()), late.clone()));
+        switch_api(&mut app.ui.stac, "https://two.example/stac");
+        assert!(app.ui.stac.waiting.is_none());
+        *late.lock().unwrap() = Some(Ok(br#"{"collections":[{"id":"old","title":"Old"}]}"#.to_vec()));
+        poll(&mut app, &ctx);
+        assert!(app.ui.stac.collections.is_empty());
+        assert_eq!(app.ui.stac.api, "https://two.example/stac");
+
+        // Listed, then away and back: Save as Connection waits for a listing of its own, and
+        // the last listing's status goes with it.
+        app.ui.stac.listed = "https://two.example/stac".into();
+        app.ui.stac.info = Some("Showing 10 items".into());
+        switch_api(&mut app.ui.stac, "https://one.example/stac");
+        switch_api(&mut app.ui.stac, "https://two.example/stac");
+        assert!(app.ui.stac.listed.is_empty());
+        assert_eq!(app.ui.stac.info, None);
+
+        app.ui.stac.waiting = Some((Asked::Link("https://two.example/item.json".into()), Slot::default()));
+        switch_api(&mut app.ui.stac, "https://three.example/stac");
+        assert!(matches!(app.ui.stac.waiting, Some((Asked::Link(_), _))), "a link already asked for goes on");
+    }
+
+    /// A static catalog picked while a listing of the last API is pending is browsed at once:
+    /// the dropped listing doesn't hold it up.
+    #[test]
+    fn a_catalog_picked_during_a_pending_listing_is_browsed() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        // Nothing listens on port 9 of the loopback address: the browse is refused, harmlessly.
+        app.run("connection.new", json!({"kind":"stac","name":"Local catalog","address":"http://127.0.0.1:9/catalog.json"})).unwrap();
+        app.ui.stac.api = "https://one.example/stac".into();
+        app.ui.stac.waiting = Some((Asked::Collections("https://one.example/stac".into()), Slot::default()));
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(900.0, 700.0))
+            .build_ui_state(|ui, app: &mut RustGisApp| dialog(app, ui), app);
+        h.step();
+        h.step();
+        h.query_all_by_role(egui::accesskit::Role::ComboBox).find(|n| n.value().as_deref() == Some("Other")).unwrap().click();
+        // The list opens on the frame after the click.
+        h.step();
+        h.step();
+        h.get_by_label("Local catalog").click();
+        h.step();
+        assert_eq!(h.state().ui.stac.api, "http://127.0.0.1:9/catalog.json");
+        assert!(matches!(&h.state().ui.stac.waiting, Some((Asked::Children(url), _)) if url == "http://127.0.0.1:9/catalog.json"));
     }
 }

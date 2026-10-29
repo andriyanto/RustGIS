@@ -35,8 +35,21 @@ ways (`pip install "rustgis[jupyter]"`):
 ```python
 m = rustgis.Map(sample=True)
 m.add_geopandas(gdf, name="Big cities")           # appears in the app
+m.add_pmtiles("https://example.org/atlas.pmtiles", name="Atlas")
 m                                                 # pan, edit, style there...
 m.info()["center"]                                # ...and read it back here
+```
+
+In a Qt application, `rustgis.qt.MapWidget` is the same app in a widget (`pip install "rustgis[qt]"`):
+
+```python
+from rustgis.qt import MapWidget                  # before the QApplication
+from PySide6.QtWidgets import QApplication
+
+app = QApplication([])
+w = MapWidget(sample=True)                        # w["Countries"].style(...) and so on
+w.show()
+app.exec()
 ```
 
 Every action in RustGIS is a command with an id, the same ids the ribbon, `rustgis-cli` and the

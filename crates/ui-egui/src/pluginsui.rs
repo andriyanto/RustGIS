@@ -673,12 +673,17 @@ fn browse_tab(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) {
         ui.add(egui::TextEdit::singleline(filter).hint_text(tl!("Search plugins")).desired_width(220.0));
         let all = tl!("All categories");
         let shown = if category.is_empty() { all.to_string() } else { category.clone() };
-        egui::ComboBox::from_id_salt("plugin-category").selected_text(shown).width(150.0).show_ui(ui, |ui| {
-            ui.selectable_value(category, String::new(), all);
-            for c in &browse.categories {
-                ui.selectable_value(category, c.clone(), c.as_str());
-            }
-        });
+        egui::ComboBox::from_id_salt("plugin-category")
+            .selected_text(shown)
+            .width(150.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(category, String::new(), all);
+                for c in &browse.categories {
+                    ui.selectable_value(category, c.clone(), c.as_str());
+                }
+            })
+            .response
+            .on_hover_text(tl!("Category"));
         if ui.button(tl!("Refresh")).clicked() {
             app.plugins.set_registry(None);
             refresh(app, ui.ctx());
@@ -789,7 +794,8 @@ fn browse_row(ui: &mut egui::Ui, t: &Tokens, e: &Entry, web: bool) -> bool {
     if let Some(r) = &reason {
         tip = format!("{tip}\n\n{r}");
     }
-    let desc = ui.add(egui::Label::new(egui::RichText::new(description).size(12.0)).truncate());
+    // The explicit tooltip below includes the withdrawal reason; don't also show egui's elision tooltip.
+    let desc = ui.add(egui::Label::new(egui::RichText::new(description).size(12.0)).truncate().show_tooltip_when_elided(false));
     if !tip.trim().is_empty() {
         desc.on_hover_text(tip);
     }
@@ -896,7 +902,7 @@ fn confirm(app: &mut RustGisApp, ctx: &egui::Context, t: &Tokens) {
     let Some(c) = &app.plugins.confirm else { return };
     let m = c.manifest.clone();
     let mut decision = None;
-    egui::Modal::new(egui::Id::new("plugin_confirm")).show(ctx, |ui| {
+    egui::Modal::new(egui::Id::unique("plugin_confirm")).show(ctx, |ui| {
         ui.set_width(420.0);
         ui.label(
             egui::RichText::new(crate::i18n::fmt("Install {name} {version}?", &[("name", &m.name), ("version", &m.version)]))
@@ -993,7 +999,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     let mut open = true;
     let screen = ctx.content_rect();
     egui::Window::new(tl!("Plugin Manager"))
-        .id(egui::Id::new("plugin_manager"))
+        .id(egui::Id::unique("plugin_manager"))
         .open(&mut open)
         .collapsible(false)
         .resizable(true)

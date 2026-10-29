@@ -267,17 +267,41 @@ const NEVER: &[&str] = &[
     "project.openText",
     "project.sample",
     "project.fromTemplate",
+    // A QGIS project names the files and web addresses its layers come from, and the import
+    // adds them without each one passing a plugin's permissions.
+    "project.importQgis",
+    "project.importGeolibre",
+    // Completion callbacks can finish project imports; plugins never supply their state.
+    "layer.addDownload",
     "edit.undo",
     "edit.redo",
     // Credentials: a plugin never sets where the user's are sent.
+    "connection.new",
+    "connection.edit",
+    "connection.duplicate",
+    "connection.remove",
+    "connection.login",
+    "connection.forgetPassword",
+    "connection.forgetSavedKeys",
+    "connection.resolveS3",
+    "connection.test",
+    "connection.browse",
     "s3.connect",
     "s3.disconnect",
     "earthdata.login",
     "earthdata.logout",
+    "pg.connect",
+    "pg.disconnect",
+    // Writes to a database: the user's to do, asked each time.
+    "pg.saveEdits",
+    "gpkg.saveEdits",
 ];
 
 /// Commands that write files without naming one in their parameters.
 const WRITES_FILES: &[&str] = &["project.save", "project.saveAs"];
+
+/// Commands that read a file a layer names, not their parameters.
+const READS_FILES: &[&str] = &["gpkg.discardEdits"];
 
 /// Parameter keys that name a file, folder or address. (`data` and `text` carry content, which
 /// plugins may pass: `layer.addDataBytes`, `map.import` from text.)
@@ -288,8 +312,22 @@ pub const SQL: &str = "layer.addSql";
 
 /// Commands that read a database, which can be a PostgreSQL server's as well as a file, and a
 /// Zarr store, a folder or a web address.
-const DATABASES: &[&str] =
-    &[SQL, "layer.addDatabase", "info.databaseTables", "sql.query", "sql.schema", "raster.zarrInfo", "layer.addZarr"];
+const DATABASES: &[&str] = &[
+    SQL,
+    "layer.addDatabase",
+    "info.databaseTables",
+    "sql.query",
+    "sql.schema",
+    "raster.zarrInfo",
+    "layer.addZarr",
+    "pg.tables",
+    "pg.addLayer",
+    "pg.discardEdits",
+    "zarr.series",
+    "zarr.reduce",
+    "cube.trend",
+    "cube.reduce",
+];
 
 /// What a command reaches beyond the project when run with some parameters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -316,7 +354,18 @@ pub fn reaches(spec: &C, params: &Value) -> Option<Reach> {
         return Some(Reach::Files);
     }
     // So do tools with a file parameter (a plugin's `file`): they're handed the file.
-    if spec.id == "gp.run" && ps(params, "tool").and_then(rustgis_analysis::tool).is_some_and(super::gp::reads_files) {
+    if spec.id == "gp.run"
+        && ps(params, "tool").and_then(super::gp::tool_id).and_then(rustgis_analysis::tool).is_some_and(super::gp::reads_files)
+    {
+        return Some(Reach::Files);
+    }
+    if spec.id == "gp.run"
+        && ps(params, "tool").and_then(super::gp::tool_id).and_then(rustgis_analysis::tool).is_some_and(super::gp::writes_files)
+    {
+        return Some(Reach::Files);
+    }
+    // A catalog's Zarr entry is opened as `layer.addZarr` is, a database's way.
+    if spec.id == "cube.open" && super::cube_catalog::opens_zarr(params) {
         return Some(Reach::Files);
     }
     // Commands that fetch from an address read and write no files, so `files` doesn't come into
@@ -327,9 +376,15 @@ pub fn reaches(spec: &C, params: &Value) -> Option<Reach> {
     if DATABASES.contains(&spec.id) {
         return Some(Reach::Files);
     }
+    // Georeferencing and projecting write a file only when given a `path`; the rest of them stays
+    // in the project.
+    if spec.id == "raster.georeference" || spec.id == "raster.project" {
+        return super::items::names_place(params, PLACE_KEYS, 0).then_some(Reach::Files);
+    }
     let files = super::items::names_place(params, PLACE_KEYS, 0)
         || PLACE_KEYS.iter().any(|k| spec.params.contains(&format!("\"{k}\"")))
         || WRITES_FILES.contains(&spec.id)
+        || READS_FILES.contains(&spec.id)
         || ["share.", "offline.", "cache.", "notebook."].iter().any(|p| spec.id.starts_with(p));
     files.then_some(Reach::Files)
 }
@@ -341,7 +396,8 @@ fn refused(plugin: &Plugin, spec: &C, params: &Value) -> Option<String> {
         return Some(format!("plugins can't run '{}'", spec.id));
     }
     // An SQL query reads files and web addresses alike, and a database is a file or a server.
-    if DATABASES.contains(&spec.id) && !(m.has(Permission::Files) && m.has(Permission::Network)) {
+    let database = DATABASES.contains(&spec.id) || (spec.id == "cube.open" && super::cube_catalog::opens_zarr(params));
+    if database && !(m.has(Permission::Files) && m.has(Permission::Network)) {
         return Some(format!("{} needs the 'files' and 'network' permissions to run '{}'", m.name, spec.id));
     }
     match reaches(spec, params) {
@@ -422,6 +478,7 @@ impl Bridge<'_> {
             features: rows.iter().take(limit).filter_map(|&i| l.dataset.features.get(i).cloned()).collect(),
             source: None,
             crs: None,
+            crs_incomplete: false,
             windowed: false,
         };
         let mut gj = rustgis_data::io::to_geojson(&ds);

@@ -1,7 +1,11 @@
 //! Every command, grouped by ribbon tab.
 
+pub mod arcgis;
 pub mod catalogs;
 pub mod clipboard;
+pub mod connections;
+pub mod cube;
+pub mod cube_catalog;
 pub mod deeplearning;
 pub mod design;
 pub mod directions;
@@ -10,7 +14,9 @@ pub mod edit;
 pub mod effects;
 pub mod embeddings;
 pub mod geocode;
+pub mod geolibre;
 pub mod gp;
+pub mod gpkg;
 pub mod graphics;
 pub mod group;
 pub mod history;
@@ -23,11 +29,14 @@ pub mod layout;
 pub mod navigate;
 pub mod nldi;
 pub mod notebook;
+pub mod pg;
 pub mod plugins;
 pub mod portals;
 pub mod presentation;
 pub mod project;
+pub mod qgis;
 pub mod raster;
+pub mod repair;
 pub mod report;
 pub mod s3;
 pub mod search;
@@ -50,9 +59,12 @@ use serde_json::Value;
 
 use crate::{CommandSpec, Session};
 
+/// Collects the engine command registry, including project importers, for every front end.
 pub fn all() -> Vec<CommandSpec> {
     let mut v = Vec::new();
     v.extend(project::commands());
+    v.extend(qgis::commands());
+    v.extend(geolibre::commands());
     v.extend(navigate::commands());
     v.extend(geocode::commands());
     v.extend(directions::commands());
@@ -61,11 +73,15 @@ pub fn all() -> Vec<CommandSpec> {
     v.extend(service::commands());
     v.extend(s3::commands());
     v.extend(sources::commands());
+    v.extend(connections::commands());
     v.extend(layer::commands());
     v.extend(group::commands());
     v.extend(layer_copy::commands());
     v.extend(raster::commands());
+    v.extend(repair::commands());
     v.extend(zarr::commands());
+    v.extend(cube::commands());
+    v.extend(cube_catalog::commands());
     v.extend(select::commands());
     v.extend(edit::commands());
     v.extend(clipboard::commands());
@@ -87,6 +103,8 @@ pub fn all() -> Vec<CommandSpec> {
     v.extend(history::commands());
     v.extend(share::commands());
     v.extend(sql::commands());
+    v.extend(pg::commands());
+    v.extend(gpkg::commands());
     v.extend(plugins::commands());
     v.extend(sharing::commands());
     v.extend(stac::commands());
@@ -95,6 +113,7 @@ pub fn all() -> Vec<CommandSpec> {
     v.extend(webdata::commands());
     v.extend(embeddings::commands());
     v.extend(earthdata::commands());
+    v.extend(arcgis::commands());
     v.extend(nldi::commands());
     v.extend(time::commands());
     v

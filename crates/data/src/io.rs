@@ -352,6 +352,37 @@ pub fn project(ds: &Dataset, crs: Crs) -> Result<Dataset> {
     Ok(out)
 }
 
+/// Defines the CRS of the dataset's native coordinates without changing those numeric values.
+/// Geometry stored in longitude/latitude is converted back through the previous CRS, then
+/// interpreted in the new one. Builds a copy so failed transformations leave the input intact.
+/// Source geometry discarded during import cannot be recovered this way.
+pub fn define_projection(ds: &Dataset, crs: Crs) -> Result<Dataset> {
+    if ds.crs_incomplete {
+        return Err(DataError::Format("geometry was lost during import; import the original file again with a crs override".into()));
+    }
+    let from = ds.crs.unwrap_or(Crs::LonLat);
+    let native = project(ds, from)?;
+    let to = crs.transformer().map_err(DataError::Format)?;
+    let mut out = native;
+    for f in &mut out.features {
+        if let Some(g) = f.geometry.take() {
+            let g = g.map_coords(&|c| to.to_lonlat(c).unwrap_or(Coord::new(f64::NAN, f64::NAN)));
+            let mut valid = true;
+            g.for_each_coord(|c| valid &= c.is_finite() && c.x.abs() <= 180.0 && c.y.abs() <= 90.0);
+            if !valid {
+                return Err(DataError::Format(format!(
+                    "feature {} can't be interpreted in {}; import the original file with a crs override",
+                    f.id,
+                    crs.label()
+                )));
+            }
+            f.geometry = Some(g);
+        }
+    }
+    out.crs = Some(crs);
+    Ok(out)
+}
+
 /// Refuses a system without an EPSG code for a GeoPackage or FlatGeobuf: their readers (RustGIS's
 /// among them) go by the code, and would read the file as longitude/latitude.
 fn check_projected(ext: &str, crs: Crs) -> Result<()> {
@@ -404,7 +435,7 @@ fn projected_bytes(ds: &Dataset, ext: &str, crs: Crs) -> Result<(Vec<u8>, usize)
 /// `.parquet`/`.geoparquet`, `.shp`, `.zip`, `.kml`, `.kmz` or `.gpx`); returns the number of features the
 /// format couldn't hold (FlatGeobuf, KML, GPX and Shapefile hold only features with geometry). A
 /// Shapefile is written as its `.shp`, `.shx`, `.dbf`, `.prj` and `.cpg` files (or zipped, to a
-/// `.zip`).
+/// `.zip`). GeoPackage exports require a new path and never replace an existing file.
 pub fn write_path(ds: &Dataset, path: &Path) -> Result<usize> {
     write_path_in(ds, path, Crs::LonLat)
 }
@@ -440,8 +471,11 @@ pub fn write_path_in(ds: &Dataset, path: &Path, crs: Crs) -> Result<usize> {
                 // The .shp keeps the name given (`Roads.SHP` stays so); the others take its stem.
                 let target = if *e == "shp" { path.to_path_buf() } else { path.with_extension(e) };
                 let tmp = temp_beside(&target)?;
-                written.push((tmp.clone(), target));
-                write_new(&tmp, bytes)
+                let result = write_new(&tmp, bytes);
+                if result.is_ok() {
+                    written.push((tmp, target));
+                }
+                result
             });
             if let Err(e) = staged {
                 for (tmp, _) in &written {
@@ -527,11 +561,13 @@ pub(crate) fn temp_beside(path: &Path) -> std::io::Result<std::path::PathBuf> {
 /// removes it on failure.
 fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
     let res = (|| {
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
         f.write_all(bytes)?;
         f.sync_all()
     })();
+    // Close before removing a failed write, including on Windows.
+    drop(f);
     if res.is_err() {
         let _ = std::fs::remove_file(path);
     }
@@ -612,13 +648,114 @@ pub fn read_geojson(text: &str, name: &str) -> Result<(Dataset, ReadReport)> {
     let mut features = Collector::default();
     match stream_features(text, &mut features) {
         Ok(rest) => match rest.get("type").and_then(Json::as_str) {
-            Some("FeatureCollection") => Ok(features.finish(name)),
+            Some("FeatureCollection") => Ok(features.finish(name, &rest)),
             Some(_) => read_geojson_value(Json::Object(rest), name),
             None => Err(DataError::Format("GeoJSON: missing \"type\"".into())),
         },
         // Not an object, or "features" not an array: read whole, as before.
         Err(_) => read_geojson_value(serde_json::from_str(text).map_err(|e| DataError::Format(format!("GeoJSON: {e}")))?, name),
     }
+}
+
+/// The longest `crs` name looked at; a longer one is reported, not parsed.
+const CRS_NAME_MAX: usize = 256;
+
+/// At most 80 characters of `s`, for a message.
+fn clip(s: &str) -> String {
+    let mut out: String = s.chars().take(80).collect();
+    if out.len() < s.len() {
+        out.push('…');
+    }
+    out
+}
+
+/// The coordinate system a FeatureCollection declares with the legacy (GeoJSON 2008) `crs` member,
+/// `{"type": "name", "properties": {"name": "urn:ogc:def:crs:EPSG::28992"}}`, with the transformer
+/// to longitude/latitude: `None` for longitude/latitude (no member, `null`, `EPSG:4326`, `CRS84`)
+/// and for a declaration that isn't understood, which is said in `messages`: coordinates are then
+/// read as longitude/latitude, but never without saying so.
+///
+/// Only named EPSG codes and CRS84 are honoured (not links, WKT or PROJ strings in the name, nor
+/// codes RustGIS doesn't know). The coordinates are x/y (easting/northing, longitude/latitude)
+/// whatever the axis order of the EPSG definition, as the legacy GeoJSON text says.
+pub(crate) fn declared_crs(root: &Map<String, Json>, messages: &mut Vec<String>) -> Option<(Crs, crate::raster::Transformer)> {
+    let decl = root.get("crs").filter(|v| !v.is_null())?;
+    match legacy_crs(decl) {
+        Ok(found) => found,
+        Err(why) => {
+            let shown = match decl.get("properties").and_then(|p| p.get("name")).and_then(Json::as_str) {
+                Some(name) => format!("\"{}\"", clip(name)),
+                None => match decl.get("type").and_then(Json::as_str) {
+                    Some(kind) => format!("of type \"{}\"", clip(kind)),
+                    None => "of an unknown shape".to_string(),
+                },
+            };
+            messages.push(format!("GeoJSON crs {shown}: {why}; coordinates are read as longitude/latitude"));
+            None
+        }
+    }
+}
+
+fn legacy_crs(decl: &Json) -> std::result::Result<Option<(Crs, crate::raster::Transformer)>, String> {
+    if decl.get("type").and_then(Json::as_str) != Some("name") {
+        return Err("only named coordinate systems are supported".into());
+    }
+    let name = decl.get("properties").and_then(|p| p.get("name")).and_then(Json::as_str).ok_or("it has no properties.name")?;
+    // Only the forms below, anchored (not any text holding "EPSG"), and no other text for
+    // `Crs::parse`, which also takes WKT and PROJ strings (and registers a system for them).
+    if name.len() > CRS_NAME_MAX || !is_epsg_or_crs84_name(name) {
+        return Err("only EPSG codes and CRS84 are supported".into());
+    }
+    let crs = Crs::parse(name)?;
+    if crs == Crs::LonLat {
+        return Ok(None);
+    }
+    let t = crs.transformer()?;
+    Ok(Some((crs, t)))
+}
+
+/// Whether a `crs` name is `EPSG:N`, `urn:ogc:def:crs:EPSG:<version, maybe empty>:N`,
+/// `http(s)://www.opengis.net/def/crs/EPSG/<version>/N`, or CRS84 as `CRS84`, `OGC:CRS84`,
+/// `urn:ogc:def:crs:OGC:<version, maybe empty>:CRS84` or
+/// `http(s)://www.opengis.net/def/crs/OGC/<version>/CRS84` (any case, whitespace around).
+fn is_epsg_or_crs84_name(name: &str) -> bool {
+    let up = name.trim().to_ascii_uppercase();
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let version = |s: &str| s.bytes().all(|b| b.is_ascii_digit() || b == b'.');
+    // `<version><sep><last>`: a version (maybe empty), then what's after the last separator.
+    let tail = |rest: &str, sep: char| {
+        rest.split_once(sep).filter(|(v, last)| version(v) && !last.contains(sep)).map(|(_, last)| last.to_string())
+    };
+    fn url(rest: &str) -> Option<&str> {
+        rest.strip_prefix("HTTP://").or_else(|| rest.strip_prefix("HTTPS://")).and_then(|r| r.strip_prefix("WWW.OPENGIS.NET/DEF/CRS/"))
+    }
+    if let Some(code) = up.strip_prefix("EPSG:") {
+        return digits(code);
+    }
+    if let Some(rest) = up.strip_prefix("URN:OGC:DEF:CRS:EPSG:") {
+        return tail(rest, ':').is_some_and(|c| digits(&c));
+    }
+    if let Some(rest) = up.strip_prefix("URN:OGC:DEF:CRS:OGC:") {
+        return tail(rest, ':').is_some_and(|c| c == "CRS84");
+    }
+    if let Some(rest) = url(&up).and_then(|r| r.strip_prefix("EPSG/")) {
+        return tail(rest, '/').is_some_and(|c| digits(&c));
+    }
+    if let Some(rest) = url(&up).and_then(|r| r.strip_prefix("OGC/")) {
+        return tail(rest, '/').is_some_and(|c| c == "CRS84");
+    }
+    // The shorthands: `CRS84`, `OGC:CRS84`, `OGC::CRS84`, `OGC:1.3:CRS84`.
+    up == "CRS84" || up == "OGC:CRS84" || up.strip_prefix("OGC:").and_then(|rest| tail(rest, ':')).is_some_and(|c| c == "CRS84")
+}
+
+/// A geometry in longitude/latitude from the coordinates `t` converts: `None` when a coordinate
+/// can't be converted or comes out beyond longitude/latitude (a declared system that doesn't match
+/// the coordinates).
+pub(crate) fn geometry_to_lonlat(g: &Geometry, t: &crate::raster::Transformer) -> Option<Geometry> {
+    let mut ok = true;
+    let out = g.map_coords(&|c| t.to_lonlat(c).unwrap_or(Coord::new(f64::NAN, f64::NAN)));
+    out.for_each_coord(|c: Coord| ok &= c.is_finite() && c.x.abs() <= 180.5 && c.y.abs() <= 90.5);
+    ok.then_some(out)
 }
 
 /// What takes a FeatureCollection's features as they're read.
@@ -792,41 +929,73 @@ impl Collector {
         }
     }
 
-    fn finish(self, name: &str) -> (Dataset, ReadReport) {
+    /// The dataset; `root` is the document's top level (for its `crs`, see [`declared_crs`]).
+    fn finish(self, name: &str, root: &Map<String, Json>) -> (Dataset, ReadReport) {
         let mut report = ReadReport { skipped: self.skipped, ..ReadReport::default() };
         let mut ds = Dataset::new(name, GeometryType::None, self.schema.fields());
         ds.features.reserve(self.features.len());
-        for (geom, values) in self.features {
+        if report.skipped > 0 {
+            report.messages.push(format!("{} features had unreadable geometry", report.skipped));
+        }
+        let declared = declared_crs(root, &mut report.messages);
+        let mut unconverted = 0usize;
+        for (n, (geom, values)) in self.features.into_iter().enumerate() {
+            // A feature that can't be converted is dropped, and its id is not reused, as when the
+            // file is read in place.
+            let geom = match (&declared, geom) {
+                (Some((_, t)), Some(g)) => match geometry_to_lonlat(&g, t) {
+                    Some(g) => Some(g),
+                    None => {
+                        unconverted += 1;
+                        continue;
+                    }
+                },
+                (_, g) => g,
+            };
             let mut attrs = vec![Value::Null; ds.fields.len()];
             for (i, v) in values {
                 if let (Some(slot), Some(field)) = (attrs.get_mut(i), ds.fields.get(i)) {
                     *slot = coerce(v, field.ty);
                 }
             }
-            ds.push_next(geom, attrs);
+            ds.features.push(crate::Feature { id: n as u64 + 1, geometry: geom, attrs });
         }
         ds.geometry_type = dominant_type(&ds);
-        if report.skipped > 0 {
-            report.messages.push(format!("{} features had unreadable geometry", report.skipped));
+        if let Some((crs, _)) = &declared {
+            ds.crs = Some(*crs);
+            if unconverted > 0 {
+                report.skipped += unconverted;
+                report.messages.push(format!(
+                    "{unconverted} features couldn't be converted from {} to longitude/latitude and were skipped",
+                    crs.label()
+                ));
+            }
+            // What couldn't be converted can't come back by defining the projection again.
+            ds.crs_incomplete = unconverted > 0;
         }
         (ds, report)
     }
 }
 
-/// Reads a GeoJSON document already parsed: a FeatureCollection, Feature or bare geometry.
+/// Reads a GeoJSON document already parsed: a FeatureCollection, Feature or bare geometry. Only a
+/// FeatureCollection's `crs` is read (a Feature's or a geometry's isn't part of the legacy text).
 fn read_geojson_value(root: Json, name: &str) -> Result<(Dataset, ReadReport)> {
     let mut features = Collector::default();
+    let mut top = Map::new();
     match root.get("type").and_then(Json::as_str) {
         Some("FeatureCollection") => {
             for f in root.get("features").and_then(Json::as_array).into_iter().flatten() {
                 features.add(f);
+            }
+            if let Some(crs) = root.get("crs") {
+                top.insert("crs".to_string(), crs.clone());
             }
         }
         Some("Feature") => features.add(&root),
         Some(_) => features.add(&json!({"type": "Feature", "geometry": &root, "properties": {}})),
         None => return Err(DataError::Format("GeoJSON: missing \"type\"".into())),
     }
-    Ok(features.finish(name))
+    Ok(features.finish(name, &top))
 }
 
 fn json_type(v: &Json) -> Option<FieldType> {
@@ -1303,28 +1472,43 @@ pub fn to_csv(ds: &Dataset) -> Result<String> {
 // ---------------------------------------------------------------------------------------------
 // Shapefile
 
+/// Reads a loose Shapefile using its sidecar CRS, retaining the default reader's behavior.
 fn read_shapefile(path: &Path, name: &str) -> Result<(Dataset, ReadReport)> {
+    read_shapefile_in(path, name, None)
+}
+
+/// Reads a Shapefile with an optional source CRS replacing its `.prj`, before any geometry is
+/// converted. This changes only interpretation; the files on disk are never modified.
+pub fn read_shapefile_in(path: &Path, name: &str, crs: Option<Crs>) -> Result<(Dataset, ReadReport)> {
+    check_size(path)?;
     let dbf = path.with_extension("dbf");
     if !dbf.is_file() {
         return Err(DataError::Format(format!("Shapefile: {} is missing", dbf.display())));
     }
+    check_size(&dbf)?;
     let shx = path.with_extension("shx");
+    if shx.is_file() {
+        check_size(&shx)?;
+    }
+    let mut notes = Vec::new();
     let parts = ShapefileParts {
         shp: std::fs::read(path)?,
         shx: if shx.is_file() { Some(std::fs::read(shx)?) } else { None },
         dbf: std::fs::read(dbf)?,
         prj: crate::raster::read_prj(path),
+        cpg: crate::dbf::read_cpg(path, &mut notes),
     };
-    read_shapefile_parts(parts, name)
+    let (ds, mut report) = read_shapefile_parts(parts, name, crs)?;
+    report.messages.extend(notes);
+    Ok((ds, report))
 }
 
-/// The files of a Shapefile besides its `.shp` that [`gather_shapefiles`] zips with it. The `.cpg`
-/// isn't read (the `.dbf`'s text is decoded without it); it's taken along so it isn't refused on its own.
+/// The files of a Shapefile besides its `.shp` that [`gather_shapefiles`] zips with it.
 const SHAPEFILE_SIDECARS: [&str; 4] = ["dbf", "shx", "prj", "cpg"];
 
 /// Gathers each Shapefile among files given together (several picked at once in the browser, or
 /// dropped at once) into a zip that reads as a zipped Shapefile: a `.shp` with the `.dbf` of the
-/// same base name, ignoring case, and its `.shx`, `.prj` and `.cpg` when they are there (the `.cpg` only so it goes with the rest). The zip,
+/// same base name, ignoring case, and its `.shx`, `.prj` and `.cpg` when they are there. The zip,
 /// named after the `.shp`, takes its place; its parts go. Other files, and a `.shp` without its
 /// `.dbf`, pass through as they came. A Shapefile whose parts are too large to read together (more
 /// than [`MAX_BYTES`], or the zip reader's limit) is left out, and said why in the messages
@@ -1390,6 +1574,18 @@ pub const MAX_ZIP_LAYERS: usize = 32;
 /// [`MAX_ZIP_LAYERS`]. Folders inside are fine; macOS
 /// resource forks (`__MACOSX/`, `._*`) are ignored.
 pub fn read_zip(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>> {
+    read_zip_in(file_name, bytes, None)
+}
+
+/// Reads a ZIP, optionally overriding the source CRS of every Shapefile in it. Other formats
+/// retain their own coordinate systems. The override is applied before reading any shapes.
+pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Vec<(Dataset, ReadReport)>> {
+    if bytes.len() as u64 > MAX_BYTES {
+        return Err(DataError::Format(format!("file is too large ({} bytes)", bytes.len())));
+    }
+    if let Some(c) = crs {
+        c.transformer().map_err(DataError::Format)?;
+    }
     let lower = |n: &str| n.to_ascii_lowercase();
     let is_fork = |n: &str| n.split('/').any(|part| part == "__MACOSX" || part.starts_with("._"));
     let ext_of = |n: &str| Path::new(n).extension().and_then(|e| e.to_str()).map(lower).unwrap_or_default();
@@ -1398,7 +1594,7 @@ pub fn read_zip(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadRepor
     let wanted = |n: &str| {
         let e = ext_of(n);
         !is_fork(n)
-            && (matches!(e.as_str(), "shp" | "shx" | "dbf" | "prj" | "mid")
+            && (matches!(e.as_str(), "shp" | "shx" | "dbf" | "prj" | "cpg" | "mid")
                 || (e == "pbf" && lower(n).ends_with(".osm.pbf"))
                 || (!matches!(e.as_str(), "zip" | "txt" | "pbf") && READ_EXTENSIONS.contains(&e.as_str())))
     };
@@ -1424,11 +1620,12 @@ pub fn read_zip(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadRepor
         let shp = take(&mut entries, &base, "shp").map(|(_, b)| b).unwrap_or_default();
         let shx = take(&mut entries, &base, "shx").map(|(_, b)| b);
         let prj = take(&mut entries, &base, "prj").map(|(_, b)| String::from_utf8_lossy(&b).into_owned());
+        let cpg = take(&mut entries, &base, "cpg").map(|(_, b)| b);
         let Some((_, dbf)) = take(&mut entries, &base, "dbf") else {
             skipped.push(format!("{n} (no .dbf beside it)"));
             continue;
         };
-        match read_shapefile_parts(ShapefileParts { shp, shx, dbf, prj }, &name) {
+        match read_shapefile_parts(ShapefileParts { shp, shx, dbf, prj, cpg }, &name, crs) {
             Ok(mut read) => {
                 read.0.source = Some(format!("{file_name}/{n}"));
                 out.push(read);
@@ -1455,8 +1652,11 @@ pub fn read_zip(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadRepor
             Err(e) => skipped.push(format!("{n} ({e})")),
         }
     }
-    let mut others: Vec<(String, Vec<u8>)> =
-        entries.into_iter().flatten().filter(|(n, _)| !matches!(ext_of(n).as_str(), "shp" | "shx" | "dbf" | "prj" | "mid")).collect();
+    let mut others: Vec<(String, Vec<u8>)> = entries
+        .into_iter()
+        .flatten()
+        .filter(|(n, _)| !matches!(ext_of(n).as_str(), "shp" | "shx" | "dbf" | "prj" | "cpg" | "mid"))
+        .collect();
     others.sort_by(|a, b| a.0.cmp(&b.0));
     for (n, b) in others {
         if out.len() >= MAX_ZIP_LAYERS {
@@ -1490,14 +1690,22 @@ struct ShapefileParts {
     shx: Option<Vec<u8>>,
     dbf: Vec<u8>,
     prj: Option<String>,
+    cpg: Option<Vec<u8>>,
 }
 
-fn read_shapefile_parts(parts: ShapefileParts, name: &str) -> Result<(Dataset, ReadReport)> {
+/// Decodes attributes and shapes together, tracking geometry lost during CRS conversion so
+/// a later projection definition cannot silently repair an incomplete layer.
+fn read_shapefile_parts(parts: ShapefileParts, name: &str, crs: Option<Crs>) -> Result<(Dataset, ReadReport)> {
     use shapefile::Shape;
     use shapefile::dbase::FieldValue;
     use std::io::Cursor;
     let fmt = |e: shapefile::Error| DataError::Format(format!("Shapefile: {e}"));
-    let dbf = shapefile::dbase::Reader::new(Cursor::new(parts.dbf)).map_err(|e| DataError::Format(format!("Shapefile: the .dbf: {e}")))?;
+    let mut encoding_notes = Vec::new();
+    let encoding = crate::dbf::encoding(parts.cpg.as_deref(), parts.dbf.get(29).copied().unwrap_or(0), &mut encoding_notes);
+    let dbf = shapefile::dbase::ReaderBuilder::new()
+        .with_encoding(encoding.decoder())
+        .build(Cursor::new(parts.dbf))
+        .map_err(|e| DataError::Format(format!("Shapefile: the .dbf: {e}")))?;
     // Field order comes from the .dbf header (records are unordered maps).
     let order: Vec<(String, FieldType)> = dbf
         .fields()
@@ -1523,11 +1731,19 @@ fn read_shapefile_parts(parts: ShapefileParts, name: &str) -> Result<(Dataset, R
     let fields: Vec<Field> = order.iter().map(|(n, t)| Field::new(n.clone(), *t)).collect();
     let mut ds = Dataset::new(name, GeometryType::None, fields);
     let mut report = ReadReport::default();
-    let to_lonlat = shapefile_crs(parts.prj.as_deref(), &mut report).map(|(crs, t)| {
-        ds.crs = Some(crs);
-        t
-    });
+    report.messages.extend(encoding_notes);
+    let to_lonlat = match crs {
+        Some(c) => {
+            ds.crs = Some(c);
+            Some(c.transformer().map_err(DataError::Format)?)
+        }
+        None => shapefile_crs(parts.prj.as_deref(), &mut report).map(|(crs, t)| {
+            ds.crs = Some(crs);
+            t
+        }),
+    };
     let (mut converted, mut unconverted) = (0usize, 0usize);
+    let mut source_kind = GeometryType::None;
     let pt = |x: f64, y: f64| Coord::new(x, y);
     for item in reader.iter_shapes_and_records() {
         let Ok((shape, record)) = item else {
@@ -1559,6 +1775,11 @@ fn read_shapefile_parts(parts: ShapefileParts, name: &str) -> Result<(Dataset, R
                 continue;
             }
         };
+        if source_kind == GeometryType::None
+            && let Some(g) = &geom
+        {
+            source_kind = g.kind();
+        }
         let geom = match (&to_lonlat, geom) {
             (Some(t), Some(g)) => {
                 let mut ok = true;
@@ -1589,6 +1810,11 @@ fn read_shapefile_parts(parts: ShapefileParts, name: &str) -> Result<(Dataset, R
         ds.push_next(geom, attrs);
     }
     ds.geometry_type = dominant_type(&ds);
+    // A bad .prj must not turn a spatial layer into an attribute-only table and hide the
+    // conversion warning. Its shapes can be recovered by importing with an override.
+    if ds.geometry_type == GeometryType::None && unconverted > 0 {
+        ds.geometry_type = source_kind;
+    }
     integral_numeric_to_integer(&mut ds);
     let e = ds.extent();
     if !e.is_empty() && (e.min_x < -180.5 || e.max_x > 180.5 || e.min_y < -90.5 || e.max_y > 90.5) {
@@ -1597,6 +1823,7 @@ fn read_shapefile_parts(parts: ShapefileParts, name: &str) -> Result<(Dataset, R
     if report.skipped > 0 {
         report.messages.push(format!("{} shapes were unreadable or unsupported", report.skipped));
     }
+    ds.crs_incomplete = unconverted > 0;
     if unconverted > 0 && converted == 0 {
         report.messages.push("no shape could be converted to longitude/latitude: the .prj doesn't seem to match the coordinates".into());
     } else if unconverted > 0 {
@@ -1866,6 +2093,145 @@ pub(crate) fn group_rings(rings: Vec<(Vec<Coord>, bool)>) -> Geometry {
 mod tests {
     use super::*;
 
+    /// Exercises caller cleanup through the public Shapefile writer, one fresh process per collision.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn shapefile_staging_collisions_preserve_existing_entries() -> std::io::Result<()> {
+        let (original, _) =
+            read_geojson(r#"{"type":"Feature","properties":{"name":"old"},"geometry":{"type":"Point","coordinates":[1,2]}}"#, "roads")
+                .map_err(std::io::Error::other)?;
+        let (parts, _) = shapefile_parts(&original).map_err(std::io::Error::other)?;
+        const CHILD: &str = "RUSTGIS_SHAPEFILE_STAGING_COLLISION";
+        let Ok(case) = std::env::var(CHILD) else {
+            let kinds: &[&str] = if cfg!(unix) { &["file", "live", "dangling"] } else { &["file"] };
+            for index in 0..parts.len() {
+                for kind in kinds {
+                    let output = std::process::Command::new(std::env::current_exe()?)
+                        .args([
+                            "--exact",
+                            "io::tests::shapefile_staging_collisions_preserve_existing_entries",
+                            "--nocapture",
+                            "--test-threads=1",
+                        ])
+                        .env(CHILD, format!("{index}:{kind}"))
+                        .output()?;
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    assert!(
+                        output.status.success()
+                            && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;")
+                            && stdout.contains(&format!("collision case completed: {index}:{kind}")),
+                        "part={index} kind={kind}: {}{}",
+                        stdout,
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+            println!("collision scenarios: {}", parts.len() * kinds.len());
+            return Ok(());
+        };
+        let (index, kind) = case.split_once(':').ok_or_else(|| std::io::Error::other("missing collision case"))?;
+        let index = index.parse::<usize>().map_err(std::io::Error::other)?;
+        if !matches!(kind, "file" | "live" | "dangling") {
+            return Err(std::io::Error::other("unknown collision kind"));
+        }
+        let workspace = tempfile::Builder::new().prefix("rustgis-shp-collision-").tempdir()?;
+        let root = workspace.path();
+        let path = root.join("roads.SHP");
+        let destination = |extension: &str| if extension == "shp" { path.clone() } else { path.with_extension(extension) };
+        for (extension, bytes) in &parts {
+            std::fs::write(destination(extension), bytes)?;
+        }
+        let (extension, _) = parts.get(index).ok_or_else(|| std::io::Error::other("collision part out of range"))?;
+        let target = destination(extension);
+        // This child runs only this test: write_path's first staging counter is zero.
+        let mut name = std::ffi::OsString::from(".");
+        name.push(target.file_name().ok_or_else(|| std::io::Error::other("missing part name"))?);
+        name.push(format!(".{}.{index}.tmp", std::process::id()));
+        let collision = target.with_file_name(name);
+        #[cfg(unix)]
+        let link_target = root.join("link-target");
+        if kind == "file" {
+            std::fs::write(&collision, b"unrelated entry")?;
+        }
+        #[cfg(unix)]
+        if kind != "file" {
+            if kind == "live" {
+                std::fs::write(&link_target, b"unrelated target")?;
+            }
+            std::os::unix::fs::symlink(&link_target, &collision)?;
+        }
+        let (replacement, _) =
+            read_geojson(r#"{"type":"Feature","properties":{"name":"new"},"geometry":{"type":"Point","coordinates":[3,4]}}"#, "roads")
+                .map_err(std::io::Error::other)?;
+        let result = write_path(&replacement, &path);
+        assert!(matches!(&result, Err(DataError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists), "{result:?}");
+        if kind == "file" {
+            assert_eq!(std::fs::read(&collision)?, b"unrelated entry");
+        }
+        #[cfg(unix)]
+        if kind != "file" {
+            assert_eq!(std::fs::read_link(&collision)?, link_target);
+            if kind == "live" {
+                assert_eq!(std::fs::read(&link_target)?, b"unrelated target");
+            } else {
+                assert!(!link_target.exists());
+            }
+        }
+        for (extension, bytes) in &parts {
+            assert_eq!(&std::fs::read(destination(extension))?, bytes, "original {extension} changed");
+        }
+        assert_eq!(std::fs::read_dir(root)?.count(), parts.len() + 1 + usize::from(kind == "live"), "owned staging files were not cleaned");
+        std::fs::remove_file(collision)?;
+        assert_eq!(write_path(&replacement, &path).map_err(std::io::Error::other)?, 0);
+        for (extension, bytes) in shapefile_parts(&replacement).map_err(std::io::Error::other)?.0 {
+            assert_eq!(std::fs::read(destination(extension))?, bytes, "retry changed {extension}");
+        }
+        workspace.close()?;
+        println!("collision case completed: {case}");
+        Ok(())
+    }
+
+    #[test]
+    fn staging_collision_preserves_the_existing_file() -> std::io::Result<()> {
+        let path = temp_beside(&std::env::temp_dir().join("rustgis-staging-collision"))?;
+        write_new(&path, b"unrelated existing file")?;
+        let error = write_new(&path, b"must not replace").err().ok_or_else(|| std::io::Error::other("collision succeeded"))?;
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path)?, b"unrelated existing file");
+        std::fs::remove_file(path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_collision_preserves_symlinks_and_their_targets() -> std::io::Result<()> {
+        let target = temp_beside(&std::env::temp_dir().join("rustgis-staging-target"))?;
+        let link = temp_beside(&target)?;
+        write_new(&target, b"unrelated target")?;
+        std::os::unix::fs::symlink(&target, &link)?;
+        assert!(write_new(&link, b"must not follow").is_err());
+        assert_eq!(std::fs::read_link(&link)?, target);
+        assert_eq!(std::fs::read(&target)?, b"unrelated target");
+        std::fs::remove_file(&target)?;
+        assert!(write_new(&link, b"must not replace dangling link").is_err());
+        assert_eq!(std::fs::read_link(&link)?, target);
+        assert!(!target.exists());
+        std::fs::remove_file(link)
+    }
+
+    #[test]
+    fn write_atomic_failed_install_preserves_destination_and_removes_staging() -> std::io::Result<()> {
+        let root = temp_beside(&std::env::temp_dir().join("rustgis-atomic-failed-install"))?;
+        std::fs::create_dir(&root)?;
+        let destination = root.join("occupied");
+        std::fs::create_dir(&destination)?;
+        let marker = destination.join("keep.txt");
+        std::fs::write(&marker, b"keep destination contents")?;
+        assert!(write_atomic(&destination, b"must not replace directory").is_err());
+        assert_eq!(std::fs::read(marker)?, b"keep destination contents");
+        assert_eq!(std::fs::read_dir(&root)?.count(), 1, "failed install left a staging file");
+        std::fs::remove_dir_all(root)
+    }
+
     #[test]
     fn topojson_named_json_from_disk() {
         let topo = r#"{"type":"Topology","objects":{"pts":{"type":"GeometryCollection","geometries":[{"type":"Point","coordinates":[5,6]}]},"more":{"type":"GeometryCollection","geometries":[{"type":"Point","coordinates":[1,2]}]}},"arcs":[]}"#;
@@ -2112,6 +2478,22 @@ mod tests {
         for t in ["", "{", "[]", "{\"type\":5}", "{\"type\":\"FeatureCollection\",\"features\":7}"] {
             let _ = read_geojson(t, "x");
         }
+        // A `crs` of any shape, anywhere in the document: read, never a panic.
+        let deep = "[".repeat(5000) + &"]".repeat(5000);
+        for crs in
+            ["null", "7", "-1e308", "\"\"", "[]", "{}", "{\"type\":\"name\"}", "{\"type\":\"name\",\"properties\":{\"name\":{}}}", &deep]
+        {
+            for t in [
+                format!(
+                    "{{\"crs\":{crs},\"type\":\"FeatureCollection\",\"features\":[{{\"type\":\"Feature\",\"geometry\":{{\"type\":\"Point\",\"coordinates\":[1,2]}}}}]}}"
+                ),
+                format!("{{\"type\":\"FeatureCollection\",\"features\":7,\"crs\":{crs}}}"),
+                format!("{{\"type\":\"Feature\",\"crs\":{crs},\"geometry\":null}}"),
+                format!("{{\"type\":\"Point\",\"coordinates\":[1,2],\"crs\":{crs}}}"),
+            ] {
+                let _ = read_geojson(&t, "x");
+            }
+        }
     }
 
     #[test]
@@ -2164,6 +2546,27 @@ mod tests {
         assert!(rep.messages.iter().any(|m| m.contains("not longitude/latitude")), "{:?}", rep.messages);
         std::fs::remove_dir_all(&dir).ok();
     }
+    /// An ESRI .prj without an authority retains the national datum shift (issue #807).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn shapefile_esri_national_datum() {
+        use shapefile::dbase::{Record, TableWriterBuilder};
+        let dir = tempfile::tempdir().unwrap();
+        let shp = dir.path().join("milan.shp");
+        {
+            let mut writer = shapefile::Writer::from_path(&shp, TableWriterBuilder::new()).unwrap();
+            writer
+                .write_shape_and_record(&shapefile::Point::new(1_514_881.490_594_152, 5_034_556.812_441_661), &Record::default())
+                .unwrap();
+        }
+        let row = include_str!("raster/esri_datum_corpus.tsv").lines().find(|l| l.starts_with("3003\t")).unwrap();
+        std::fs::write(shp.with_extension("prj"), row.split('\t').nth(5).unwrap()).unwrap();
+        let (ds, report) = read_path(&shp).unwrap();
+        let c = ds.features[0].geometry.as_ref().and_then(Geometry::label_point).unwrap();
+        assert!((c.x - 9.19).abs() < 1e-7 && (c.y - 45.4642).abs() < 1e-7, "{c:?}");
+        assert!(report.messages.is_empty(), "{:?}", report.messages);
+    }
+
     /// Zipped Shapefiles are read from memory (the web app's way to open them), with their `.prj`,
     /// from folders inside the archive, beside other vector files; truncations are errors.
     #[test]

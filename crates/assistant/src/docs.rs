@@ -27,6 +27,7 @@ pub const PAGES: &[Page] = pages![
     "user-guide/data.md",
     "user-guide/web-data.md",
     "user-guide/data-formats.md",
+    "user-guide/shapefile-encoding.md",
     "user-guide/maps.md",
     "user-guide/cartography.md",
     "user-guide/editing.md",
@@ -46,6 +47,7 @@ pub const PAGES: &[Page] = pages![
     "architecture.md",
     "contributing.md",
     "acknowledgements.md",
+    "citation.md",
     "sponsor.md",
     "privacy.md",
 ];

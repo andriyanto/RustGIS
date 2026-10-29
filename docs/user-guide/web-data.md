@@ -1,11 +1,13 @@
 # Web Data
 
-**Home › Web Data** gathers public web services and catalogs: the ones that cover the whole world
+**Home › Add › Web Data** gathers public web services and catalogs: the ones that cover the whole world
 in one alphabetical list, and those that cover one country in a submenu named after it. Each
 opens in the Web Data pane on the right, beside the map it searches. Unless a section says
-otherwise, they work in the web app too: their documents and tiles are fetched like any other.
-They reach the network, so the [AI Assistant](assistant.md) asks before it runs their commands,
-and plugins need the network permission. `ui.dialog` opens a panel on a search with `"search"`
+otherwise, the panes work in the web app too, provided the servers allow browser requests
+(CORS). The command-line examples below are for the desktop CLI; many network commands cannot
+fetch synchronously in the browser, where the panes fetch in the background instead.
+Commands that reach the network need the [AI Assistant](assistant.md)'s approval when it runs
+them, and the network permission when a plugin does. `ui.dialog` opens a panel on a search with `"search"`
 (`{"name": "nasaEarthdata", "search": "sea surface temperature"}`).
 
 | Entry | What it gives | Section |
@@ -40,31 +42,34 @@ Data added by its address, from a web server or an S3 bucket, is described in
 
 ## STAC catalogs
 
-**Home › Web Data › STAC Search…** searches a [STAC](https://stacspec.org) API for imagery and
+**Home › Add › Web Data › STAC Search…** searches a [STAC](https://stacspec.org) API for imagery and
 other assets: by collection, dates, the most cloud cover and (by default) where the map is. The
-default API is Element 84's [Earth Search](https://earth-search.aws.element84.com/v1)
-(Sentinel-2, Landsat, NAIP, Copernicus DEM and Sentinel-1 on AWS); Microsoft's [Planetary
-Computer](https://planetarycomputer.microsoft.com/api/stac/v1) is offered beside it, and any
-STAC API with item search works. **Collections** lists what the API offers, and **Find Items** shows up to 50 items as cards
+default API is Element 84's [Earth Search](https://earth-search.aws.element84.com/v1);
+Microsoft's [Planetary Computer](https://planetarycomputer.microsoft.com/api/stac/v1) is offered
+beside it, and other APIs with GET item search work. **Collections** lists what the API offers,
+and **Find Items** shows up to 50 items as cards
 (with "Showing 50 of 1234 items" when the API says how many match) and draws their footprints as
 a layer. Each card has the item's preview picture when it has one, its id, a collection · date ·
 cloud cover line, and **Zoom** (to the item), the asset to add, **Add** and **Details** (the item's
 properties). The asset chosen at first is `visual` (true colour) when there is one, else the first
-GeoTIFF, else the first point cloud, else the first data asset. A cloud-optimised GeoTIFF is read in place, the tiles each view needs by range
-(see [Files on the web](data-formats.md#files-on-the-web)); other assets download whole.
+GeoTIFF, else the first point cloud, else the first data asset, preferring HTTP(S) assets.
+Cloud-optimised GeoTIFF, GeoParquet and FlatGeobuf assets are read in place, and PMTiles a tile
+at a time; other assets download whole (see [Files on the web](data-formats.md#files-on-the-web)).
 
 The commands do the same: `stac.collections` (`"url"`), `stac.search` (`"collections"`,
 `"bbox"` as `[west, south, east, north]` or `"view"`, `"datetime"` such as
-`2024-06-01/2024-06-30`, `"limit"`, `"maxCloud"`, `"footprints"`, and `"properties": true` for
-every property of each item rather than its date and cloud cover), and `stac.addAsset` with
-an item `stac.search` returned (`"item"`) or an item's address (`"url"`) and `"asset"`:
+`2024-06-01/2024-06-30`, `"limit"` from 1 to 200, default 10, `"maxCloud"`, `"footprints"`, and
+`"properties": true` for the scalar item properties rather than just date and cloud cover),
+and `stac.addAsset` with an item returned by `stac.search` (`"item"`) or an item's address
+(`"url"`) and `"asset"`. API searches return one page and a `"next"` address when there is another:
 
 ```sh
-rustgis-cli run --cmd 'stac.search={"collections":"sentinel-2-l2a","bbox":[7.4,46.9,7.5,47],"datetime":"2024-07-01/2024-07-31","maxCloud":20}' --cmd 'stac.addAsset={"url":"https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a/items/S2B_32TLS_20240727_0_L2A","asset":"scl"}'
+rustgis-cli run --cmd 'stac.search={"collections":"sentinel-2-c1-l2a","bbox":[7.4,46.9,7.5,47],"datetime":"2024-07-01/2024-07-31","maxCloud":20}' --cmd 'stac.addAsset={"url":"https://earth-search.aws.element84.com/v1/collections/sentinel-2-c1-l2a/items/S2B_T32TLS_20240727T103439_L2A","asset":"scl"}'
 ```
 
-Assets are added by their web address: one in a cloud store's own protocol (`s3://`) is refused
-with a message saying so, and an item on the web can't point into the local network. A Planetary
+Assets can use HTTP(S) or `s3://` addresses. S3 assets use the saved connection serving their
+bucket, or anonymous AWS access when none matches; see [S3 buckets](data.md#s3-buckets).
+An item on the web can't point into the local network. A Planetary
 Computer asset (in Azure Blob Storage) is signed first: RustGIS asks the Planetary Computer's
 token service for its storage container's token and reuses it for half an hour. The token is part
 of the layer's address, so a project saved with one reads it again only while the token lasts
@@ -90,12 +95,105 @@ and band, such as INPE's [Brazil Data Cube](https://data.inpe.br/bdc/) or Sentin
   scale and offset turn it into the files' stored values. Without one, each file is stretched on
   its own, between its 2nd and 98th percentiles.
 - **Saved with the project:** each tile's dates and addresses.
-- **Web app:** a server that doesn't allow the browser to fetch its files (CORS), as the Brazil Data
-  Cube's doesn't, works on the desktop only.
+- **Files in public buckets:** a collection whose items give their files as `s3://` addresses
+  (Digital Earth Australia, Digital Earth Africa, the Copernicus DEM on Earth Search) is read
+  from AWS at the files' web addresses. Reads are anonymous unless an S3 connection explicitly
+  names the bucket, in which case its credentials are used, as for other S3 reads. A
+  bucket in a region AWS's global endpoint doesn't reach (Digital Earth Africa's, in Cape Town) is
+  read at its own region's, found by reading one byte of its first file. Without a matching
+  connection, a bucket that refuses anonymous reads (a private one, or one that charges the
+  reader, as Landsat's does) is refused, naming it.
+- **Web app:** creating a cube with **Add as Time Series** is desktop-only. Saved cube tile
+  layers can draw in the web app when their servers allow browser requests (CORS).
+- **Its trend:** the same search, given to Trend Analysis (`cube.trend` with `collection`,
+  `asset`, `bbox`, `start` and `end`), reads the values over the area and works out each cell's
+  trend: see [Trend analysis](analysis.md#trend-analysis).
 
 ```sh
 rustgis-cli run --cmd 'stac.addCube={"url":"https://data.inpe.br/bdc/stac/v1","collection":"S2-16D-2","asset":"NDVI","bbox":[-55.9,-12.6,-55.5,-12.35],"start":"2024-08-01","end":"2025-06-30","range":[0,0.9]}' --cmd 'time.export={"path":"ndvi.gif"}'
 ```
+
+### A catalog of data cubes
+
+A data cube needs more than an API's address: the right collection and band, and often a range
+to show it with and a cell size to read it at. The catalog of data cubes lists cubes ready to
+open, each with those filled in, so none of them has to be looked up in a provider's catalog.
+
+**Home › Add › Web Data › Data Cubes** lists them, filtered by theme, by words, and (ticked to
+begin with) to those with data where the map is. Each shows its provider, period, step,
+resolution, source and licence, with a link to the provider's page, and two buttons:
+
+- **Add to Time Slider** (desktop) adds it as `cube.open` does (below): a STAC cube where the map
+  is, a Zarr cube whole. It is added over the period typed in **From** and **To**, or its last
+  full calendar year when both are empty.
+- **Trend Analysis…** (desktop) opens Trend Analysis on it, with the period typed: a STAC cube is
+  read where the map is, a Zarr cube whole, and **Use layers instead** goes back to the map's
+  layers. A trend over a cube needs its period.
+
+The list is kept up to date between releases with the app's other assets, so a cube can be added,
+or an address fixed, without a new version: the app reads it the first time the pane opens, and
+uses the copy built into it until then, offline, or when the list doesn't read whole. Commands,
+scripts and the assistant use the same list.
+
+- **Finding a cube** (`cube.catalog`): by `"theme"` (vegetation, land cover, water, climate, ocean,
+  atmosphere or elevation), by area (`"bbox"`, or `"view"`: the entries with data there; with
+  neither, anywhere) and by words in the name, provider or id (`"query"`). Each entry gives its
+  provider, themes, area, period, step, resolution, source and licence, with a link to the
+  provider's page.
+- **Opening one** (desktop; `cube.open` with the entry's `"id"`): a STAC entry is added as
+  `stac.addCube` adds a cube, over the map's extent (or `"bbox"`), with the entry's collection,
+  band, range and cloud cover cap (`"range"` and `"maxCloud"` override the last two). A Zarr entry
+  is added as `layer.addZarr` adds a variable that follows the time slider; its variable is read
+  whole, but an area given must meet the entry's. The period is `"start"` and `"end"`, given together; with neither, it
+  is the entry's last full calendar year (the year before this one while the cube is kept up to
+  date). An end given as a day, a month or a year takes all of it, so an hourly variable's last day
+  is read whole. An area the entry has no data in, or a period outside its dates, is refused,
+  naming them. **Undo** takes the whole cube away.
+- **Its trend or summary:** Trend Analysis and the summary over time take an entry too
+  (`cube.trend` or `cube.reduce` with `"cube"`), filling in the collection's API, band, cell size
+  and cloud cap (a `"cellSize"` or `"maxCloud"` given is kept), or the Zarr store and variable.
+  Data named alongside it (`layer`, `url`, `collection`…) is refused, since the entry would take its
+  place.
+
+The entries, all public and read in place:
+
+| Provider | Cubes |
+|---|---|
+| [Brazil Data Cube](https://data.inpe.br/bdc/) (INPE) | MODIS NDVI and EVI (MOD13Q1 v6.1, 232 m, from 2000); the 16-day NDVI cubes of Sentinel-2 (10 m, from 2017), Landsat (30 m) and CBERS-4 WFI (64 m, from 2016) |
+| [Earth Search](https://element84.com/earth-search/) (Element 84) | Sentinel-2 L2A Collection 1 scenes' red and near-infrared bands (10 m, from 2015), searched with at most 20% cloud cover; the Copernicus DEM GLO-30 (one date) |
+| [Digital Earth Australia](https://www.dea.ga.gov.au/) and [Digital Earth Africa](https://www.digitalearthafrica.org/) | the yearly frequency of water seen by Landsat (30 m, from 1986 and 1984) |
+| [ARCO-ERA5](https://cloud.google.com/storage/docs/public-datasets/era5) (Google Cloud, ECMWF) | hourly air temperature at 2 m, total precipitation and top-layer soil moisture (0.25°, from 1940), as a Zarr store the desktop reads |
+
+Only cubes RustGIS reads today are listed. Collections whose files sit behind signed addresses
+(Planetary Computer), need a sign-in (Copernicus Data Space, NASA Earthdata) or charge the reader
+(Landsat Collection 2 on Earth Search) are left out. Digital Earth Australia's catalog sits behind
+a firewall that may ask a program making many requests in a row for a browser check for a while;
+its searches then fail until it lets them through again.
+
+An entry, as the list holds it (built in from `crates/tiles/src/cubes.json`, and kept with the app's
+assets); a cube is proposed by adding one:
+
+```json
+{"id": "bdc-mod13q1-ndvi", "name": "MODIS NDVI, 16-day composites (MOD13Q1 v6.1)",
+ "provider": "Brazil Data Cube (INPE)", "theme": ["vegetation"], "bbox": [-100, -60, -21.3, 20],
+ "start": "2000-02-18", "end": null, "step": "16 days", "resolution": "232 m",
+ "format": "stac", "url": "https://data.inpe.br/bdc/stac/v1/", "collection": "mod13q1-6.1",
+ "asset": "NDVI", "range": [0, 0.9], "cellSize": 232,
+ "license": "NASA LP DAAC: no restrictions on use", "about": "https://data.inpe.br/bdc/"}
+```
+
+A Zarr entry has `"format": "zarr"` and `"variable"` in place of `"collection"` and `"asset"`, and
+no `"range"`, `"cellSize"` or `"maxCloud"`. `"end"` is `null` while a cube is kept up to date. Every
+address is a web address (https or http), the dates are `YYYY-MM-DD`, and each id is in the list
+once; the list is checked when it is read.
+
+```sh
+rustgis-cli run --cmd 'cube.catalog={"theme":"vegetation","bbox":[-43,-6,-42.5,-5.5]}' --cmd 'cube.open={"id":"bdc-mod13q1-ndvi","bbox":[-43,-6,-42.5,-5.5]}'
+```
+
+### Saved connections
+
+Once you have a STAC connection (Data Sources › Connections), its name appears in the API list at the top of STAC Search below the built-in APIs: picking it fills in the address and clears the collections and items of the previous one. Add From Service, Add From Database and S3 Buckets have the same **Saved connection** list for their kinds. An API you typed in by hand stays usable; once its collections are listed, **Save as Connection** keeps it under Data Sources › Connections (nothing is saved unless you click it, and never a password or key). Editing the address by hand drops the collections and items listed for the old one.
 
 ### Static catalogs
 
@@ -118,7 +216,7 @@ time.
 address), and `stac.search` walks one, with `"phase"` (`"pre"` or `"post"`) for catalogs of events:
 
 ```sh
-rustgis-cli run --cmd 'stac.search={"url":"https://vantor-opendata.s3.amazonaws.com/events/Mexico-Hurricane-Simon-Oct-2026/collection.json","phase":"post"}'
+rustgis-cli run --cmd 'stac.search={"url":"https://vantor-opendata.s3.amazonaws.com/events/catalog.json","phase":"post"}'
 ```
 
 The services below are STAC Search opened on one API or catalog, with the dialog titled after
@@ -128,7 +226,7 @@ start from), `"phase"` and `"search": true` (find items at once).
 
 ### Planet Open Data
 
-**Home › Web Data › Planet Open Data…** browses Planet's [disaster data
+**Home › Add › Web Data › Planet Open Data…** browses Planet's [disaster data
 releases](https://source.coop/planet/disasterdata) on Source Cooperative: imagery of earthquakes,
 floods, fires and storms from PlanetScope, SkySat and Pelican, before and after the event, licensed
 CC BY-NC 4.0. Pick an event (and, below it, its pre-event or post-event imagery or one collection),
@@ -136,7 +234,7 @@ then **Find Items**; **Add** adds a scene's `visual` image.
 
 ### Portolan
 
-**Home › Web Data › Portolan…** opens the [Portolan
+**Home › Add › Web Data › Portolan…** opens the [Portolan
 registry](https://github.com/portolan-sdi/portolan-registry), a catalog of the open data catalogs
 published with Portolan (cities, regions and agencies, most in Europe). Pick a publisher's catalog,
 then a theme or collection, then **Find Items**: each collection's files (GeoParquet, PMTiles and
@@ -149,7 +247,7 @@ others) are listed, and **Add** adds the one chosen (`visual` first, often a PMT
   <figcaption>The Sentinel-2 Explorer: the clearest recent scenes where the map is, with their footprints.</figcaption>
 </figure>
 
-**Home › Web Data › Sentinel-2 Explorer…** searches Earth Search's Sentinel-2 Collection 1 Level-2A
+**Home › Add › Web Data › Sentinel-2 Explorer…** searches Earth Search's Sentinel-2 Collection 1 Level-2A
 scenes (`sentinel-2-c1-l2a`) where the map is, over the last 90 days and with at most 20 % cloud
 cover, clearest first (sorted by cloud cover). **Add** adds the true colour image (`visual`);
 the asset list beside each scene offers its bands (`red`, `nir`, `swir16`, `scl`…), each a
@@ -158,14 +256,14 @@ cloud-optimised GeoTIFF read in place. `stac.search` sorts with `"sortby"`
 
 ### Vantor
 
-**Home › Web Data › Vantor…** browses [Vantor](https://vantor.com)'s open data (formerly Maxar's
+**Home › Add › Web Data › Vantor…** browses [Vantor](https://vantor.com)'s open data (formerly Maxar's
 Open Data program): very high resolution imagery of disasters, one collection per event. Pick an
 event and a phase (before or after the event), then **Find Items**; **Add** adds a scene's
 `visual` cloud-optimised GeoTIFF.
 
 ### USGS LiDAR
 
-**Home › Web Data › United States › USGS LiDAR…** searches the USGS 3D Elevation Program's LiDAR
+**Home › Add › Web Data › United States › USGS LiDAR…** searches the USGS 3D Elevation Program's LiDAR
 point clouds on the Planetary Computer (`3dep-lidar-copc`) where the map is: zoom to a town first.
 Each tile's `data` asset is a COPC file, signed with the Planetary Computer's token and added as a
 LiDAR point cloud (an evenly spread sample of its points, see [Formats](data.md#formats)). A tile is
@@ -173,7 +271,7 @@ downloaded whole, often tens of megabytes, so adding one takes a while.
 
 ## Overture Maps
 
-**Home › Web Data › Overture Maps…** adds [Overture Maps](https://overturemaps.org)' open data:
+**Home › Add › Web Data › Overture Maps…** adds [Overture Maps](https://overturemaps.org)' open data:
 buildings, places, transportation (segments and connectors), administrative divisions, base
 layers (land use, land, land cover, water, infrastructure, bathymetry) and addresses, from the
 latest release (or one named with `"release"`). Two ways:
@@ -184,8 +282,8 @@ latest release (or one named with `"release"`). Two ways:
   GeoParquet by address (see [Files on the web](data-formats.md#files-on-the-web)), and each
   becomes a layer read a view at a time. Zoom to a city or smaller: a view that takes more than six
   files is refused (a country takes dozens).
-- **Map tiles of the whole world**, from the theme's PMTiles archive: every zoom, drawn a layer per
-  type. Some themes' tiles hold their features only when zoomed in (places from zoom 14).
+- **Map tiles of the whole world**, from the theme's PMTiles archive, drawn a layer per type.
+  Some themes' tiles hold their features only when zoomed in (places from zoom 14).
 
 `overture.add` does the same (`"theme"`, `"type"`, `"bbox"` or the view, `"tiles": true` for the
 tiles):
@@ -199,17 +297,18 @@ places); the layer says which.
 
 ## Source Cooperative
 
-**Home › Web Data › Source Cooperative…** lists [Source Cooperative](https://source.coop)'s
+**Home › Add › Web Data › Source Cooperative…** lists [Source Cooperative](https://source.coop)'s
 featured products (or an account's), browses a product's folders and adds a file by its address on
 the data proxy (`https://data.source.coop/<account>/<product>/…`): GeoParquet, FlatGeobuf,
 cloud-optimised GeoTIFFs and PMTiles are read in place, other files downloaded.
-`sourcecoop.products` (`"account"`) and `sourcecoop.list` (`"account"`, `"product"`, `"path"`)
-list them; a listed file's `"url"` is added with `layer.addUrl`. Like STAC searches, these reach the
-network: the AI Assistant asks first and plugins need the network permission.
+`sourcecoop.products` (`"account"`) and `sourcecoop.list` (`"account"`, `"product"`, `"path"`,
+and `"token"` for the next page returned by a listing) list them; a listed file's `"url"` is
+added with `layer.addUrl`. These commands reach the network: the AI Assistant asks first and
+plugins need the network permission.
 
 ## Natural Earth
 
-**Home › Web Data › Natural Earth…** is the Source Cooperative browser locked to
+**Home › Add › Web Data › Natural Earth…** is the Source Cooperative browser locked to
 [Natural Earth](https://www.naturalearthdata.com)'s public domain map data as Source Cooperative
 holds it (`opengeos/natural-earth`): countries, states, coastlines, land, ocean, rivers, lakes,
 glaciers, urban areas, airports, railways and more. It opens on the `pmtiles/` folder, whose
@@ -220,7 +319,7 @@ archives are added as tile layers read in place; the `geoparquet/`, `geojson/`, 
 
 ## Fields of the World
 
-**Home › Web Data › Fields of the World…** adds the agricultural field boundaries the
+**Home › Add › Web Data › Fields of the World…** adds the agricultural field boundaries the
 [Fields of the World](https://fieldsofthe.world) model found in Sentinel-2 imagery, worldwide, one
 year at a time (2017 to 2025; 2nd Edition, CC BY 4.0). Each year is a PMTiles archive on Source
 Cooperative read in place. Fields are drawn from zoom 9, filled and outlined by the model's score
@@ -239,7 +338,7 @@ The look is the tile layer's own style layers (`map.addTiles` takes MapLibre sty
 
 ## OpenStreetMap and administrative boundaries
 
-**Home › Web Data › OpenStreetMap…** (`osm.download`) downloads OpenStreetMap data where the map
+**Home › Add › Web Data › OpenStreetMap…** (`osm.download`) downloads OpenStreetMap data where the map
 is from an [Overpass](https://overpass-api.de) server: a preset (buildings, roads, railways, water,
 land use, parks, points of interest or administrative boundaries) or tag filters such as
 `amenity=cafe, shop`. The answer becomes up to three layers, points, lines and polygons: closed
@@ -250,7 +349,7 @@ degrees (about 50 × 50 km), and an answer up to 50,000 elements: the public ser
 a larger area is better read from an extract (`.osm.pbf`). `"url"` names another Overpass server
 when the public one is busy.
 
-**Home › Web Data › Boundaries…** (`boundaries.add`) adds a country's administrative boundaries from
+**Home › Add › Web Data › Boundaries…** (`boundaries.add`) adds a country's administrative boundaries from
 [geoBoundaries](https://www.geoboundaries.org) (CC BY 4.0): the country itself (`ADM0`), its states
 or provinces (`ADM1`) and finer divisions down to `ADM5` where they exist, simplified for the map.
 `boundaries.countries` lists the countries.
@@ -270,30 +369,17 @@ NASA's data comes two ways: **NASA Earthdata…** adds imagery that NASA serves 
 
 ### NASA Earthdata
 
-**Home › Web Data › NASA Earthdata…** lists the layers of NASA's
+**Home › Add › Web Data › NASA Earthdata…** lists the layers of NASA's
 [Global Imagery Browse Services](https://www.earthdata.nasa.gov/engage/open-data-services-software/earthdata-developer-portal/gibs-api)
 (GIBS) in Web Mercator: more than a thousand layers of satellite imagery and science data (MODIS,
 VIIRS, Landsat, sea surface temperature, aerosols, fires…), grouped by mission or instrument (the
-first part of their names) and searched by words. Most layers change day by day: **Date**
-(YYYY-MM-DD) picks the day they are added at, and empty adds the service's default (its latest).
-The same layer can be added at several dates, each a layer named with its date. A WMTS layer with a time dimension works the same way in any service,
-and with commands `service.add` takes `"time"`:
-
-```sh
-rustgis-cli run --cmd 'service.add={"url":"https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/1.0.0/WMTSCapabilities.xml","layer":"MODIS_Terra_CorrectedReflectance_TrueColor","time":"2024-06-01"}' --cmd 'share.exportMap={"path":"gibs.png"}'
-```
-
-A service may name its time instead of dating it: swisstopo's layers on
-[geo.admin.ch](https://docs.geo.admin.ch/visualize-data/wmts.html) are drawn at `current`, their
-default, so they need no `"time"`:
-
-```sh
-rustgis-cli run --cmd 'service.add={"url":"https://wmts.geo.admin.ch/EPSG/3857/1.0.0/WMTSCapabilities.xml","layer":"ch.swisstopo.pixelkarte-farbe"}' --cmd 'share.exportMap={"path":"swisstopo.png"}'
-```
+first part of their names) and searched by words. Most of them change day by day: they go on the
+time slider, as every layer with a time dimension does (see
+[Layers that change with time](#layers-that-change-with-time)).
 
 ### NASA Earthaccess
 
-**Home › Web Data › NASA Earthaccess…** searches [NASA Earthdata](https://www.earthdata.nasa.gov)
+**Home › Add › Web Data › NASA Earthaccess…** searches [NASA Earthdata](https://www.earthdata.nasa.gov)
 as GeoLibre's Earthaccess panel does, through NASA's Common Metadata Repository (CMR):
 
 1. **Dataset**: pick one of the **Popular datasets** (ICESat-2 ATL03/ATL06/ATL08, GEDI L2A/L2B/L4A,
@@ -304,9 +390,9 @@ as GeoLibre's Earthaccess panel does, through NASA's Common Metadata Repository 
    view** (`earthdata.granules`): the granules where the map is, newest first, 25 at a time
    (**Load more**). Their footprints are drawn as a layer.
 3. Each granule is a card with its preview, date, size, cloud cover and number of files, and
-   **Add** (its first GeoTIFF, added as a COG read in place), **Download** (its first file, in
-   the browser), **Zoom** and **Details** (its page on Earthdata Search). **Files** lists every file,
-   each GeoTIFF with its own **Add**.
+   **Add** (its first GeoTIFF, desktop only, read in place when tiled), **Download** (a link to
+   its first file), **Zoom** and **Details** (its page on Earthdata Search). **Files** lists every
+   file, each GeoTIFF with its own desktop **Add**.
 
 Searching needs no account, but NASA's data servers ask for an
 [Earthdata Login](https://urs.earthdata.nasa.gov) token to read most files. Paste one in the pane's
@@ -315,6 +401,8 @@ the project, and sent only over HTTPS to NASA's Earthdata data servers (`*.earth
 and `*.earthdata.nasa.gov`), never to the login server itself; a redirect away from them (to the
 presigned address the file is served from) goes without it. A file the token doesn't open says
 so (an expired token, or a dataset whose EULA you haven't accepted on Earthdata Login).
+`earthdata.status` reports whether a token is kept and its expiry when present;
+`earthdata.logout` forgets it.
 
 In the web app, searching and footprints work, but NASA's data servers don't let web pages read
 their files (they send no CORS headers), so GeoTIFFs are added in the desktop app; **Download**
@@ -328,13 +416,14 @@ rustgis-cli run --sample --cmd 'earthdata.login={"token":"…"}' --cmd 'layer.ad
 
 ## Open-data portals
 
-**Home › Web Data › Search Open Data…** (`portal.search`) finds datasets by text in an open-data
+**Home › Add › Web Data › Search Open Data…** (`portal.search`) finds datasets by text in an open-data
 portal and lists, for each, the resources RustGIS can add, the best format first:
 
-- **data.gov and CKAN catalogues**: [catalog.data.gov](https://catalog.data.gov) by default, or a
-  CKAN site by its address (`https://open.canada.ca/data`, `https://data.gov.uk`…). GeoJSON,
-  FlatGeobuf, GeoParquet, GeoPackage, KML, zipped Shapefiles, GeoTIFF, CSV, WMS, WFS and ArcGIS
-  REST resources are offered; web pages, PDFs and the like are left out.
+- **data.gov and CKAN catalogues**: [catalog.data.gov](https://catalog.data.gov) by default,
+  using data.gov's own DCAT search, or a CKAN site by its address
+  (`https://open.canada.ca/data`, `https://data.gov.uk`…). GeoJSON, FlatGeobuf, GeoParquet,
+  GeoPackage, KML/KMZ, zipped Shapefiles, GeoTIFF, CSV, WMS, WFS and ArcGIS REST resources are
+  offered; web pages, PDFs and the like are left out.
 - **Socrata**: every Socrata site through its discovery API, or one site such as
   `data.cityofnewyork.us`. Datasets with a location column are added as their GeoJSON export (up
   to 50,000 rows).
@@ -359,7 +448,7 @@ and plugins need the network permission. A dataset's licence is the portal's: it
 
 ### Web services
 
-Several **Home › Web Data** entries open the same search on one service, with its own choices
+Several **Home › Add › Web Data** entries open the same search on one service, with its own choices
 (`portal.search` with the `"portal"` in brackets):
 
 | Entry | What it finds | Added as |
@@ -371,9 +460,9 @@ Several **Home › Web Data** entries open the same search on one service, with 
 | **Hugging Face…** (`huggingface`) | Datasets on [Hugging Face](https://huggingface.co/datasets) by name, or one by `owner/name`; **Browse Files** (`portal.files`) lists its GeoTIFFs, GeoParquet, GeoJSON, FlatGeobuf, GeoPackage, PMTiles, LiDAR and other files (public, not gated) | The file |
 | **Ocean Data Platform…** (`ocean-data`) | [HUB Ocean](https://app.hubocean.earth)'s marine datasets, searched by words | Features, up to 10,000 |
 | **OpenAerialMap…** (`openaerialmap`) | Drone and aerial images on [OpenAerialMap](https://openaerialmap.org) where the map is, newest first | A COG, read in place |
-| **France › IGN LiDAR HD…** (`ign-lidar`) | [IGN](https://geoservices.ign.fr/lidarhd)'s 1 km LiDAR HD tiles where the map is (a view of at most 2 square degrees) | A COPC point cloud, read in place |
+| **France › IGN LiDAR HD…** (`ign-lidar`) | [IGN](https://geoservices.ign.fr/lidarhd)'s 1 km LiDAR HD tiles where the map is (a view of at most 2 square degrees) | A COPC point cloud downloaded whole and sampled, like [USGS LiDAR](#usgs-lidar) |
 | **United States › Tennessee GIS…** | Tennessee's own portal, [Tennessee GeoData](https://geodata.tn.gov): its public items, newest first, as it opens | The service, or the file |
-| **United States › US Federal GIS…**, **US State GIS…**, **US Local GIS…** | The public GIS portals of 24 federal agencies (by department), every state and the District of Columbia, and 146 counties and cities (by state): pick a group and a portal; an ArcGIS organisation's public items (`arcgis-portal` with `"org"`), or a Socrata site | The service, or the file |
+| **United States › US Federal GIS…**, **US State GIS…**, **US Local GIS…** | Curated public GIS portals of federal agencies (by department), states and the District of Columbia, and counties and cities (by state): pick a group and a portal; an ArcGIS organisation's public items (`arcgis-portal` with `"org"`), or a Socrata site | The service, or the file |
 | **United States › USGS 3DEP DEM…** (`usgs-dem`) | USGS elevation models from [The National Map](https://apps.nationalmap.gov) where the map is: 1 m, 1/9, 1/3 (the default) or 1 arc-second, or Alaska's 5 m (`"dataset"`), each tile's newest current edition | A GeoTIFF, read in place |
 
 Results are cards, as in GeoLibre: a picture when the service has one, what the item is, who
@@ -396,9 +485,45 @@ rustgis-cli run --cmd 'portal.files={"dataset":"giswqs/geospatial"}'
 rustgis-cli run --sample --cmd 'portal.add={"url":"https://data.geopf.fr/telechargement/download/LiDARHD-NUALID/NUALHD_1-0__LAZ_LAMB93_KE_2025-06-06/LHD_FXX_0652_6864_PTS_LAMB93_IGN69.copc.laz","name":"LiDAR HD 0652-6864"}'
 ```
 
+### Layers that change with time
+
+A WMS or WMTS layer with a time dimension, from any service, goes on the
+[time slider](workspace.md) by default: **Follow the time slider**, which the dialogs tick, and
+adding it from the Connections tree. Its requests then take the time of the slider's step, written
+as the layer writes its times (`1995`, `19951231`, `2024-06-01`, `2026-08-31T23:59:59Z`), its
+GetFeatureInfo requests too, so identify answers for that time; `time.export` animates it.
+
+- **A slider that is off** is turned on with the layer's times: every step of a period it lists
+  (`2000-02-24/2026-10-28/P1D`, a day at a time; when it lists only a period longer than the
+  slider's 20,000 steps, every second, fourth… step), or the times it lists, at the layer's default
+  (or its latest, when its default is no date). A slider already on keeps its steps; a service
+  that lists other times may draw nothing at some of them, and a notice says so.
+- **At one time instead**: untick **Follow the time slider**. **Date** then takes one of the times
+  the layer lists (hover over its "map by date" to see them, and its default), and empty adds it
+  at the service's default. The same layer can be added at several times, each a layer named
+  with its time.
+- **A WMS layer** (WMS 1.3.0 Annex C, 1.1.1) asks with `TIME`. Its default may be an interval;
+  where the service lets a layer take several times at once (`multipleValues`), a list
+  (`1990,2000`) or an interval (`1990/2020`, `1990/2020/P10Y`) can be asked for too, otherwise one
+  time.
+- **A time named, not dated**: a layer whose only time is a name (OGC's `current`, or `default`),
+  whose times are one period finer than the slider's hour (`…/PT30M`), or whose list of times would
+  take more than the slider's 20,000 steps, isn't stepped through: it is added at its default.
+
+With commands, `service.add` follows the slider when `"time"` is left out (or is `"slider"`, or
+`true`); a time of the layer's draws it at that time, and `"default"` (or `false`) at the service's
+default. For example, a daily layer at one day, a yearly map on the slider exported as an
+animation, and a layer whose only time is `current`:
+
+```sh
+rustgis-cli run --cmd 'service.add={"url":"https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/1.0.0/WMTSCapabilities.xml","layer":"MODIS_Terra_CorrectedReflectance_TrueColor","time":"2024-06-01"}' --cmd 'share.exportMap={"path":"gibs.png"}'
+rustgis-cli run --cmd 'service.add={"url":"https://wms.geo.admin.ch/?SERVICE=WMS&REQUEST=GetCapabilities&VERSION=1.3.0","layer":"ch.swisstopo.pixelkarte-farbe-pk25.noscale"}' --cmd 'map.goToXY={"lon":7.4474,"lat":46.948,"scale":25000}' --cmd 'time.set={"interval":15}' --cmd 'time.export={"path":"bern.gif"}'
+rustgis-cli run --cmd 'service.add={"url":"https://wmts.geo.admin.ch/EPSG/3857/1.0.0/WMTSCapabilities.xml","layer":"ch.swisstopo.pixelkarte-farbe"}' --cmd 'share.exportMap={"path":"map.png"}'
+```
+
 ## United States
 
-**Home › Web Data › United States** holds services covering the United States: the
+**Home › Add › Web Data › United States** holds services covering the United States: the
 portals in the [Web services](#web-services) table (Tennessee GIS, US Federal, State and Local GIS,
 USGS 3DEP DEM), [USGS LiDAR](#usgs-lidar), and the panels below.
 
@@ -433,7 +558,7 @@ rustgis-cli run --cmd 'nationalMap.add={"service":"basemap/USGSTopo"}' --cmd 'na
 
 ### USGS NLDI
 
-**Home › Web Data › United States › USGS NLDI…** uses the USGS
+**Home › Add › Web Data › United States › USGS NLDI…** uses the USGS
 [Network-Linked Data Index](https://api.water.usgs.gov/nldi) on the NHDPlus river network, as
 GeoLibre's NLDI panel does. Each result is a layer:
 
@@ -458,7 +583,7 @@ rustgis-cli run --sample --cmd 'nldi.flowline={"lon":-89.36083,"lat":43.08944}' 
 
 ## Satellite embeddings
 
-**Home › Web Data › Satellite Embeddings…** shows pre-computed satellite embeddings: vectors a
+**Home › Add › Web Data › Satellite Embeddings…** shows pre-computed satellite embeddings: vectors a
 geospatial foundation model made for every pixel or image patch, so that places alike have values
 alike. Pick a dataset (its provider, model, resolution, years, coverage, licence and links are
 shown), a year, and **Search where the map is**; the results are cards with **Zoom** and **Add**,

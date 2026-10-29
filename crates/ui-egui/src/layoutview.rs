@@ -6,8 +6,9 @@
 
 use egui::{Align2, Color32, CornerRadius, CursorIcon, Pos2, Rect, Sense, Stroke, Ui, pos2, vec2};
 use rustgis_engine::map::layout::{
-    ArrowStyle, CoordFormat, ElementKind, Grid, GridStyle, Layout, LineHead, MAX_COLORBAR_TICKS, MAX_GRID_WIDTH, MAX_SCALE_DIVISIONS,
-    MAX_TICK_MM, Orientation, PT_PER_MM, ScaleBarStyle, ScaleUnits, TickSide, frame_camera, line_angle, line_length,
+    Arrange, ArrowStyle, CoordFormat, ElementKind, Grid, GridKind, GridStyle, Layout, LineHead, MAX_COLORBAR_TICKS, MAX_FRAME_SCALE,
+    MAX_GRID_WIDTH, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_FRAME_SCALE, Orientation, PT_PER_MM, ScaleBarStyle, ScaleUnits, TickSide,
+    frame_camera, line_angle, line_length,
 };
 use serde_json::{Value, json};
 
@@ -93,6 +94,10 @@ pub struct LayoutView {
     /// Where the primary button last went down: egui forgets it on release, and a click is
     /// judged by where it started.
     pressed: Option<Pos2>,
+    /// The map of a frame being panned, with [`PAN_OVERSCAN`] of map past each side: drawn once
+    /// as the pan starts and slid under the pointer, so the map comes into view as it moves; None
+    /// when it couldn't be drawn (it isn't tried again for that pan).
+    pan_preview: Option<(u32, Option<egui::TextureHandle>)>,
     /// The arrow-key nudges so far: how many runs of them there have been, and the last one's
     /// layout, element and time (seconds), for [`LayoutView::nudge_key`].
     nudges: u64,
@@ -131,10 +136,48 @@ pub(crate) fn follow_project(app: &mut RustGisApp) {
     app.layout.project = Some(opened);
 }
 
+/// How much map a pan's preview draws past each side of the frame, in frame widths and heights.
+const PAN_OVERSCAN: f64 = 1.0;
+/// Most pixels a pan's preview is drawn with: it's drawn on the spot as the pan starts.
+const PAN_PREVIEW_PIXELS: f64 = 6_000_000.0;
+/// Longest side, in pixels, a pan's preview is drawn with, within what the GPU takes.
+const PAN_PREVIEW_SIDE: f64 = 8192.0;
+
+/// A map frame's map with [`PAN_OVERSCAN`] past each side, at the screen's resolution (or less,
+/// within [`PAN_PREVIEW_PIXELS`] and [`PAN_PREVIEW_SIDE`]), for a pan's preview. It doesn't wait
+/// for tiles still on their way, as it's drawn while the pointer moves.
+fn pan_preview(app: &mut RustGisApp, ctx: &egui::Context, layout: &Layout, id: u32, s: f32) -> Option<egui::TextureHandle> {
+    let e = layout.element(id)?;
+    let ElementKind::MapFrame { map, center, scale, bearing, pitch, .. } = &e.kind else { return None };
+    // A tilted view's perspective follows the drawing's height, so a taller drawing wouldn't match
+    // the frame: a pitched frame slides the page as before.
+    if *pitch != 0.0 {
+        return None;
+    }
+    let m = app.session.project.maps.iter_mut().find(|m| m.name.eq_ignore_ascii_case(map))?;
+    let cam = frame_camera(m, *center, *scale, *bearing, *pitch);
+    let k = 1.0 + 2.0 * PAN_OVERSCAN;
+    let (w, h) = (e.w * PT_PER_MM * k, e.h * PT_PER_MM * k);
+    let screen = f64::from(s) / PT_PER_MM * f64::from(ctx.pixels_per_point());
+    // Within the pixel budget, and within the longest side the GPU takes for a texture (a long,
+    // thin frame could pass the first and not the second).
+    let side = (ctx.input(|i| i.max_texture_side) as f64).min(PAN_PREVIEW_SIDE);
+    let ppp = screen.min((PAN_PREVIEW_PIXELS / (w * h).max(1.0)).sqrt()).min(side / w.max(h).max(1.0)).max(0.01);
+    let pm = rustgis_engine::render::layout::frame_map_preview(m, cam, w, h, ppp)?;
+    let img = egui::ColorImage::from_rgba_premultiplied([pm.width() as usize, pm.height() as usize], pm.data());
+    Some(ctx.load_texture("layout_pan_preview", img, egui::TextureOptions::LINEAR))
+}
+
 /// Seconds after the wheel stops before a map frame's zoom is applied.
 const FRAME_ZOOM_SETTLE: f64 = 0.35;
 
 impl LayoutView {
+    /// Draws the page again on the next frame, though the project hasn't changed (the installed
+    /// fonts a text names have just been indexed).
+    pub fn redraw(&mut self) {
+        self.key = None;
+    }
+
     /// Stops drawing a polygon or lasso frame, or navigating map frames (Esc).
     pub fn cancel_tool(&mut self) {
         self.navigate = false;
@@ -520,7 +563,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
     // A stable id: dragging an element selects it and opens the Format pane beside the page,
     // and an automatic id would change with it, losing the drag before it is dropped (#325).
     ui.advance_cursor_after_rect(area);
-    let resp = ui.interact(area, ui.id().with("layout_page"), Sense::click_and_drag());
+    let resp = ui.interact(area, ui.scope_id().with("layout_page"), Sense::click_and_drag());
     let painter = ui.painter_at(area);
     painter.rect_filled(area, 0.0, if t.dark { Color32::from_gray(38) } else { Color32::from_rgb(0xD9, 0xDD, 0xE3) });
     let (page, s) = page_rect(&app.layout, area, &layout);
@@ -549,6 +592,16 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
             app.layout.key = Some(key);
         }
     }
+    // A pan's preview is drawn as the pan starts, and let go when it ends.
+    match app.layout.drag {
+        Some(Drag::PanFrame(id, _)) if app.layout.pan_preview.as_ref().is_none_or(|(p, _)| *p != id) => {
+            let ctx = ui.ctx().clone();
+            let map = pan_preview(app, &ctx, &layout, id, s);
+            app.layout.pan_preview = Some((id, map));
+        }
+        Some(Drag::PanFrame(..)) => {}
+        _ => app.layout.pan_preview = None,
+    }
     // Shadow, page, elements.
     painter.rect_filled(page.translate(vec2(3.0, 4.0)), 2.0, Color32::from_black_alpha(50));
     painter.rect_filled(page, 0.0, Color32::WHITE);
@@ -576,7 +629,19 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
             let uv = Rect::from_min_max(src((e.x, e.y)), src((e.x + e.w, e.y + e.h)));
             let clip = painter.with_clip_rect(frame);
             clip.rect_filled(frame, 0.0, Color32::WHITE);
-            clip.image(tex.id(), frame, uv, Color32::WHITE);
+            match &app.layout.pan_preview {
+                // A pan: the frame's map with the overscan around it, moved with the pointer, so
+                // what comes into view is map, not the page beside the frame.
+                Some((pid, Some(map))) if *pid == id && k == 1.0 => {
+                    let o = PAN_OVERSCAN as f32;
+                    let around = Rect::from_min_max(frame.min - frame.size() * o, frame.max + frame.size() * o);
+                    let full = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                    clip.image(map.id(), around.translate(vec2(dx as f32, dy as f32) * s), full, Color32::WHITE);
+                }
+                _ => {
+                    clip.image(tex.id(), frame, uv, Color32::WHITE);
+                }
+            }
         }
     }
     let accent = t.accent;
@@ -1012,7 +1077,7 @@ fn zoom_frame(app: &mut RustGisApp, layout: &Layout, li: usize, id: u32, k: f64,
     let ElementKind::MapFrame { map, center, scale, bearing, pitch, .. } = &e.kind else { return };
     let Some(m) = app.session.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(map)) else { return };
     let cam = frame_camera(m, *center, *scale, *bearing, *pitch);
-    let new_scale = (scale * k).clamp(100.0, 1e10);
+    let new_scale = (scale * k).clamp(MIN_FRAME_SCALE, MAX_FRAME_SCALE);
     // A turned or tilted frame zooms as the map view does, about the anchor.
     if cam.bearing != 0.0 || cam.pitch != 0.0 {
         let (w, h) = (e.w * PT_PER_MM, e.h * PT_PER_MM);
@@ -1094,14 +1159,21 @@ pub(crate) fn save_drafts(app: &mut RustGisApp) {
 
 /// A text field whose typing is kept in the view's state while it has focus. Returns the new text
 /// when the field loses focus with a change.
-fn text_field(app: &mut RustGisApp, ui: &mut Ui, key: (usize, u32, &'static str), current: &str, multiline: bool) -> Option<String> {
+fn text_field(
+    app: &mut RustGisApp,
+    ui: &mut Ui,
+    key: (usize, u32, &'static str),
+    current: &str,
+    multiline: bool,
+    label_id: egui::Id,
+) -> Option<String> {
     let mut buf = app.layout.typing.remove(&key).unwrap_or_else(|| current.to_string());
     let edit = if multiline {
         egui::TextEdit::multiline(&mut buf).desired_rows(3).desired_width(240.0)
     } else {
         egui::TextEdit::singleline(&mut buf)
     };
-    let r = ui.add(edit);
+    let r = ui.add(edit).labelled_by(label_id);
     if r.lost_focus() {
         return (buf != current).then_some(buf);
     }
@@ -1119,30 +1191,63 @@ fn grid_properties(app: &mut RustGisApp, ui: &mut Ui, grid: Option<&Grid>, id: u
     }
     let Some(g) = grid else { return };
     // Each number kept across a drag until it is let go (#607).
-    let key = |field: &str| egui::Id::new(("grid_drag", id, field));
+    let key = |field: &str| egui::Id::unique(("grid_drag", id, field));
+    let measured = g.kind == GridKind::Measured;
     egui::Grid::new(("grid_props", id)).num_columns(2).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
-        ui.label(tl!("Interval"));
+        // Latitudes and longitudes, or eastings and northings (ArcGIS Pro's measured grid).
+        let input_label = ui.label(tl!("Type"));
+        egui::ComboBox::from_id_salt(("grid_kind", id))
+            .selected_text(tl!(g.kind.label()))
+            .show_ui(ui, |ui| {
+                for v in GridKind::ALL {
+                    if ui.selectable_label(g.kind == v, tl!(v.label())).clicked() && g.kind != v {
+                        set(app, json!({"type": v.code()}));
+                    }
+                }
+            })
+            .response
+            .labelled_by(input_label.id);
+        ui.end_row();
+        if measured {
+            crs_row(app, ui, g, id, set);
+        }
+        let input_label = ui.label(tl!("Interval"));
         let mut step = g.step;
         let drag = Dragged::lend(ui, key("step"), &mut step);
-        let r = ui.add(
-            egui::DragValue::new(&mut step)
-                .range(0.0..=90.0)
-                .speed(0.05)
-                .max_decimals(4)
-                .custom_formatter(|v, _| if v <= 0.0 { tl!("Auto").to_string() } else { format!("{v}°") }),
-        );
+        let (most, speed) = if measured {
+            (rustgis_engine::map::layout::MAX_MEASURED_STEP, 10.0)
+        } else {
+            (rustgis_engine::map::layout::MAX_GRATICULE_STEP, 0.05)
+        };
+        let r = ui
+            .add(egui::DragValue::new(&mut step).range(0.0..=most).speed(speed).max_decimals(4).custom_formatter(|v, _| {
+                if v <= 0.0 {
+                    tl!("Auto").to_string()
+                } else if measured {
+                    // (The system's units: metres for UTM.)
+                    format!("{v}")
+                } else {
+                    format!("{v}°")
+                }
+            }))
+            .on_hover_text(if measured { tl!("In the coordinate system's units: metres for UTM.") } else { tl!("In degrees.") })
+            .labelled_by(input_label.id);
         if drag.settled(ui, &r, &mut step) && (step - g.step).abs() > 1e-9 {
             set(app, json!({"step": step}));
         }
         ui.end_row();
-        ui.label(tl!("Style"));
-        egui::ComboBox::from_id_salt(("grid_style", id)).selected_text(tl!(g.style.label())).show_ui(ui, |ui| {
-            for v in GridStyle::ALL {
-                if ui.selectable_label(g.style == v, tl!(v.label())).clicked() && g.style != v {
-                    set(app, json!({"style": v.code()}));
+        let input_label = ui.label(tl!("Style"));
+        egui::ComboBox::from_id_salt(("grid_style", id))
+            .selected_text(tl!(g.style.label()))
+            .show_ui(ui, |ui| {
+                for v in GridStyle::ALL {
+                    if ui.selectable_label(g.style == v, tl!(v.label())).clicked() && g.style != v {
+                        set(app, json!({"style": v.code()}));
+                    }
                 }
-            }
-        });
+            })
+            .response
+            .labelled_by(input_label.id);
         ui.end_row();
         ui.label(tl!("Color"));
         let mut c = crate::theme::c32(g.color);
@@ -1150,48 +1255,72 @@ fn grid_properties(app: &mut RustGisApp, ui: &mut Ui, grid: Option<&Grid>, id: u
             set(app, json!({"color": crate::theme::rgba(c).hex()}));
         }
         ui.end_row();
-        ui.label(tl!("Line width"));
+        let input_label = ui.label(tl!("Line width"));
         let mut w = g.width;
         let drag = Dragged::lend(ui, key("width"), &mut w);
-        let r = ui.add(egui::DragValue::new(&mut w).range(0.0..=MAX_GRID_WIDTH).speed(0.05).max_decimals(2).suffix(" pt"));
+        let r = ui
+            .add(egui::DragValue::new(&mut w).range(0.0..=MAX_GRID_WIDTH).speed(0.05).max_decimals(2).suffix(" pt"))
+            .labelled_by(input_label.id);
         if drag.settled(ui, &r, &mut w) && (w - g.width).abs() > 1e-9 {
             set(app, json!({"width": w}));
         }
         ui.end_row();
         if g.style.ticks() {
-            ui.label(tl!("Tick length"));
+            let input_label = ui.label(tl!("Tick length"));
             let mut t = g.tick_length;
             let drag = Dragged::lend(ui, key("tickLength"), &mut t);
-            let r = ui.add(egui::DragValue::new(&mut t).range(0.0..=MAX_TICK_MM).speed(0.1).max_decimals(1).suffix(" mm"));
+            let r = ui
+                .add(egui::DragValue::new(&mut t).range(0.0..=MAX_TICK_MM).speed(0.1).max_decimals(1).suffix(" mm"))
+                .labelled_by(input_label.id);
             if drag.settled(ui, &r, &mut t) && (t - g.tick_length).abs() > 1e-9 {
                 set(app, json!({"tickLength": t}));
             }
             ui.end_row();
         }
-        ui.label(tl!("Labels"));
+        let input_label = ui.label(tl!("Labels"));
         let mut labels = g.labels;
-        if ui.checkbox(&mut labels, "").changed() {
+        if ui.checkbox(&mut labels, "").labelled_by(input_label.id).changed() {
             set(app, json!({"labels": labels}));
         }
         ui.end_row();
         if !g.labels {
             return;
         }
-        ui.label(tl!("Format"));
-        ui.horizontal(|ui| {
-            for (label, v, code) in [("Decimal", CoordFormat::Decimal, "decimal"), ("DMS", CoordFormat::Dms, "dms")] {
-                if ui.selectable_label(g.format == v, tl!(label)).clicked() && g.format != v {
-                    set(app, json!({"format": code}));
-                }
+        if measured {
+            let input_label = ui.label(tl!("Short labels"));
+            let mut short = g.short;
+            if ui
+                .checkbox(&mut short, "")
+                .labelled_by(input_label.id)
+                .on_hover_text(tl!("The kilometres' last two digits, as topographic maps print them: 43 for 543000."))
+                .changed()
+            {
+                set(app, json!({"short": short}));
             }
-        });
-        ui.end_row();
-        ui.label(tl!("N/S/E/W"));
-        let mut hemi = g.hemisphere;
-        if ui.checkbox(&mut hemi, "").on_hover_text(tl!("Off, west and south are negative: -112.5°.")).changed() {
-            set(app, json!({"hemisphere": hemi}));
+            ui.end_row();
+        } else {
+            // Degrees: decimal or degrees, minutes and seconds, with hemisphere letters or signs.
+            ui.label(tl!("Format"));
+            ui.horizontal(|ui| {
+                for (label, v, code) in [("Decimal", CoordFormat::Decimal, "decimal"), ("DMS", CoordFormat::Dms, "dms")] {
+                    if ui.selectable_label(g.format == v, tl!(label)).clicked() && g.format != v {
+                        set(app, json!({"format": code}));
+                    }
+                }
+            });
+            ui.end_row();
+            let input_label = ui.label(tl!("N/S/E/W"));
+            let mut hemi = g.hemisphere;
+            if ui
+                .checkbox(&mut hemi, "")
+                .labelled_by(input_label.id)
+                .on_hover_text(tl!("Off, west and south are negative: -112.5°."))
+                .changed()
+            {
+                set(app, json!({"hemisphere": hemi}));
+            }
+            ui.end_row();
         }
-        ui.end_row();
         // Two rows, so the four edges fit the panel's width.
         let e = g.edges;
         let all = [("Top", "top", e.top), ("Bottom", "bottom", e.bottom), ("Left", "left", e.left), ("Right", "right", e.right)];
@@ -1223,6 +1352,28 @@ fn grid_properties(app: &mut RustGisApp, ui: &mut Ui, grid: Option<&Grid>, id: u
         });
         ui.end_row();
     });
+}
+
+/// A measured grid's coordinate system, typed (EPSG:25832, WKT or a PROJ string) and set when the
+/// field is left; empty is the map's when projected, else the UTM zone at the frame's centre.
+fn crs_row(app: &mut RustGisApp, ui: &mut Ui, g: &Grid, id: u32, set: &dyn Fn(&mut RustGisApp, Value)) {
+    let input_label = ui.label(tl!("Coordinate system"));
+    let key = egui::Id::unique(("grid_crs", id));
+    let current = g.crs.clone().unwrap_or_default();
+    let mut buf = ui.data(|d| d.get_temp::<String>(key)).unwrap_or_else(|| current.clone());
+    let r = ui
+        .add(egui::TextEdit::singleline(&mut buf).hint_text(tl!("The map's, else its UTM zone")).desired_width(150.0))
+        .labelled_by(input_label.id)
+        .on_hover_text(tl!("EPSG:25832, WKT or a PROJ string; empty: the map's when projected, else the UTM zone at the frame's centre."));
+    if r.has_focus() {
+        ui.data_mut(|d| d.insert_temp(key, buf));
+    } else {
+        ui.data_mut(|d| d.remove::<String>(key));
+        if r.lost_focus() && buf.trim() != current {
+            set(app, json!({"crs": buf.trim()}));
+        }
+    }
+    ui.end_row();
 }
 
 /// The Format pane (#516): the selected layout element's properties, while its layout is on
@@ -1262,7 +1413,7 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
     let Some(e) = app.layout.selected.and_then(|id| layout.element(id)).cloned() else { return };
     let id = e.id;
     // Each number kept across a drag until it is let go (#607): one key per layout, element and field.
-    let drag_key = |field: &str| egui::Id::new(("layout_drag", li, id, field));
+    let drag_key = |field: &str| egui::Id::unique(("layout_drag", li, id, field));
     let update = |app: &mut RustGisApp, p: Value| {
         let mut p = p;
         p["layout"] = json!(li);
@@ -1273,24 +1424,24 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
         egui::Grid::new(("layout_props", id)).num_columns(2).min_col_width(crate::textform::LABEL_W).spacing(vec2(8.0, 6.0)).show(
             ui,
             |ui| {
-                ui.label(tl!("Name"));
-                if let Some(name) = text_field(app, ui, (li, id, "name"), &e.name, false) {
+                let input_label = ui.label(tl!("Name"));
+                if let Some(name) = text_field(app, ui, (li, id, "name"), &e.name, false, input_label.id) {
                     update(app, json!({"name": name}));
                 }
                 ui.end_row();
                 for (label, key, v) in [("X (mm)", "x", e.x), ("Y (mm)", "y", e.y), ("Width (mm)", "w", e.w), ("Height (mm)", "h", e.h)] {
-                    ui.label(tl!(label));
+                    let input_label = ui.label(tl!(label));
                     let mut val = v;
                     let drag = Dragged::lend(ui, drag_key(key), &mut val);
-                    let r = ui.add(egui::DragValue::new(&mut val).speed(0.5).max_decimals(1));
+                    let r = ui.add(egui::DragValue::new(&mut val).speed(0.5).max_decimals(1)).labelled_by(input_label.id);
                     if drag.settled(ui, &r, &mut val) && (val - v).abs() > 1e-6 {
                         update(app, json!({key: val}));
                     }
                     ui.end_row();
                 }
-                ui.label(tl!("Visible"));
+                let input_label = ui.label(tl!("Visible"));
                 let mut vis = e.visible;
-                if ui.checkbox(&mut vis, "").changed() {
+                if ui.checkbox(&mut vis, "").labelled_by(input_label.id).changed() {
                     update(app, json!({"visible": vis}));
                 }
                 ui.end_row();
@@ -1298,33 +1449,33 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                     // Its text, size, colour and boldness: the shared form, below the grid.
                     ElementKind::Text { .. } => {}
                     ElementKind::Legend { title, all_classes, hide_other, .. } => {
-                        ui.label(tl!("Title"));
-                        if let Some(tt) = text_field(app, ui, (li, id, "title"), title, false) {
+                        let input_label = ui.label(tl!("Title"));
+                        if let Some(tt) = text_field(app, ui, (li, id, "title"), title, false, input_label.id) {
                             update(app, json!({"title": tt}));
                         }
                         ui.end_row();
                         // Off, the legend lists only what the frame draws (#207).
-                        ui.label(tl!("All classes"));
+                        let input_label = ui.label(tl!("All classes"));
                         let mut all = *all_classes;
-                        if ui.checkbox(&mut all, "").changed() {
+                        if ui.checkbox(&mut all, "").labelled_by(input_label.id).changed() {
                             update(app, json!({"allClasses": all}));
                         }
                         ui.end_row();
-                        ui.label(tl!("Hide other values"));
+                        let input_label = ui.label(tl!("Hide other values"));
                         let mut hide = *hide_other;
-                        if ui.checkbox(&mut hide, "").changed() {
+                        if ui.checkbox(&mut hide, "").labelled_by(input_label.id).changed() {
                             update(app, json!({"hideOther": hide}));
                         }
                         ui.end_row();
                     }
                     ElementKind::Colorbar { frame, layer, title, orientation, ticks, tick_side, reverse } => {
-                        ui.label(tl!("Title"));
-                        if let Some(tt) = text_field(app, ui, (li, id, "title"), title, false) {
+                        let input_label = ui.label(tl!("Title"));
+                        if let Some(tt) = text_field(app, ui, (li, id, "title"), title, false, input_label.id) {
                             update(app, json!({"title": tt}));
                         }
                         ui.end_row();
                         // The rasters of the frame's map; none picked follows the top visible one.
-                        ui.label(tl!("Layer"));
+                        let input_label = ui.label(tl!("Layer"));
                         let rasters: Vec<String> = match layout.element(*frame).map(|f| &f.kind) {
                             Some(ElementKind::MapFrame { map, .. }) => app
                                 .session
@@ -1337,9 +1488,9 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                             _ => Vec::new(),
                         };
                         let top = tl!("Top visible raster");
-                        egui::ComboBox::from_id_salt(("colorbar_layer", id)).selected_text(layer.as_deref().unwrap_or(top)).show_ui(
-                            ui,
-                            |ui| {
+                        egui::ComboBox::from_id_salt(("colorbar_layer", id))
+                            .selected_text(layer.as_deref().unwrap_or(top))
+                            .show_ui(ui, |ui| {
                                 if ui.selectable_label(layer.is_none(), top).clicked() {
                                     update(app, json!({"layer": ""}));
                                 }
@@ -1348,8 +1499,9 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                                         update(app, json!({"layer": n}));
                                     }
                                 }
-                            },
-                        );
+                            })
+                            .response
+                            .labelled_by(input_label.id);
                         ui.end_row();
                         let vertical = *orientation == Orientation::Vertical;
                         ui.label(tl!("Orientation"));
@@ -1372,38 +1524,46 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                             }
                         });
                         ui.end_row();
-                        ui.label(tl!("Ticks"));
+                        let input_label = ui.label(tl!("Ticks"));
                         let mut n = *ticks as u64;
                         let drag = Dragged::lend(ui, drag_key("ticks"), &mut n);
-                        let r = ui.add(egui::DragValue::new(&mut n).range(2..=MAX_COLORBAR_TICKS as u64));
+                        let r = ui.add(egui::DragValue::new(&mut n).range(2..=MAX_COLORBAR_TICKS as u64)).labelled_by(input_label.id);
                         if drag.settled(ui, &r, &mut n) && n as usize != *ticks {
                             update(app, json!({"ticks": n}));
                         }
                         ui.end_row();
-                        ui.label(tl!("Reverse"));
+                        let input_label = ui.label(tl!("Reverse"));
                         let mut rev = *reverse;
-                        if ui.checkbox(&mut rev, "").changed() {
+                        if ui.checkbox(&mut rev, "").labelled_by(input_label.id).changed() {
                             update(app, json!({"reverse": rev}));
                         }
                         ui.end_row();
                     }
                     ElementKind::MapFrame { map, scale, bearing, pitch, .. } => {
-                        ui.label(tl!("Map"));
+                        let input_label = ui.label(tl!("Map"));
                         let maps: Vec<String> = app.session.project.maps.iter().map(|m| m.name.clone()).collect();
-                        egui::ComboBox::from_id_salt(("frame_map", id)).selected_text(map.as_str()).show_ui(ui, |ui| {
-                            for m in maps {
-                                if ui.selectable_label(m == *map, m.as_str()).clicked() {
-                                    update(app, json!({"map": m}));
+                        egui::ComboBox::from_id_salt(("frame_map", id))
+                            .selected_text(map.as_str())
+                            .show_ui(ui, |ui| {
+                                for m in maps {
+                                    if ui.selectable_label(m == *map, m.as_str()).clicked() {
+                                        update(app, json!({"map": m}));
+                                    }
                                 }
-                            }
-                        });
+                            })
+                            .response
+                            .labelled_by(input_label.id);
                         ui.end_row();
-                        ui.label(tl!("Scale 1:"));
+                        let input_label = ui.label(tl!("Scale 1:"));
                         let mut sc = *scale;
                         let speed = sc * 0.01;
+                        // Below 1:10, tenths: 1:0.5 is a frame at 2:1 (#902).
+                        let decimals = if sc < 10.0 { 1 } else { 0 };
                         let drag = Dragged::lend(ui, drag_key("scale"), &mut sc);
-                        let r = ui.add(egui::DragValue::new(&mut sc).range(100.0..=1e10).speed(speed).max_decimals(0));
-                        if drag.settled(ui, &r, &mut sc) && (sc - scale).abs() > 0.5 {
+                        let r = ui
+                            .add(egui::DragValue::new(&mut sc).range(MIN_FRAME_SCALE..=MAX_FRAME_SCALE).speed(speed).max_decimals(decimals))
+                            .labelled_by(input_label.id);
+                        if drag.settled(ui, &r, &mut sc) && (sc / scale - 1.0).abs() > 1e-3 {
                             update(app, json!({"scale": sc}));
                         }
                         ui.end_row();
@@ -1411,10 +1571,12 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         for (label, key, current, range) in
                             [("Bearing", "bearing", *bearing, -180.0..=180.0), ("Pitch", "pitch", *pitch, 0.0..=85.0)]
                         {
-                            ui.label(tl!(label));
+                            let input_label = ui.label(tl!(label));
                             let mut v = current;
                             let drag = Dragged::lend(ui, drag_key(key), &mut v);
-                            let r = ui.add(egui::DragValue::new(&mut v).range(range).speed(0.5).max_decimals(1).suffix("°"));
+                            let r = ui
+                                .add(egui::DragValue::new(&mut v).range(range).speed(0.5).max_decimals(1).suffix("°"))
+                                .labelled_by(input_label.id);
                             if drag.settled(ui, &r, &mut v) && (v - current).abs() > 1e-6 {
                                 update(app, json!({key: v}));
                             }
@@ -1422,14 +1584,18 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         }
                     }
                     ElementKind::NorthArrow { style, fill, outline, .. } => {
-                        ui.label(tl!("Style"));
-                        egui::ComboBox::from_id_salt(("arrow_style", id)).selected_text(tl!(style.label())).show_ui(ui, |ui| {
-                            for v in ArrowStyle::ALL {
-                                if ui.selectable_label(*style == v, tl!(v.label())).clicked() && *style != v {
-                                    update(app, json!({"style": v.code()}));
+                        let input_label = ui.label(tl!("Style"));
+                        egui::ComboBox::from_id_salt(("arrow_style", id))
+                            .selected_text(tl!(style.label()))
+                            .show_ui(ui, |ui| {
+                                for v in ArrowStyle::ALL {
+                                    if ui.selectable_label(*style == v, tl!(v.label())).clicked() && *style != v {
+                                        update(app, json!({"style": v.code()}));
+                                    }
                                 }
-                            }
-                        });
+                            })
+                            .response
+                            .labelled_by(input_label.id);
                         ui.end_row();
                         for (label, key, current) in [("Fill", "fill", *fill), ("Outline", "outline", *outline)] {
                             ui.label(tl!(label));
@@ -1441,44 +1607,52 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         }
                     }
                     ElementKind::ScaleBar { units, divisions, style, .. } => {
-                        ui.label(tl!("Style"));
-                        egui::ComboBox::from_id_salt(("scale_style", id)).selected_text(tl!(style.label())).show_ui(ui, |ui| {
-                            for v in ScaleBarStyle::ALL {
-                                if ui.selectable_label(*style == v, tl!(v.label())).clicked() && *style != v {
-                                    update(app, json!({"style": v.code()}));
+                        let input_label = ui.label(tl!("Style"));
+                        egui::ComboBox::from_id_salt(("scale_style", id))
+                            .selected_text(tl!(style.label()))
+                            .show_ui(ui, |ui| {
+                                for v in ScaleBarStyle::ALL {
+                                    if ui.selectable_label(*style == v, tl!(v.label())).clicked() && *style != v {
+                                        update(app, json!({"style": v.code()}));
+                                    }
                                 }
-                            }
-                        });
+                            })
+                            .response
+                            .labelled_by(input_label.id);
                         ui.end_row();
-                        ui.label(tl!("Units"));
-                        egui::ComboBox::from_id_salt(("scale_units", id)).selected_text(tl!(units.label())).show_ui(ui, |ui| {
-                            for v in ScaleUnits::ALL {
-                                if ui.selectable_label(*units == v, tl!(v.label())).clicked() && *units != v {
-                                    update(app, json!({"units": v.code()}));
+                        let input_label = ui.label(tl!("Units"));
+                        egui::ComboBox::from_id_salt(("scale_units", id))
+                            .selected_text(tl!(units.label()))
+                            .show_ui(ui, |ui| {
+                                for v in ScaleUnits::ALL {
+                                    if ui.selectable_label(*units == v, tl!(v.label())).clicked() && *units != v {
+                                        update(app, json!({"units": v.code()}));
+                                    }
                                 }
-                            }
-                        });
+                            })
+                            .response
+                            .labelled_by(input_label.id);
                         ui.end_row();
-                        ui.label(tl!("Divisions"));
+                        let input_label = ui.label(tl!("Divisions"));
                         let mut n = *divisions as u64;
                         let drag = Dragged::lend(ui, drag_key("divisions"), &mut n);
-                        let r = ui.add(egui::DragValue::new(&mut n).range(1..=MAX_SCALE_DIVISIONS as u64));
+                        let r = ui.add(egui::DragValue::new(&mut n).range(1..=MAX_SCALE_DIVISIONS as u64)).labelled_by(input_label.id);
                         if drag.settled(ui, &r, &mut n) && n as usize != *divisions {
                             update(app, json!({"divisions": n}));
                         }
                         ui.end_row();
                     }
                     ElementKind::Table { rows, .. } => {
-                        ui.label(tl!("Rows"));
+                        let input_label = ui.label(tl!("Rows"));
                         let mut n = *rows as u64;
                         let drag = Dragged::lend(ui, drag_key("rows"), &mut n);
-                        let r = ui.add(egui::DragValue::new(&mut n).range(1..=500));
+                        let r = ui.add(egui::DragValue::new(&mut n).range(1..=500)).labelled_by(input_label.id);
                         if drag.settled(ui, &r, &mut n) && n as usize != *rows {
                             update(app, json!({"rows": n}));
                         }
                         ui.end_row();
                     }
-                    ElementKind::Rectangle { fill, outline, width } | ElementKind::Ellipse { fill, outline, width } => {
+                    ElementKind::Rectangle { fill, outline, width, .. } | ElementKind::Ellipse { fill, outline, width } => {
                         // A fill with no opacity leaves only the outline; an outline 0 wide, only the fill.
                         for (label, key, current) in [("Fill", "fill", *fill), ("Outline", "outline", *outline)] {
                             ui.label(tl!(label));
@@ -1488,10 +1662,12 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                             }
                             ui.end_row();
                         }
-                        ui.label(tl!("Outline width"));
+                        let input_label = ui.label(tl!("Outline width"));
                         let mut wd = *width;
                         let drag = Dragged::lend(ui, drag_key("width"), &mut wd);
-                        let r = ui.add(egui::DragValue::new(&mut wd).range(0.0..=50.0).speed(0.1).max_decimals(1).suffix(" pt"));
+                        let r = ui
+                            .add(egui::DragValue::new(&mut wd).range(0.0..=50.0).speed(0.1).max_decimals(1).suffix(" pt"))
+                            .labelled_by(input_label.id);
                         if drag.settled(ui, &r, &mut wd) && (wd - width).abs() > 1e-6 {
                             update(app, json!({"width": wd}));
                         }
@@ -1504,29 +1680,37 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                             update(app, json!({"color": crate::theme::rgba(c).hex()}));
                         }
                         ui.end_row();
-                        ui.label(tl!("Width"));
+                        let input_label = ui.label(tl!("Width"));
                         let mut wd = *width;
                         let drag = Dragged::lend(ui, drag_key("width"), &mut wd);
-                        let r = ui.add(egui::DragValue::new(&mut wd).range(0.1..=50.0).speed(0.1).max_decimals(1).suffix(" pt"));
+                        let r = ui
+                            .add(egui::DragValue::new(&mut wd).range(0.1..=50.0).speed(0.1).max_decimals(1).suffix(" pt"))
+                            .labelled_by(input_label.id);
                         if drag.settled(ui, &r, &mut wd) && (wd - width).abs() > 1e-6 {
                             update(app, json!({"width": wd}));
                         }
                         ui.end_row();
-                        ui.label(tl!("Arrowheads"));
-                        egui::ComboBox::from_id_salt(("line_head", id)).selected_text(tl!(head.label())).show_ui(ui, |ui| {
-                            for h in LineHead::ALL {
-                                if ui.selectable_label(h == *head, tl!(h.label())).clicked() {
-                                    update(app, json!({"head": h.code()}));
+                        let input_label = ui.label(tl!("Arrowheads"));
+                        egui::ComboBox::from_id_salt(("line_head", id))
+                            .selected_text(tl!(head.label()))
+                            .show_ui(ui, |ui| {
+                                for h in LineHead::ALL {
+                                    if ui.selectable_label(h == *head, tl!(h.label())).clicked() {
+                                        update(app, json!({"head": h.code()}));
+                                    }
                                 }
-                            }
-                        });
+                            })
+                            .response
+                            .labelled_by(input_label.id);
                         ui.end_row();
                         // Anticlockwise from pointing right; the rotation handle above it turns it too.
-                        ui.label(tl!("Angle"));
+                        let input_label = ui.label(tl!("Angle"));
                         let current = line_angle((e.x, e.y, e.w, e.h), *dir, *head);
                         let mut a = current;
                         let drag = Dragged::lend(ui, drag_key("angle"), &mut a);
-                        let r = ui.add(egui::DragValue::new(&mut a).range(-180.0..=180.0).speed(1.0).max_decimals(1).suffix("°"));
+                        let r = ui
+                            .add(egui::DragValue::new(&mut a).range(-180.0..=180.0).speed(1.0).max_decimals(1).suffix("°"))
+                            .labelled_by(input_label.id);
                         if drag.settled(ui, &r, &mut a) && (a - current).abs() > 1e-6 {
                             update(app, json!({"angle": a}));
                         }
@@ -1538,11 +1722,11 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
         );
     });
     // A layout's text: the form a text graphic has too (#516, #535), with the page's dynamic text.
-    if let ElementKind::Text { text, size, color, bold, italic, align, letter_spacing } = &e.kind {
+    if let ElementKind::Text { text, size, color, bold, italic, align, letter_spacing, font, font_name } = &e.kind {
         let key = (li, id, "text");
         let mut buf = app.layout.typing.remove(&key).unwrap_or_else(|| text.clone());
         let (mut sz, mut c, mut bb) = (*size, crate::theme::c32(*color), *bold);
-        let (mut it, mut al, mut ls) = (*italic, *align, *letter_spacing);
+        let (mut it, mut al, mut ls, mut fam, mut named) = (*italic, *align, *letter_spacing, *font, font_name.clone());
         let tokens = [rustgis_engine::map::graphics::TOKENS, rustgis_engine::map::layout::PAGE_TOKENS];
         let fields = crate::textform::Fields {
             text: &mut buf,
@@ -1552,6 +1736,9 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
             italic: Some(&mut it),
             align: Some(&mut al),
             letter_spacing: Some(&mut ls),
+            font: Some(&mut fam),
+            font_name: Some(&mut named),
+            named_fonts: true,
             select: false,
         };
         let settled = crate::textform::section(ui, "Text", |ui| crate::textform::show(ui, ("layout_text", li, id), &tokens, fields))
@@ -1578,6 +1765,14 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
         }
         if settled.letter_spacing {
             update(app, json!({"letterSpacing": ls}));
+        }
+        if settled.font {
+            // A named family with its fallback (#762), else the generic one.
+            let font = match &named {
+                Some(n) => json!({"font": n, "fallback": fam.code()}),
+                None => json!({"font": fam.code()}),
+            };
+            update(app, font);
         }
     }
     // The layers a legend lists: a checkbox for each vector layer of its frame's map, ticked when
@@ -1638,16 +1833,18 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                     update(app, json!({"extentIndicator": {"color": crate::theme::rgba(c).hex()}}));
                 }
                 ui.end_row();
-                ui.label(tl!("Line width"));
+                let input_label = ui.label(tl!("Line width"));
                 let mut w = *extent_width;
                 let drag = Dragged::lend(ui, drag_key("extentWidth"), &mut w);
-                let r = ui.add(
-                    egui::DragValue::new(&mut w)
-                        .range(rustgis_engine::map::layout::MIN_INDICATOR_WIDTH..=rustgis_engine::map::layout::MAX_INDICATOR_WIDTH)
-                        .speed(0.05)
-                        .max_decimals(2)
-                        .suffix(" pt"),
-                );
+                let r = ui
+                    .add(
+                        egui::DragValue::new(&mut w)
+                            .range(rustgis_engine::map::layout::MIN_INDICATOR_WIDTH..=rustgis_engine::map::layout::MAX_INDICATOR_WIDTH)
+                            .speed(0.05)
+                            .max_decimals(2)
+                            .suffix(" pt"),
+                    )
+                    .labelled_by(input_label.id);
                 if drag.settled(ui, &r, &mut w) && (w - extent_width).abs() > 1e-6 {
                     update(app, json!({"extentIndicator": {"width": w}}));
                 }
@@ -1673,7 +1870,8 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
 }
 
 /// Duplicate and Delete, under the properties: a locked element can be copied (the copy isn't
-/// locked) but not deleted, nor a frame with a locked surround.
+/// locked) but not deleted, nor a frame with a locked surround. Then the drawing order: Bring to
+/// Front, Bring Forward, Send Backward, Send to Back.
 fn element_actions(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize, id: u32) {
     ui.add_space(8.0);
     ui.horizontal(|ui| {
@@ -1690,6 +1888,27 @@ fn element_actions(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize
         {
             let _ = app.run("layout.removeElement", json!({"layout": li, "element": id}));
             app.layout.selected = None;
+        }
+    });
+    // The drawing order: a legend brought to the front is drawn over the map frame under it.
+    // A step it can't take (already on top, or at the bottom) is greyed, as is a locked element.
+    let Some((at, n)) = layout.draw_order(id) else { return };
+    let locked = layout.element(id).is_some_and(|e| e.locked);
+    ui.horizontal_wrapped(|ui| {
+        for to in Arrange::ALL {
+            let can = match to {
+                Arrange::Front | Arrange::Forward => at + 1 < n,
+                Arrange::Backward | Arrange::Back => at > 0,
+            };
+            let tip = match to {
+                Arrange::Front => "Draw it over every other element",
+                Arrange::Forward => "Draw it over the element above it",
+                Arrange::Backward => "Draw it under the element below it",
+                Arrange::Back => "Draw it under every other element",
+            };
+            if ui.add_enabled(can && !locked, egui::Button::new(tl!(to.label()))).on_hover_text(tl!(tip)).clicked() {
+                let _ = app.run("layout.arrange", json!({"layout": li, "element": id, "to": to.code()}));
+            }
         }
     });
 }
@@ -1768,6 +1987,67 @@ mod tests {
         let old = layout.element(id).unwrap();
         assert!(((e.x + e.w / 2.0) - (old.x + old.w / 2.0)).abs() < 1e-9 && ((e.y + e.h / 2.0) - (old.y + old.h / 2.0)).abs() < 1e-9);
         assert_eq!(app.layout.selected, Some(id), "still selected");
+    }
+
+    /// While a map frame is panned, its map is drawn past the frame's sides and slid with the
+    /// pointer, so what comes into view is map rather than the page beside the frame; the drawing
+    /// is let go when the pan ends, which moves the frame's map as before.
+    #[test]
+    fn a_panned_frame_shows_map_beyond_its_edges() {
+        use rustgis_engine::map::layout::ElementKind;
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Pan"})).unwrap();
+        app.layout.navigate = true;
+        let li = app.session.active_layout.unwrap();
+        let area = Rc::new(Cell::new(Rect::NOTHING));
+        let shown = area.clone();
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 760.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                shown.set(ui.available_rect_before_wrap());
+                super::show(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let layout = h.state().session.project.layouts[li].clone();
+        let id = layout.first_frame().unwrap();
+        let center = |l: &rustgis_engine::map::layout::Layout| match &l.element(id).unwrap().kind {
+            ElementKind::MapFrame { center, .. } => *center,
+            k => panic!("{k:?}"),
+        };
+        let before = center(&layout);
+        let e = layout.element(id).unwrap();
+        let (page, s) = page_rect(&h.state().layout, area.get(), &layout);
+        let from = to_screen(page, s, (e.x + e.w / 2.0, e.y + e.h / 2.0));
+        let to = from + vec2(120.0, 0.0);
+        let button = |pos: Pos2, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        h.event(Event::PointerMoved(from));
+        h.step();
+        h.event(button(from, true));
+        h.step();
+        for i in 1..=4 {
+            h.event(Event::PointerMoved(from + (to - from) * i as f32 / 4.0));
+            h.step();
+        }
+        // Mid-pan: the frame's map with its overscan is drawn, three frames wide and high.
+        let (pid, map) = h.state().layout.pan_preview.clone().expect("a preview while panning");
+        assert_eq!(pid, id);
+        let size = map.expect("the frame's map was drawn").size();
+        let frame_px = (e.w as f32 * s * h.ctx.pixels_per_point(), e.h as f32 * s * h.ctx.pixels_per_point());
+        assert!(
+            (size[0] as f32 - 3.0 * frame_px.0).abs() < 3.0 && (size[1] as f32 - 3.0 * frame_px.1).abs() < 3.0,
+            "{size:?} for a frame of {frame_px:?} px"
+        );
+        h.event(button(to, false));
+        h.step();
+        assert!(h.state().layout.pan_preview.is_none(), "let go after the pan");
+        assert_ne!(center(&h.state().session.project.layouts[li]), before, "the pan moved the frame's map");
     }
 
     /// Pressing a corner handle and dragging away fast resizes the element, though by the time
@@ -2089,6 +2369,39 @@ mod tests {
         assert_eq!(at(&h), (0.0, 0.0));
     }
 
+    /// The selected element's Bring to Front and Send to Back buttons move it in the drawing
+    /// order; a step it can't take is greyed.
+    #[test]
+    fn the_arrange_buttons_move_an_element_up_and_down() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Arrange"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let frame = app.session.project.layouts[li].first_frame().unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(600.0, 200.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                let layout = app.session.project.layouts[li].clone();
+                super::element_actions(app, ui, &layout, li, frame);
+            },
+            app,
+        );
+        h.run_steps(2);
+        let at = |h: &egui_kittest::Harness<'_, RustGisApp>| h.state().session.project.layouts[li].draw_order(frame).unwrap();
+        let n = at(&h).1;
+        h.get_by_label("Bring to Front").click();
+        h.run_steps(2);
+        assert_eq!(at(&h), (n - 1, n));
+        // On top, it can't go further up.
+        assert!(h.get_by_label("Bring Forward").accesskit_node().is_disabled());
+        h.get_by_label("Send Backward").click();
+        h.run_steps(2);
+        assert_eq!(at(&h).0, n - 2);
+        h.get_by_label("Send to Back").click();
+        h.run_steps(2);
+        assert_eq!(at(&h).0, 0);
+        assert!(h.get_by_label("Send to Back").accesskit_node().is_disabled());
+    }
+
     /// Ctrl+D (Cmd+D) duplicates the selected element and selects the copy; Backspace, the Mac's
     /// delete key, deletes it.
     #[test]
@@ -2235,6 +2548,16 @@ mod tests {
             matches!(kind, ElementKind::Text { italic: true, align: TextAlign::Left, letter_spacing, .. } if *letter_spacing == 3.5),
             "{kind:?}"
         );
+        // The family (#517): Serif picked from the Font list is stored.
+        h.get_by_role_and_label(Role::ComboBox, "Font").click();
+        h.run_steps(2);
+        h.get_by_label("Serif").click();
+        h.run_steps(3);
+        let kind = &h.state().session.project.layouts[li].element(title).unwrap().kind;
+        assert!(matches!(kind, ElementKind::Text { font: rustgis_engine::map::layout::FontFamily::Serif, .. }), "{kind:?}");
+        // Said where no serif is installed, and only there.
+        let said = h.query_by_label_contains("No serif font is installed").is_some();
+        assert_eq!(said, !rustgis_engine::render::fonts::serif_available());
     }
 
     /// A number dragged in the Format pane and let go is applied (#607): X moves the element by
@@ -2464,6 +2787,56 @@ mod tests {
         }
         super::show(app, ui);
         super::save_drafts(app);
+    }
+
+    /// A frame's grid in the Format pane: a graticule's degree rows, or a measured grid's
+    /// coordinate system (typed, set once left) and short labels.
+    #[test]
+    fn a_measured_grid_is_set_in_the_format_pane() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::map::layout::ElementKind;
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Hike"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let frame = app.session.project.layouts[li].elements.iter().find(|e| e.kind.code() == "mapFrame").unwrap().id;
+        app.run("layout.addElement", json!({"kind": "grid"})).unwrap();
+        app.run("ui.pane.format", json!({})).unwrap();
+        app.layout.selected = Some(frame);
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 1400.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                with_format(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let grid = |h: &egui_kittest::Harness<'_, RustGisApp>| match &h.state().session.project.layouts[li].element(frame).unwrap().kind {
+            ElementKind::MapFrame { grid, .. } => grid.clone().unwrap(),
+            _ => panic!("not a frame"),
+        };
+        assert!(h.query_by_label("N/S/E/W").is_some() && h.query_by_label("Coordinate system").is_none(), "a graticule's rows");
+        h.state_mut().run("layout.update", json!({"element": frame, "grid": {"type": "measured"}})).unwrap();
+        h.run_steps(3);
+        assert!(h.query_by_label("N/S/E/W").is_none(), "no degrees for a measured grid");
+        assert!(h.query_by_label("Short labels").is_some());
+        // A system typed is set once the field is left; until then, the grid's stays.
+        h.get_by_role_and_label(Role::TextInput, "Coordinate system").focus();
+        h.run_steps(2);
+        h.get_by_role_and_label(Role::TextInput, "Coordinate system").type_text("EPSG:2056");
+        h.run_steps(2);
+        assert_eq!(grid(&h).crs, None, "not while typing");
+        h.key_press(egui::Key::Enter);
+        h.run_steps(3);
+        assert_eq!(grid(&h).crs.as_deref(), Some("EPSG:2056"));
+        h.get_by_label("Short labels").click();
+        h.run_steps(2);
+        assert!(grid(&h).short);
     }
 
     /// Selecting an element opens the Format pane, a tab like the others (#516). Closing it keeps

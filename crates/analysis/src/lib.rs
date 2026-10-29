@@ -14,14 +14,21 @@ pub mod convert;
 pub mod dggs;
 pub mod geodesic;
 pub mod georef;
+mod join;
+pub mod kriging;
+mod merge;
 pub mod network;
 pub mod neural;
 pub mod rasterops;
+pub mod selection;
+mod stats;
 pub mod tissot;
 mod tools;
 pub mod topology;
+pub mod trend;
+pub mod warp;
 
-pub use tools::{TOOLS, holds_coordinates, simplify_geometry};
+pub use tools::{TOOLS, find_field_case_insensitive, holds_coordinates, param_applies, simplify_geometry, zonal_bands};
 
 use rustgis_data::Dataset;
 use serde_json::Value;
@@ -58,6 +65,11 @@ pub enum ParamKind {
     Bool,
     /// A file path typed by the user (for data RustGIS doesn't open as a layer, such as LiDAR).
     Path,
+    /// A file written by the tool, not an input to read. Native callers supply a destination;
+    /// browser callers supply a download name (or use the tool's suggested name).
+    SaveFile {
+        ext: &'static str,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -85,6 +97,8 @@ pub enum Output {
     Table(Dataset),
     /// Several new layers and tables (external tools can write more than one output).
     Layers(Vec<OutputLayer>),
+    /// A downloadable file, never added to the map as a layer.
+    File { file_name: String, bytes: Vec<u8> },
 }
 
 /// One output of [`Output::Layers`].
@@ -141,6 +155,18 @@ pub trait Inputs {
     /// The longitude/latitude extent the map's view shows, when there is a view.
     fn view_extent(&self) -> Option<rustgis_geom::Extent> {
         None
+    }
+
+    /// Builds a vector-tile archive without coupling the analysis crate to the tile crate.
+    fn vector_to_pmtiles(
+        &self,
+        _dataset: &Dataset,
+        _rows: &[usize],
+        _min_zoom: u8,
+        _max_zoom: u8,
+        _source_layer: &str,
+    ) -> Result<(Vec<u8>, Vec<String>), String> {
+        Err("vector-to-PMTiles export is unavailable in this input provider".into())
     }
 }
 
@@ -329,6 +355,22 @@ fn choice(spec: &ToolSpec, ps: &ParamSpec, choices: &[&str], v: &Value) -> Resul
         Some(c) => Ok(Value::String((*c).to_string())),
         None => Err(format!("{}: '{}' must be one of {} (not {v})", spec.name, ps.label, choices.join(", "))),
     }
+}
+
+/// A multi-layer parameter: semicolon-separated names or an array of names.
+pub fn layer_list(value: &Value) -> Result<Vec<&str>, String> {
+    let names: Vec<&str> = match value {
+        Value::String(text) => text.split(';').map(str::trim).filter(|n| !n.is_empty()).collect(),
+        Value::Array(values) => values
+            .iter()
+            .map(|v| v.as_str().map(str::trim).filter(|n| !n.is_empty()).ok_or("input layers must be nonempty names"))
+            .collect::<Result<_, _>>()?,
+        _ => return Err("input layers must be names separated by ; or an array of names".into()),
+    };
+    if names.is_empty() {
+        return Err("at least one input layer is required".into());
+    }
+    Ok(names)
 }
 
 /// Runs a tool with JSON parameters, filling defaults and checking required ones.

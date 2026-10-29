@@ -9,11 +9,16 @@ use serde_json::{Value, json};
 use crate::RustGisApp;
 use crate::theme::{Tokens, semibold};
 
+pub(crate) const DISTANCE_UNITS: &[&str] = &["Meters", "Feet", "Kilometers", "Miles"];
+pub(crate) const DISTANCE_UNITS_PREF: &str = "editing_distance_units";
+
 /// Text typed into the panes' forms.
 #[derive(Default)]
 pub struct Forms {
     pub dx: String,
     pub dy: String,
+    /// Remembered units for Move and constant elevation.
+    pub distance_units: String,
     pub angle: String,
     pub factor: String,
     pub template: String,
@@ -89,12 +94,17 @@ fn layer_names(app: &RustGisApp, pred: impl Fn(&rustgis_engine::map::Layer) -> b
     app.session.map().layers.iter().filter(|l| pred(l)).map(|l| l.name.clone()).collect()
 }
 
-fn combo(ui: &mut Ui, id: &str, value: &mut String, options: &[String]) {
-    egui::ComboBox::from_id_salt(id).selected_text(value.as_str()).width(170.0).show_ui(ui, |ui| {
-        for o in options {
-            ui.selectable_value(value, o.clone(), o.as_str());
-        }
-    });
+fn combo(ui: &mut Ui, id: &str, name: &str, value: &mut String, options: &[String]) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(value.as_str())
+        .width(170.0)
+        .show_ui(ui, |ui| {
+            for o in options {
+                ui.selectable_value(value, o.clone(), o.as_str());
+            }
+        })
+        .response
+        .on_hover_text(tl!(name));
 }
 
 pub fn editing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
@@ -111,6 +121,24 @@ pub fn editing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         }
     });
 
+    let mut units_changed = false;
+    ui.horizontal(|ui| {
+        let unit_label = ui.label(tl!("Distance units"));
+        let _ = egui::ComboBox::from_id_salt(DISTANCE_UNITS_PREF)
+            .selected_text(tl!(&app.forms.distance_units))
+            .show_ui(ui, |ui| {
+                for &unit in DISTANCE_UNITS {
+                    units_changed |= ui.selectable_value(&mut app.forms.distance_units, unit.to_string(), tl!(unit)).changed();
+                }
+            })
+            .response
+            .labelled_by(unit_label.id);
+    });
+    if units_changed && let Some(save) = &app.services.save_pref {
+        save(DISTANCE_UNITS_PREF, &app.forms.distance_units);
+    }
+    let units = app.forms.distance_units.clone();
+
     heading(ui, "Modify Selected Features");
     // Texts alone (#516): of these tools only Move applies to them (the others turn, scale or cut
     // shapes, and a text is a point); they are formatted in the Format pane.
@@ -120,20 +148,20 @@ pub fn editing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     };
     let not_for_texts = tl!("Not for texts: a text is edited in the Format pane.");
     egui::Grid::new("modify").num_columns(3).spacing(vec2(6.0, 6.0)).show(ui, |ui| {
-        ui.label(tl!("Move (m)"));
+        ui.label(tl!("Move"));
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut app.forms.dx).hint_text("east").desired_width(52.0));
-            ui.add(egui::TextEdit::singleline(&mut app.forms.dy).hint_text("north").desired_width(52.0));
+            ui.add(egui::TextEdit::singleline(&mut app.forms.dx).hint_text(tl!("east")).desired_width(52.0));
+            ui.add(egui::TextEdit::singleline(&mut app.forms.dy).hint_text(tl!("north")).desired_width(52.0));
         });
         if ui.button(tl!("Move")).clicked() {
             let (tx, ty) = (app.forms.dx.clone(), app.forms.dy.clone());
             if let (Some(dx), Some(dy)) = (number(app, &tx, "East"), number(app, &ty, "North")) {
-                run(app, "edit.move", json!({"dx": dx, "dy": dy}));
+                run(app, "edit.move", json!({"dx": dx, "dy": dy, "units": units}));
             }
         }
         ui.end_row();
-        ui.label(tl!("Rotate (°)"));
-        ui.add(egui::TextEdit::singleline(&mut app.forms.angle).hint_text("90").desired_width(124.0));
+        let input_label = ui.label(tl!("Rotate (°)"));
+        ui.add(egui::TextEdit::singleline(&mut app.forms.angle).hint_text("90").desired_width(124.0)).labelled_by(input_label.id);
         if ui.add_enabled(!only_texts, egui::Button::new(tl!("Rotate"))).on_disabled_hover_text(not_for_texts).clicked() {
             let t = app.forms.angle.clone();
             if let Some(a) = number(app, &t, "Angle") {
@@ -141,8 +169,8 @@ pub fn editing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             }
         }
         ui.end_row();
-        ui.label(tl!("Scale (×)"));
-        ui.add(egui::TextEdit::singleline(&mut app.forms.factor).hint_text("2").desired_width(124.0));
+        let input_label = ui.label(tl!("Scale (×)"));
+        ui.add(egui::TextEdit::singleline(&mut app.forms.factor).hint_text("2").desired_width(124.0)).labelled_by(input_label.id);
         if ui.add_enabled(!only_texts, egui::Button::new(tl!("Scale"))).on_disabled_hover_text(not_for_texts).clicked() {
             let t = app.forms.factor.clone();
             if let Some(k) = number(app, &t, "Scale") {
@@ -240,13 +268,15 @@ pub fn editing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         if ui.radio(mode == "none", tl!("None")).clicked() {
             run(app, "edit.elevation", json!({"mode": "none"}));
         }
-        if ui.radio(mode == "constant", tl!("Constant")).clicked() {
+        let constant = ui.radio(mode == "constant", tl!("Constant")).clicked();
+        ui.add(egui::TextEdit::singleline(&mut app.forms.z).hint_text(tl!("z")).desired_width(60.0));
+        let apply = ui.button(tl!("Apply elevation")).clicked();
+        if constant || apply {
             let t = app.forms.z.clone();
             if let Some(z) = number(app, &t, "Elevation") {
-                run(app, "edit.elevation", json!({"mode": "constant", "z": z}));
+                run(app, "edit.elevation", json!({"mode": "constant", "z": z, "units": units}));
             }
         }
-        ui.add(egui::TextEdit::singleline(&mut app.forms.z).hint_text("z (m)").desired_width(60.0));
         for r in &rasters {
             let on = matches!(&settings.elevation, Elevation::Surface(n) if n == r);
             if ui.radio(on, crate::i18n::fmt("Surface: {layer}", &[("layer", r)])).clicked() {
@@ -254,6 +284,8 @@ pub fn editing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             }
         }
     });
+
+    ui.weak(tl!("The current elevation stays in effect while you edit inputs. Click Apply elevation to apply the value and units."));
 
     heading(ui, "Ground To Grid");
     ui.horizontal(|ui| {
@@ -291,10 +323,10 @@ pub fn editing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         if app.forms.rule_kind.is_empty() {
             app.forms.rule_kind = "mustNotOverlap".into();
         }
-        combo(ui, "topo_kind", &mut app.forms.rule_kind, &kinds);
-        combo(ui, "topo_layer", &mut app.forms.rule_layer, &feature_layers);
+        combo(ui, "topo_kind", "Rule", &mut app.forms.rule_kind, &kinds);
+        combo(ui, "topo_layer", "Layer", &mut app.forms.rule_layer, &feature_layers);
         if app.forms.rule_kind == "mustBeCoveredBy" {
-            combo(ui, "topo_by", &mut app.forms.rule_by, &feature_layers);
+            combo(ui, "topo_by", "By layer", &mut app.forms.rule_by, &feature_layers);
         }
         if ui.button(tl!("Add Rule")).clicked() {
             let add = json!({"rule": app.forms.rule_kind, "layer": app.forms.rule_layer, "by": app.forms.rule_by});
@@ -372,7 +404,7 @@ pub fn design(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         });
     }
     ui.horizontal(|ui| {
-        combo(ui, "dom_field", &mut app.forms.field, &fields);
+        combo(ui, "dom_field", "Field", &mut app.forms.field, &fields);
         ui.add(egui::TextEdit::singleline(&mut app.forms.min).hint_text("min").desired_width(46.0));
         ui.add(egui::TextEdit::singleline(&mut app.forms.max).hint_text("max").desired_width(46.0));
     });
@@ -415,7 +447,7 @@ pub fn design(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     let ints: Vec<String> =
         l.dataset.fields.iter().filter(|f| f.ty == rustgis_engine::data::FieldType::Integer).map(|f| f.name.clone()).collect();
     ui.horizontal(|ui| {
-        combo(ui, "sub_field", &mut app.forms.subtype_field, &ints);
+        combo(ui, "sub_field", "Field", &mut app.forms.subtype_field, &ints);
         if ui.button(tl!("Set Subtypes")).on_hover_text(tl!("One per line: code=name")).clicked() {
             let subs: Vec<Value> = app
                 .forms
@@ -451,7 +483,7 @@ pub fn design(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         ui.add(egui::TextEdit::singleline(&mut app.forms.rule_name).hint_text(tl!("Rule name")).desired_width(110.0));
         ui.checkbox(&mut app.forms.calc, tl!("Calculation"));
         if app.forms.calc {
-            combo(ui, "rule_field", &mut app.forms.calc_field, &fields);
+            combo(ui, "rule_field", "Field", &mut app.forms.calc_field, &fields);
         }
     });
     ui.horizontal(|ui| {
@@ -545,11 +577,11 @@ pub fn design(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     };
     let (of, df) = (fields_of(app, &app.forms.rel_origin), fields_of(app, &app.forms.rel_dest));
     egui::Grid::new("rel").num_columns(2).spacing(vec2(6.0, 4.0)).show(ui, |ui| {
-        combo(ui, "rel_o", &mut app.forms.rel_origin, &layers);
-        combo(ui, "rel_ok", &mut app.forms.rel_origin_key, &of);
+        combo(ui, "rel_o", "Origin", &mut app.forms.rel_origin, &layers);
+        combo(ui, "rel_ok", "Origin key", &mut app.forms.rel_origin_key, &of);
         ui.end_row();
-        combo(ui, "rel_d", &mut app.forms.rel_dest, &layers);
-        combo(ui, "rel_dk", &mut app.forms.rel_dest_key, &df);
+        combo(ui, "rel_d", "Destination", &mut app.forms.rel_dest, &layers);
+        combo(ui, "rel_dk", "Destination key", &mut app.forms.rel_dest_key, &df);
         ui.end_row();
     });
     ui.add(egui::TextEdit::singleline(&mut app.forms.rel_name).hint_text(tl!("Relationship name")).desired_width(180.0));

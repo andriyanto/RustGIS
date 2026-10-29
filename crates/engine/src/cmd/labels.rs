@@ -1,62 +1,176 @@
-//! View › Labeling (lock, pause, unplaced labels, convert to annotation), the Style tab's label
-//! visibility range and placement, and a layer's label classes (#618).
+//! The Labeling tab (#897): Map Labeling (lock, pause, unplaced labels, convert to annotation), a
+//! layer's label visibility range and placement, and its label classes (#618).
 
 use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as Attr};
 use rustgis_map::symbology::{MAX_LABEL_CLASSES, label_class_name};
-use rustgis_map::{LabelClass, LabelMatcher, LabelPlacement, Labeling, Renderer, Rgba, Symbol};
+use rustgis_map::{LabelBackground, LabelClass, LabelMatcher, LabelPlacement, Labeling, Renderer, Rgba, Symbol};
 use serde_json::{Value, json};
 
 use super::layer::s_req;
 use super::{b, f, need_feature_layer, ps};
 use crate::{CmdResult, CommandSpec as C, Session};
 
+/// A number, or a number written as text (as `f` reads a parameter).
+fn number(v: &Value) -> Option<f64> {
+    v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())).filter(|x: &f64| x.is_finite())
+}
+
+/// A label offset given as `[right, down]` (points), each kept within the range a class keeps.
+fn label_offset(v: &Value) -> Option<[f32; 2]> {
+    let range = rustgis_map::symbology::LABEL_OFFSET;
+    let [x, y] = v.as_array()?.as_slice() else { return None };
+    let within = |v: &Value| number(v).map(|v| v.clamp(*range.start(), *range.end()) as f32);
+    Some([within(x)?, within(y)?])
+}
+
+/// What `labels.style`'s `background` does to a class's background.
+pub(super) type BackgroundChange = Box<dyn Fn(Option<LabelBackground>) -> Option<LabelBackground>>;
+
+/// Reads `labels.style`'s `background`: false or null takes it away, true puts one on (the default,
+/// or the one it has), and an object sets the parts it gives on the one it has (else on the
+/// default). Anything else, or a part that isn't what it should be, is an error.
+pub(super) fn background_change(v: &Value) -> Result<BackgroundChange, String> {
+    let o = match v {
+        Value::Null | Value::Bool(false) => return Ok(Box::new(|_| None)),
+        Value::Bool(true) => return Ok(Box::new(|b| Some(b.unwrap_or_default()))),
+        Value::Object(o) => o,
+        _ => return Err("background must be true, false, null or {fill, stroke, strokeWidth, padding, radius}".into()),
+    };
+    // A colour, or "" or null for none.
+    let color = |k: &str| -> Result<Option<Option<Rgba>>, String> {
+        match o.get(k) {
+            None => Ok(None),
+            Some(Value::Null) => Ok(Some(None)),
+            Some(Value::String(c)) if c.trim().is_empty() => Ok(Some(None)),
+            Some(Value::String(c)) => Rgba::from_hex(c.trim())
+                .map(|c| Some(Some(c)))
+                .ok_or_else(|| format!("background.{k} must be #RRGGBB or #RRGGBBAA, or \"\"")),
+            Some(_) => Err(format!("background.{k} must be #RRGGBB or #RRGGBBAA, or \"\"")),
+        }
+    };
+    let number = |v: &Value| number(v).map(|v| v as f32);
+    let points = |k: &str| -> Result<Option<f32>, String> {
+        o.get(k).map(|v| number(v).ok_or_else(|| format!("background.{k} must be a number of points"))).transpose()
+    };
+    let (fill, stroke) = (color("fill")?, color("stroke")?);
+    let (stroke_width, radius) = (points("strokeWidth")?, points("radius")?);
+    let padding = match o.get("padding") {
+        None => None,
+        Some(v) => match v.as_array().map(Vec::as_slice) {
+            Some([x, y]) => Some([number(x), number(y)]),
+            _ => None,
+        }
+        .and_then(|[x, y]| Some([x?, y?]))
+        .map(Some)
+        .ok_or("background.padding must be [across, up and down] in points")?,
+    };
+    Ok(Box::new(move |b| {
+        let mut b = b.unwrap_or_default();
+        if let Some(c) = fill {
+            b.fill = c;
+        }
+        if let Some(c) = stroke {
+            b.stroke = c;
+        }
+        if let Some(w) = stroke_width {
+            b.stroke_width = w;
+        }
+        if let Some(p) = padding {
+            b.padding = p;
+        }
+        if let Some(r) = radius {
+            b.radius = r;
+        }
+        Some(b.checked())
+    }))
+}
+
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("labels.lock", "Lock", "View › Labeling", |s, p| {
+        C::new("labels.lock", "Lock", "Labeling › Map Labeling", |s, p| {
             let d = &mut s.map_mut().label_display;
             d.locked = b(p, "on").unwrap_or(!d.locked);
             Ok(json!({"locked": d.locked}))
         })
         .view()
         .params(r#"{"on"?: bool}"#),
-        C::new("labels.pause", "Pause", "View › Labeling", |s, p| {
+        C::new("labels.pause", "Pause", "Labeling › Map Labeling", |s, p| {
             let d = &mut s.map_mut().label_display;
             d.paused = b(p, "on").unwrap_or(!d.paused);
             Ok(json!({"paused": d.paused}))
         })
         .view()
         .params(r#"{"on"?: bool}"#),
-        C::new("labels.viewUnplaced", "View Unplaced", "View › Labeling", |s, p| {
+        C::new("labels.viewUnplaced", "View Unplaced", "Labeling › Map Labeling", |s, p| {
             let d = &mut s.map_mut().label_display;
             d.show_unplaced = b(p, "on").unwrap_or(!d.show_unplaced);
             Ok(json!({"showUnplaced": d.show_unplaced}))
         })
         .view()
         .params(r#"{"on"?: bool}"#),
-        C::new("labels.convert", "Convert To Annotation", "View › Labeling", convert)
+        C::new("labels.fonts", "Label Fonts", "View › Windows › Labeling", |_, p| {
+            // The families a font picker lists, those containing `search` (in any case) if given.
+            // While the app is still indexing them (commands run on its UI thread), none yet,
+            // and `indexing` says so: asking again later lists them.
+            let search = ps(p, "search").map(str::to_lowercase).unwrap_or_default();
+            let Some(all) = crate::render::families::available() else { return Ok(json!({"fonts": [], "indexing": true})) };
+            let fonts: Vec<&str> =
+                all.iter().filter(|f| f.listed && f.name.to_lowercase().contains(&search)).map(|f| f.name.as_str()).collect();
+            Ok(json!({"fonts": fonts}))
+        })
+        .view()
+        .params(r#"{"search"?: text in the family name} → {"fonts": [the installed font families, by name], "indexing"?: true (still being indexed: none listed yet)}"#),
+        C::new("labels.convert", "Convert To Annotation", "Labeling › Map Labeling", convert)
             .when(need_feature_layer)
             .params(r#"{"layer"?, "name"?: string}"#),
-        C::new("labels.scaleRange", "Label Visibility Range", "Style › Label Range", scale_range)
+        C::new("labels.scaleRange", "Label Visibility Range", "Labeling › Label Range", scale_range)
             .when(need_feature_layer)
             .params(r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "min"?: scale|null (out beyond), "max"?: scale|null (in beyond), "clear"?: bool (clears the scale and distance limits, as Clear Limits does)}"#),
-        C::new("labels.distanceRange", "Label Distance Range", "Style › Label Range", distance_range)
+        C::new("labels.distanceRange", "Label Distance Range", "Labeling › Label Range", distance_range)
             .when(need_feature_layer)
             .params(r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "closest"?: metres|null, "farthest"?: metres|null, "clear"?: bool}"#),
-        C::new("labels.placement", "Label Placement", "Style › Label Placement", |s, p| {
-            let code = ps(p, "position").ok_or("position is required")?;
-            let pos = LabelPlacement::from_code(code).ok_or_else(|| format!("unknown placement '{code}'"))?;
-            with_class(s, p, |c| c.placement = pos)
+        C::new("labels.placement", "Label Placement", "Labeling › Label Placement", |s, p| {
+            let pos = match ps(p, "position") {
+                Some(code) => Some(LabelPlacement::from_code(code).ok_or_else(|| format!("unknown placement '{code}'"))?),
+                None if p.get("offset").is_some() || p.get("repeat").is_some() => None,
+                None => return Err("position is required (or an offset or a repeat)".into()),
+            };
+            let offset = match p.get("offset") {
+                None => None,
+                Some(o) => Some(label_offset(o).ok_or("offset must be [right, down] in points")?),
+            };
+            // Along a line, a label every so many points (null or 0: the one at its middle).
+            let repeat = match p.get("repeat") {
+                None => None,
+                Some(Value::Null) => Some(None),
+                Some(v) => match number(v) {
+                    Some(0.0) => Some(None),
+                    Some(r) if r > 0.0 => Some(rustgis_map::symbology::label_repeat(r)),
+                    _ => return Err("repeat must be a number of points, or 0 or null for none".into()),
+                },
+            };
+            with_class(s, p, |c| {
+                if let Some(pos) = pos {
+                    c.placement = pos;
+                }
+                if let Some(o) = offset {
+                    c.offset = o;
+                }
+                if let Some(r) = repeat {
+                    c.repeat = r;
+                }
+            })
         })
         .when(need_feature_layer)
         .params(
-            r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "position": "auto"|"center"|"above"|"below"|"left"|"right"|"aboveRight"|"aboveLeft"|"belowRight"|"belowLeft"}"#,
+            r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "position"?: "auto"|"center"|"above"|"below"|"left"|"right"|"aboveRight"|"aboveLeft"|"belowRight"|"belowLeft"|"parallel" (along a line, straight)|"curved" (along a line, following its bends) (required without offset or repeat), "offset"?: [right, down] points (-200 to 200 each) the label moves from where its position puts it ([0, 0]: none; a label along a line isn't moved), "repeat"?: points (10 to 10000) between a line's labels, spaced out from the one at its middle, at most 32 a line (0 or null: the one at its middle; parallel and curved only)}"#,
         ),
-        // Label classes: a feature is labelled by the first class whose clause takes it, Default
-        // last (`Labeling`).
-        C::new("labels.class.add", "Add Label Class", "Style › Label Class", add_class)
+        // Label classes: each labels every feature its clause takes, as in ArcGIS Pro; the classes
+        // listed first, Default last, are placed first (`Labeling`, #732).
+        C::new("labels.class.add", "Add Label Class", "View › Windows › Labeling", add_class)
             .when(need_feature_layer)
-            .params(r#"{"layer"?, "name": string, "where"?: sql (a definition query's language; none takes every feature that reaches it), "from"?: class (whose field and text symbol it starts with; none: the Default class)}"#),
-        C::new("labels.class.remove", "Remove Label Class", "Style › Label Class", |s, p| {
+            .params(r#"{"layer"?, "name": string, "where"?: sql (a definition query's language; none takes every feature), "from"?: class (whose field and text symbol it starts with; none: the Default class)}"#),
+        C::new("labels.class.remove", "Remove Label Class", "View › Windows › Labeling", |s, p| {
             let name = s_req(p, "class")?.trim().to_string();
             with_labels(s, p, |labels| {
                 let i = extra_class(labels, &name)?;
@@ -67,7 +181,7 @@ pub fn commands() -> Vec<C> {
         .when(need_feature_layer)
         .params(r#"{"layer"?, "class": name (not Default)}"#),
         // Every class but Default; none to remove is no error, so a script can start with it.
-        C::new("labels.class.clear", "Remove All Label Classes", "Style › Label Class", |s, p| {
+        C::new("labels.class.clear", "Remove All Label Classes", "View › Windows › Labeling", |s, p| {
             let mut removed = 0;
             with_labels(s, p, |labels| {
                 removed = labels.classes.len();
@@ -78,7 +192,7 @@ pub fn commands() -> Vec<C> {
         })
         .when(need_feature_layer)
         .params(r#"{"layer"?}"#),
-        C::new("labels.class.rename", "Rename Label Class", "Style › Label Class", |s, p| {
+        C::new("labels.class.rename", "Rename Label Class", "View › Windows › Labeling", |s, p| {
             let class = s_req(p, "class")?.trim().to_string();
             let name = s_req(p, "name")?.to_string();
             with_labels(s, p, |labels| {
@@ -89,7 +203,7 @@ pub fn commands() -> Vec<C> {
         })
         .when(need_feature_layer)
         .params(r#"{"layer"?, "class": name, "name": string}"#),
-        C::new("labels.class.update", "Update Label Class", "Style › Label Class", |s, p| {
+        C::new("labels.class.update", "Update Label Class", "View › Windows › Labeling", |s, p| {
             let id = s.layer_id(p)?;
             let clause = s.map().layer(id).map(|l| clause(p, &l.dataset)).transpose()?.flatten();
             let visible = b(p, "visible");
@@ -104,9 +218,9 @@ pub fn commands() -> Vec<C> {
         })
         .when(need_feature_layer)
         .params(r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "where"?: sql|null, "visible"?: bool}"#),
-        C::new("labels.class.move", "Move Label Class", "Style › Label Class", |s, p| {
+        C::new("labels.class.move", "Move Label Class", "View › Windows › Labeling", |s, p| {
             let name = s_req(p, "class")?.trim().to_string();
-            let to = f(p, "to").filter(|v| v.is_finite()).ok_or("to is required: the class's place, 0 checked first")?;
+            let to = f(p, "to").filter(|v| v.is_finite()).ok_or("to is required: the class's place in the list, 0 first")?;
             with_labels(s, p, |labels| {
                 let i = extra_class(labels, &name)?;
                 let c = labels.classes.remove(i);
@@ -116,7 +230,7 @@ pub fn commands() -> Vec<C> {
             })
         })
         .when(need_feature_layer)
-        .params(r#"{"layer"?, "class": name (not Default), "to": number (its place among the classes checked before Default, 0 first)}"#),
+        .params(r#"{"layer"?, "class": name (not Default), "to": number (its place among the classes listed before Default, 0 first: placed first when labels compete for room)}"#),
     ]
 }
 
@@ -153,15 +267,26 @@ pub(crate) fn with_labels(s: &mut Session, p: &Value, f: impl FnOnce(&mut Labeli
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
     let mut labels = l.labels.clone();
     f(&mut labels)?;
+    let relock = !same_class_list(&l.labels, &labels);
     l.labels = labels;
+    if relock {
+        s.map_mut().label_lock = None;
+    }
     Ok(Value::Null)
+}
+
+/// Whether `a` and `b` list the same classes in the same order. A lock names each label by its
+/// class's place in the list (`LabelKey`), so when the list changes the labels are locked again
+/// where they are placed next (`Map::label_lock` emptied, #732).
+pub(crate) fn same_class_list(a: &Labeling, b: &Labeling) -> bool {
+    a.classes.iter().map(|c| &c.name).eq(b.classes.iter().map(|c| &c.name))
 }
 
 /// The place of the class named `name` among those checked before Default (of the
 /// `MAX_LABEL_CLASSES` that count, as `Labeling::class` finds them).
 fn extra_class(labels: &Labeling, name: &str) -> Result<usize, String> {
     if labels.default.name.eq_ignore_ascii_case(name) {
-        return Err(format!("{name} is the Default class: it labels the rest of the features, and stays last"));
+        return Err(format!("{name} is the Default class: it stays last in the list"));
     }
     let mut counted = labels.classes.iter().take(MAX_LABEL_CLASSES);
     counted.position(|c| c.name.eq_ignore_ascii_case(name)).ok_or_else(|| format!("no label class named '{name}'"))
@@ -270,10 +395,10 @@ fn distance_range(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 /// Converts a layer's labels into an annotation layer: one point per label, at the label point,
-/// carrying the label text and drawn with the same text symbol. Each feature takes the text of
-/// the class labelling it (a hidden class's take none); with classes besides Default, a CLASS
-/// field keeps which, and the annotation has the same classes, picking their points by it. The
-/// layer's own labels turn off.
+/// carrying the label text and drawn with the same text symbol. Each class labelling a feature
+/// gives it a point (a hidden class none); with classes besides Default, a CLASS field keeps
+/// which, and the annotation has the same classes, each picking its points by it. The layer's
+/// own labels turn off.
 fn convert(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     let l = s.map().layer(id).ok_or("no such layer")?;
@@ -297,18 +422,18 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
         if rows.get(row) != Some(&true) {
             continue;
         }
-        let Some((i, class)) = matcher.class_of(&l.dataset, row).filter(|(_, c)| c.visible) else { continue };
-        let Some(fi) = fields.get(i).copied().flatten() else { continue };
-        let v = l.dataset.value(row, fi);
-        if v.is_null() {
-            continue;
-        }
-        if let Some(c) = ft.geometry.as_ref().and_then(Geometry::label_point) {
+        let Some(at) = ft.geometry.as_ref().and_then(Geometry::label_point) else { continue };
+        for (i, class) in matcher.classes_of(&l.dataset, row).filter(|(_, c)| c.visible) {
+            let Some(fi) = fields.get(i).copied().flatten() else { continue };
+            let v = l.dataset.value(row, fi);
+            if v.is_null() {
+                continue;
+            }
             let mut attrs = vec![Attr::Text(v.to_string())];
             if classes {
                 attrs.push(Attr::Text(class.name.clone()));
             }
-            ds.push(Some(Geometry::Point(c)), attrs);
+            ds.push(Some(Geometry::Point(at)), attrs);
         }
     }
     if ds.features.is_empty() {
@@ -322,12 +447,10 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
     for c in std::iter::once(&mut labels.default).chain(labels.classes.iter_mut()) {
         c.field = "TEXT".into();
         c.placement = LabelPlacement::Center;
+        // Each class picks the points it labelled, Default too once there are others (#732):
+        // with no clause it would label theirs as well.
+        c.where_ = classes.then(|| format!("\"CLASS\" = '{}'", c.name.replace('\'', "''")));
     }
-    // Each class picks the points it labelled; Default, checked last, takes the rest.
-    for c in &mut labels.classes {
-        c.where_ = Some(format!("\"CLASS\" = '{}'", c.name.replace('\'', "''")));
-    }
-    labels.default.where_ = None;
     let (min_scale, max_scale) = (l.min_scale, l.max_scale);
     if let Some(src) = s.map_mut().layer_mut(id) {
         src.labels.enabled = false;

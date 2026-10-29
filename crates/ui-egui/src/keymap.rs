@@ -7,9 +7,14 @@
 
 use egui::Key;
 use rustgis_engine::Registry;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::RustGisApp;
+
+const MAX_PREF_BYTES: usize = 100_000;
+const MAX_PREF_CHANGES: usize = 1_000;
+const MAX_COMMAND_LEN: usize = 200;
 
 /// The default shortcuts: (keys, command, parameters as JSON, or empty for none). Clipboard
 /// keys are not here: they arrive as copy, cut and paste events, not key presses.
@@ -31,6 +36,11 @@ const DEFAULTS: &[(&str, &str, &str)] = &[
     ("Escape", "tool.set", r#"{"tool":"explore"}"#),
     ("Delete", "edit.delete", ""),
     ("Mod+D", "layout.duplicateElement", ""),
+    // The active layer in the Layers pane's outline, as a word processor's outline keys (#836).
+    ("Alt+Shift+ArrowRight", "layer.indent", ""),
+    ("Alt+Shift+ArrowLeft", "layer.outdent", ""),
+    ("Alt+Shift+ArrowUp", "layer.moveUp", ""),
+    ("Alt+Shift+ArrowDown", "layer.moveDown", ""),
 ];
 
 /// The clipboard keys: (keys, command). They arrive as copy, cut and paste events rather than key
@@ -41,6 +51,9 @@ pub const CLIPBOARD: &[(&str, &str)] = &[("Mod+C", "edit.copy"), ("Mod+X", "edit
 pub const MAP_TOOLS: &[(&str, &str)] = &[
     ("explore", "Explore"),
     ("select", "Select"),
+    ("selectPolygon", "Select by Polygon"),
+    ("selectLasso", "Select by Lasso"),
+    ("selectRadius", "Select by Radius"),
     ("zoomIn", "Zoom In"),
     ("measure", "Measure Distance"),
     ("measureArea", "Measure Area"),
@@ -70,6 +83,12 @@ pub struct Chord {
 }
 
 impl Chord {
+    /// Whether a focused text field takes this chord for itself: egui's undo (Mod+Z) and redo
+    /// (Mod+Y, Mod+Shift+Z), matched as egui matches them, an extra Alt or Shift aside.
+    pub fn is_text_undo(self) -> bool {
+        self.command && matches!(self.key, Key::Z | Key::Y)
+    }
+
     /// Reads `Mod+Shift+Z`, `Ctrl+T`, `Home`, `F5`, `Mod++`. `Ctrl`, `Cmd` and `⌘` all mean
     /// `Mod`; letters may be lower case. `None` for anything else.
     pub fn parse(s: &str) -> Option<Chord> {
@@ -108,14 +127,15 @@ impl Chord {
         m
     }
 
-    /// As shown to the user: `⇧⌘S` on macOS, `Ctrl+Shift+S` elsewhere.
-    pub fn text(self) -> String {
+    /// As shown to the user: `⇧⌘S` on a Mac (`mac`, as egui reads the keys: `ctx.os().is_mac()`, a
+    /// browser's too), `Ctrl+Shift+S` elsewhere.
+    pub fn text(self, mac: bool) -> String {
         let key = match self.key {
             Key::Escape => "Esc",
             Key::Plus | Key::Minus | Key::Equals => self.key.symbol_or_name(),
             k => k.name(),
         };
-        if cfg!(target_os = "macos") {
+        if mac {
             let mut s = String::new();
             for (on, sym) in [(self.alt, "⌥"), (self.shift, "⇧"), (self.command, "⌘")] {
                 if on {
@@ -132,6 +152,17 @@ impl Chord {
             }
             s + key
         }
+    }
+
+    /// [`Chord::text`] for `ctx`'s keys, Option spelled out (`Opt+⇧Right`) where the interface
+    /// faces have no "⌥" (egui's own have none, so a browser without the system's faces).
+    pub fn shown(self, ctx: &egui::Context) -> String {
+        let text = self.text(ctx.os().is_mac());
+        if !text.contains('⌥') {
+            return text;
+        }
+        let ids = [egui::FontId::monospace(12.0), egui::FontId::proportional(12.0)];
+        if ctx.fonts_mut(|f| ids.iter().all(|id| f.has_glyphs(id, "⌥"))) { text } else { text.replacen('⌥', "Opt+", 1) }
     }
 }
 
@@ -162,6 +193,17 @@ impl Binding {
         let none = |v: &Value| v.is_null() || v.as_object().is_some_and(|o| o.is_empty());
         self.command == command && (self.params == *params || (none(&self.params) && none(params)))
     }
+}
+
+/// One user change to the defaults, stored in preferences.
+#[derive(Serialize, Deserialize)]
+struct Change {
+    keys: String,
+    command: String,
+    #[serde(default)]
+    params: Value,
+    #[serde(default)]
+    remove: bool,
 }
 
 /// Every shortcut.
@@ -204,6 +246,74 @@ impl Keymap {
         map
     }
 
+    /// Apply stored user changes to this version's defaults. Returns false if any of them could
+    /// not be read: the valid ones still apply, but the stored text must not be overwritten.
+    pub fn apply_preferences(&mut self, text: &str) -> bool {
+        if text.len() > MAX_PREF_BYTES {
+            return false;
+        }
+        let Ok(changes) = serde_json::from_str::<Vec<Value>>(text) else { return false };
+        if changes.len() > MAX_PREF_CHANGES {
+            return false;
+        }
+        let mut readable = true;
+        for record in changes {
+            let Ok(change) = serde_json::from_value::<Change>(record) else {
+                readable = false;
+                continue;
+            };
+            let Some(chord) = Chord::parse(&change.keys) else {
+                readable = false;
+                continue;
+            };
+            if is_clipboard(chord) || change.command.is_empty() || change.command.len() > MAX_COMMAND_LEN {
+                readable = false;
+                continue;
+            }
+            if change.remove {
+                self.bindings.retain(|b| b.chord != chord || !b.runs(&change.command, &change.params));
+            } else {
+                self.bindings.retain(|b| b.chord != chord);
+                self.bindings.push(Binding { chord, command: change.command, params: change.params });
+            }
+        }
+        readable
+    }
+
+    /// Store differences only; return None if they would exceed the load limits.
+    pub fn preferences(&self, defaults: &Keymap) -> Option<String> {
+        let mut changes = Vec::new();
+        for b in &defaults.bindings {
+            if !self.bindings.contains(b) {
+                changes.push(Change { keys: b.chord.to_string(), command: b.command.clone(), params: b.params.clone(), remove: true });
+            }
+        }
+        for b in &self.bindings {
+            if !defaults.bindings.contains(b) {
+                changes.push(Change { keys: b.chord.to_string(), command: b.command.clone(), params: b.params.clone(), remove: false });
+            }
+        }
+        if changes.len() > MAX_PREF_CHANGES || changes.iter().any(|c| c.command.is_empty() || c.command.len() > MAX_COMMAND_LEN) {
+            return None;
+        }
+        serde_json::to_string(&changes).ok().filter(|text| text.len() <= MAX_PREF_BYTES)
+    }
+
+    /// Assign a chord, replacing its previous assignment. Clipboard chords are reserved.
+    pub fn assign(&mut self, chord: Chord, command: &str, params: Value) -> bool {
+        if is_clipboard(chord) || command.is_empty() {
+            return false;
+        }
+        self.bindings.retain(|b| b.chord != chord);
+        self.bindings.push(Binding { chord, command: command.to_owned(), params });
+        true
+    }
+
+    /// Remove a particular chord.
+    pub fn remove(&mut self, chord: Chord) {
+        self.bindings.retain(|b| b.chord != chord);
+    }
+
     /// The binding a key combination runs.
     pub fn command_for(&self, chord: Chord) -> Option<&Binding> {
         self.bindings.iter().find(|b| b.chord == chord)
@@ -236,6 +346,18 @@ impl Keymap {
     }
 }
 
+/// A key as a browser's keyboard event names it: by its `key` (`d`, `=`, `+`), else by its
+/// `code` (`KeyD`, `Digit1`, `Equal`, `Minus`), which stays put when Alt (⌥) changes the
+/// character a Mac types.
+pub fn browser_key(key: &str, code: &str) -> Option<Key> {
+    let by_name = |s: &str| Key::from_name(s).or_else(|| Key::from_name(&s.to_ascii_uppercase()));
+    by_name(key).or_else(|| match code {
+        "Equal" => Some(Key::Equals),
+        "Minus" => Some(Key::Minus),
+        c => by_name(c.strip_prefix("Key").or_else(|| c.strip_prefix("Digit")).unwrap_or(c)),
+    })
+}
+
 /// Whether a key combination is one of the [`CLIPBOARD`] keys.
 pub fn is_clipboard(chord: Chord) -> bool {
     CLIPBOARD.iter().any(|(keys, _)| Chord::parse(keys) == Some(chord))
@@ -243,9 +365,9 @@ pub fn is_clipboard(chord: Chord) -> bool {
 
 /// The first shortcut of `command` with `params` as shown to the user (a clipboard command's
 /// fixed key included), or empty for none.
-pub fn shortcut_text(app: &RustGisApp, command: &str, params: &Value) -> String {
+pub fn shortcut_text(ctx: &egui::Context, app: &RustGisApp, command: &str, params: &Value) -> String {
     let clipboard = || CLIPBOARD.iter().find(|(_, c)| *c == command).and_then(|(keys, _)| Chord::parse(keys));
-    app.ui.keymap.keys_for(command, params).next().or_else(clipboard).map(Chord::text).unwrap_or_default()
+    app.ui.keymap.keys_for(command, params).next().or_else(clipboard).map(|c| c.shown(ctx)).unwrap_or_default()
 }
 
 /// What a binding runs, translated: the command's label, or the map tool it picks.
@@ -276,6 +398,133 @@ mod tests {
     use super::*;
 
     #[test]
+    fn over_limit_preferences_are_rejected_without_partial_changes() {
+        let defaults = Keymap::default();
+        let too_many =
+            serde_json::to_string(&vec![serde_json::json!({"keys":"D","command":"select.clear"}); MAX_PREF_CHANGES + 1]).unwrap();
+        let too_large = " ".repeat(MAX_PREF_BYTES + 1);
+        for saved in [&too_many, &too_large] {
+            let mut keymap = defaults.clone();
+            assert!(!keymap.apply_preferences(saved));
+            assert_eq!(keymap, defaults);
+        }
+        let mut changed = defaults.clone();
+        changed.assign(Chord::parse("D").unwrap(), "test.command", Value::String("x".repeat(MAX_PREF_BYTES)));
+        assert!(changed.preferences(&defaults).is_none(), "never save a value that cannot be loaded");
+        let mut long_id = defaults.clone();
+        long_id.assign(Chord::parse("D").unwrap(), &"x".repeat(MAX_COMMAND_LEN + 1), Value::Null);
+        assert!(long_id.preferences(&defaults).is_none(), "never save a command id that loading rejects");
+    }
+
+    #[test]
+    fn removed_registry_shortcut_stays_removed_after_preference_reload() {
+        let registry =
+            Registry { commands: vec![rustgis_engine::CommandSpec::new("test.action", "Test", "", |_, _| Ok(Value::Null)).key("F8")] };
+        let defaults = Keymap::new(&registry);
+        let chord = Chord::parse("F8").unwrap();
+        assert_eq!(defaults.command_for(chord).unwrap().command, "test.action");
+        let mut changed = defaults.clone();
+        changed.remove(chord);
+        let saved = changed.preferences(&defaults).unwrap();
+        let mut reloaded = Keymap::new(&registry);
+        reloaded.apply_preferences(&saved);
+        assert!(reloaded.command_for(chord).is_none());
+    }
+
+    #[test]
+    fn shortcut_preferences_round_trip_and_keep_new_defaults() {
+        let defaults = Keymap::default();
+        let mut changed = defaults.clone();
+        let table = Chord::parse("Mod+T").unwrap();
+        changed.remove(table);
+        let d = Chord::parse("D").unwrap();
+        assert!(changed.assign(d, "tool.set", serde_json::json!({"tool": "select"})));
+        assert!(changed.assign(table, "select.clear", Value::Null));
+        assert!(!changed.assign(Chord::parse("Mod+C").unwrap(), "select.clear", Value::Null));
+        let saved = changed.preferences(&defaults).unwrap();
+        let mut newer = defaults.clone();
+        let fresh = Chord::parse("F8").unwrap();
+        assert!(newer.assign(fresh, "new.command", Value::Null));
+        newer.apply_preferences(&saved);
+        assert_eq!(newer.command_for(d).unwrap().params, serde_json::json!({"tool": "select"}));
+        assert_eq!(newer.command_for(table).unwrap().command, "select.clear");
+        assert_eq!(newer.command_for(fresh).unwrap().command, "new.command");
+        newer.apply_preferences("not json");
+        assert_eq!(newer.command_for(table).unwrap().command, "select.clear");
+    }
+
+    #[test]
+    fn malformed_preference_records_do_not_hide_valid_bindings() {
+        let mut keymap = Keymap::default();
+        let readable =
+            keymap.apply_preferences(r#"[{"keys":"D","command":"select.clear"},{"keys":42},{"keys":"W","command":"table.open"}]"#);
+        assert!(!readable, "an unreadable record blocks saving over the stored text");
+        assert_eq!(keymap.command_for(Chord::parse("D").unwrap()).unwrap().command, "select.clear");
+        assert_eq!(keymap.command_for(Chord::parse("W").unwrap()).unwrap().command, "table.open");
+    }
+
+    /// Undo and redo are a text field's own, an extra Alt or Shift aside; nothing else is.
+    #[test]
+    fn text_undo_chords_are_undo_and_redo() {
+        let is = |s: &str| Chord::parse(s).unwrap().is_text_undo();
+        assert!(is("Mod+Z") && is("Mod+Shift+Z") && is("Mod+Y") && is("Mod+Alt+Z"));
+        assert!(!is("Mod+S") && !is("Z") && !is("Mod+K"));
+    }
+
+    #[test]
+    fn browser_keys_read_by_key_or_code() {
+        assert_eq!(browser_key("d", "KeyD"), Some(Key::D));
+        assert_eq!(browser_key("D", "KeyD"), Some(Key::D));
+        assert_eq!(browser_key("=", "Equal"), Some(Key::Equals));
+        assert_eq!(browser_key("+", "Equal"), Some(Key::Plus));
+        assert_eq!(browser_key("-", "Minus"), Some(Key::Minus));
+        // ⌥D types ∂ on a Mac: the key's code still says D.
+        assert_eq!(browser_key("∂", "KeyD"), Some(Key::D));
+        assert_eq!(browser_key("¡", "Digit1"), Some(Key::Num1));
+        assert_eq!(browser_key("Dead", "Unidentified"), None);
+    }
+
+    /// In a browser, the app's Ctrl (⌘) shortcuts are kept from the browser (⌘D would bookmark
+    /// the page), the clipboard's and keys the app doesn't use are left to it.
+    #[test]
+    fn the_app_takes_its_shortcuts_from_the_browser() {
+        let app = crate::RustGisApp::with_sample();
+        let keys = app.command_keys();
+        let takes = |key: &str, code: &str, cmd: bool, alt: bool, shift: bool| {
+            crate::RustGisApp::takes_browser_key(&keys, key, code, cmd, alt, shift)
+        };
+        assert!(takes("d", "KeyD", true, false, false), "⌘D: duplicate, not bookmark");
+        assert!(takes("y", "KeyY", true, false, false), "⌘Y: redo, not history");
+        assert!(takes("k", "KeyK", true, false, false), "Ctrl+K: command search, not the address bar");
+        assert!(takes("=", "Equal", true, false, false) && takes("+", "Equal", true, false, true), "⌘= and ⌘+ zoom the map, not the page");
+        assert!(takes("z", "KeyZ", true, false, true), "⌘⇧Z: redo");
+        // Without Ctrl (⌘), and keys the app leaves alone, go to the browser.
+        assert!(!takes("d", "KeyD", false, false, false));
+        assert!(!takes("r", "KeyR", true, false, false), "⌘R reloads");
+        assert!(!takes("l", "KeyL", true, false, false), "⌘L: the address bar");
+        // Copy, cut and paste must reach the page as the browser's clipboard events.
+        for (k, c) in [("c", "KeyC"), ("x", "KeyX"), ("v", "KeyV")] {
+            assert!(!takes(k, c, true, false, false), "⌘{k}");
+        }
+    }
+
+    /// The web app rebuilds its list of taken keys only when the fingerprint moves: it must move
+    /// when a shortcut is rebound.
+    #[test]
+    fn the_shortcuts_fingerprint_follows_the_keymap() {
+        let mut app = crate::RustGisApp::with_sample();
+        let before = app.shortcuts_fingerprint();
+        assert_eq!(before, app.shortcuts_fingerprint(), "stable while nothing changes");
+        let mod_d = Chord::parse("Mod+D");
+        let Some(b) = app.ui.keymap.bindings.iter_mut().find(|b| Some(b.chord) == mod_d) else {
+            panic!("Mod+D is bound");
+        };
+        b.chord = Chord { command: true, alt: false, shift: false, key: Key::J };
+        assert_ne!(before, app.shortcuts_fingerprint());
+        assert!(crate::RustGisApp::takes_browser_key(&app.command_keys(), "j", "KeyJ", true, false, false));
+    }
+
+    #[test]
     fn chords_read_and_write() {
         let c = Chord::parse("Mod+Shift+Z");
         assert_eq!(c, Some(Chord { command: true, alt: false, shift: true, key: Key::Z }));
@@ -292,6 +541,22 @@ mod tests {
         // Every spelling written out reads back the same.
         for b in Keymap::default().bindings {
             assert_eq!(Chord::parse(&b.chord.to_string()), Some(b.chord));
+        }
+    }
+
+    /// Shown as egui reads the keys, by the OS it tells (a browser's from its user agent), not the
+    /// one the app was built for: a web app on a Mac shows ⌘ (#799).
+    #[test]
+    fn chords_show_the_keys_of_the_os_egui_reads() {
+        let c = Chord::parse("Mod+Shift+S");
+        assert_eq!(c.map(|c| c.text(true)).as_deref(), Some("⇧⌘S"));
+        assert_eq!(c.map(|c| c.text(false)).as_deref(), Some("Ctrl+Shift+S"));
+        let app = RustGisApp::with_sample();
+        let ctx = egui::Context::default();
+        use egui::os::OperatingSystem as Os;
+        for (os, undo) in [(Os::Mac, "⌘Z"), (Os::IOS, "⌘Z"), (Os::Windows, "Ctrl+Z")] {
+            ctx.set_os(os);
+            assert_eq!(shortcut_text(&ctx, &app, "edit.undo", &Value::Null), undo, "{os:?}");
         }
     }
 
@@ -319,7 +584,7 @@ mod tests {
         // Copy, Cut and Paste declare Mod+C/X/V: binding them too would run each twice.
         let app = RustGisApp::with_sample();
         assert!(app.ui.keymap.bindings.iter().all(|b| !is_clipboard(b.chord)));
-        assert!(!shortcut_text(&app, "edit.copy", &Value::Null).is_empty(), "but Copy still shows its key");
+        assert!(!shortcut_text(&egui::Context::default(), &app, "edit.copy", &Value::Null).is_empty(), "but Copy still shows its key");
         // A command's own key joins the defaults only where it is free.
         assert_eq!(app.ui.keymap.keys_for("layer.remove", &Value::Null).count(), 0, "Delete deletes features");
     }

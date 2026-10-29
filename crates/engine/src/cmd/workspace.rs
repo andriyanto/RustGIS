@@ -213,12 +213,19 @@ pub fn commands() -> Vec<C> {
             let n = ps(p, "name").ok_or("name is required")?;
             let a =
                 s.project.offline_areas.iter().find(|a| a.name.eq_ignore_ascii_case(n)).ok_or_else(|| format!("no offline area '{n}'"))?;
+            crate::project::ensure_map_imports_complete(&a.data)?;
             let map_name = format!("{} (offline)", a.name);
             if let Some(i) = s.project.maps.iter().position(|m| m.name.eq_ignore_ascii_case(&map_name)) {
                 s.project.active_map = i;
             } else {
                 let mut m = a.data.clone();
                 m.name = map_name;
+                // Reading a project checks only maps' layers, not offline snapshots', so their
+                // selections are put right here.
+                for l in &mut m.layers {
+                    l.renew_instance_id();
+                    l.normalize_selection();
+                }
                 s.project.maps.push(m);
                 s.project.active_map = s.project.maps.len() - 1;
             }
@@ -407,7 +414,7 @@ fn animation_zip(s: &mut Session, p: &Value) -> Result<Vec<u8>, String> {
             // Smooth in and out; scale changes geometrically.
             let e = t * t * (3.0 - 2.0 * t);
             let c = Coord::new(a.center.x + (b2.center.x - a.center.x) * e, a.center.y + (b2.center.y - a.center.y) * e);
-            let sc = (a.scale.max(1.0).ln() + (b2.scale.max(1.0).ln() - a.scale.max(1.0).ln()) * e).exp();
+            let sc = rustgis_map::camera::scale_between(a.scale, b2.scale, e);
             if let Err(e) = render(s, c, sc) {
                 result = Err(e);
                 break 'frames;
@@ -531,6 +538,7 @@ fn snapshot(m: &mut rustgis_map::Map, e: &Extent) -> rustgis_map::Map {
 const MAX_AREAS: usize = 20;
 
 fn offline_download(s: &mut Session, p: &Value) -> CmdResult {
+    crate::project::ensure_map_imports_complete(s.map())?;
     let e = match p.get("extent").and_then(Value::as_array) {
         Some(a) => {
             let n: Vec<f64> = a.iter().filter_map(Value::as_f64).collect();
@@ -585,6 +593,7 @@ fn offline_sync(s: &mut Session, p: &Value) -> CmdResult {
         .iter()
         .position(|m| m.name.eq_ignore_ascii_case(&area.map))
         .ok_or_else(|| format!("the source map '{}' is gone", area.map))?;
+    crate::project::ensure_map_imports_complete(s.project.maps.get(si).ok_or("the source map is gone")?)?;
     let (mut updated, mut added, mut deleted, mut skipped) = (0, 0, 0, 0);
     if let Some(src) = s.project.maps.get_mut(si) {
         for ol in &edited.layers {

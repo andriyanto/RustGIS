@@ -14,7 +14,7 @@ pub fn commands() -> Vec<C> {
         C::new("project.new", "New Project", "Project", new).key("Mod+N").view().params(r#"{"name"?: string}"#),
         C::new("project.sample", "World Atlas Sample", "Project", sample).view(),
         C::new("project.open", "Open Project", "Project", open).key("Mod+O").view().params(r#"{"path": string}"#),
-        C::new("project.openText", "Open Project (from text)", "Project", open_text).view().params(r#"{"text": project JSON, "fileName"?: string}"#),
+        C::new("project.openText", "Open Project (from text)", "Project", open_text).view().params(r#"{"text": project JSON, "fileName"?: string, "package"?: "true for package contents: never restore saved layer secrets"}"#),
         C::new("project.save", "Save Project", "Project", save).key("Mod+S").view().params(r#"{"path"?: string}"#),
         C::new("project.saveAs", "Save Project As", "Project", save_as).key("Mod+Shift+S").view().params(r#"{"path": string}"#),
         C::new("project.rename", "Rename Project", "Project", rename).params(r#"{"name": string}"#),
@@ -28,7 +28,7 @@ pub fn commands() -> Vec<C> {
             .when(|s| if s.can_redo() { None } else { Some("nothing to redo") }),
         C::new("tool.set", "Set Map Tool", "Home › Navigate", set_tool)
             .view()
-            .params(r#"{"tool": "explore"|"select"|"zoomIn"|"measure"|"measureArea"|"createPoint"|"createLine"|"createPolygon"|"editVertices"|"graphicPoint"|"graphicText"|"graphicLine"|"graphicCurve"|"graphicFreehand"|"graphicPolygon"|"graphicLasso"|"graphicRectangle"|"graphicCircle"|"graphicEllipse"|"graphicPicture"}"#),
+            .params(r#"{"tool": "explore"|"select"|"selectPolygon"|"selectLasso"|"selectRadius"|"zoomIn"|"measure"|"measureArea"|"createPoint"|"createLine"|"createPolygon"|"editVertices"|"graphicPoint"|"graphicText"|"graphicLine"|"graphicCurve"|"graphicFreehand"|"graphicPolygon"|"graphicLasso"|"graphicRectangle"|"graphicCircle"|"graphicEllipse"|"graphicPicture"}"#),
         C::new("info.project", "Project Info", "Project", info).view().params(r#"{"nameFilter"?: string, "includeFields"?: bool}"#),
         C::new("info.commands", "List Commands", "Help", list).view(),
     ]
@@ -40,9 +40,13 @@ pub(crate) fn reset_to(s: &mut Session, p: Project) {
 }
 
 fn reset(s: &mut Session, p: Project) {
+    super::connections::clear_active();
+    s.database_logins.clear_activations();
+    s.database_logins.clear_requests();
     // Kept until the command ends: a failure gives the project back with its history.
     s.put_aside();
     s.project = p;
+    s.opened_package = None;
     s.opened = s.opened.wrapping_add(1);
     s.active_layer = s.map().layers.first().map(|l| l.id);
     s.table_layer = None;
@@ -50,9 +54,14 @@ fn reset(s: &mut Session, p: Project) {
     s.active_layout = None;
     s.tool = Tool::Explore;
     s.clear_history();
+    s.file_identity = s.state();
     s.history_from_file = s.project.gp_history.len();
     // Zarr layers that follow the time slider read the step it is at.
     super::zarr::follow_time(s);
+    // The sources that read an S3 bucket through a saved connection wait for it (or its choice):
+    // nothing of the new project is fetched before.
+    s.s3_pending.clear();
+    crate::s3_connections::resolve_project_s3(s);
 }
 
 fn new(s: &mut Session, p: &Value) -> CmdResult {
@@ -74,33 +83,60 @@ const MAX_PACKAGE: u64 = 1 << 30;
 fn open(s: &mut Session, p: &Value) -> CmdResult {
     let path = PathBuf::from(super::ps(p, "path").ok_or("path is required")?);
     let is_package = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("rgispkg"));
-    let proj = if is_package {
-        // Read at most a byte past the limit, so a huge file is refused rather than loaded.
-        use std::io::Read;
-        let mut bytes = Vec::new();
-        std::fs::File::open(&path)
-            .and_then(|f| f.take(MAX_PACKAGE + 1).read_to_end(&mut bytes))
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        if bytes.len() as u64 > MAX_PACKAGE {
-            return Err("the package is too large".into());
+    let origin = if is_package { path.canonicalize() } else { std::path::absolute(&path) }
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    super::connections::clear_active();
+    let proj = (|| {
+        if is_package {
+            // Read at most a byte past the limit, so a huge file is refused rather than loaded.
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            std::fs::File::open(&path)
+                .and_then(|f| f.take(MAX_PACKAGE + 1).read_to_end(&mut bytes))
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            if bytes.len() as u64 > MAX_PACKAGE {
+                return Err("the package is too large".into());
+            }
+            Project::from_import_json(&super::items::package_text(&bytes)?, None)
+        } else {
+            Project::load(&path)
         }
-        Project::from_json(&super::items::package_text(&bytes)?)?
-    } else {
-        Project::load(&path)?
+    })();
+    let proj = match proj {
+        Ok(proj) => proj,
+        Err(error) => {
+            super::connections::restore_active(s);
+            return Err(error);
+        }
     };
     reset(s, proj);
     // A package opens as a new, unsaved project (saving writes a plain project file).
     if !is_package {
         name_from_file(s, &path);
     }
-    s.path = if is_package { None } else { Some(path) };
+    if is_package {
+        s.opened_package = Some(origin);
+        s.path = None;
+    } else {
+        s.path = Some(origin);
+    }
     s.notify(format!("Opened {}", s.project.name), false);
+    super::connections::resolve_project(s);
+    super::connections::note_waiting(s);
     Ok(Value::Null)
 }
 
 fn open_text(s: &mut Session, p: &Value) -> CmdResult {
     let text = super::ps(p, "text").ok_or("text is required")?;
-    let proj = Project::from_json(text)?;
+    super::connections::clear_active();
+    let proj = if super::b(p, "package").unwrap_or(false) { Project::from_import_json(text, None) } else { Project::from_json(text) };
+    let proj = match proj {
+        Ok(proj) => proj,
+        Err(error) => {
+            super::connections::restore_active(s);
+            return Err(error);
+        }
+    };
     reset(s, proj);
     // The browser opens files by name and contents: the name still names the project.
     if let Some(file) = super::ps(p, "fileName") {
@@ -108,17 +144,25 @@ fn open_text(s: &mut Session, p: &Value) -> CmdResult {
     }
     s.path = None;
     s.notify(format!("Opened {}", s.project.name), false);
+    super::connections::resolve_project(s);
+    super::connections::note_waiting(s);
     Ok(Value::Null)
 }
 
+/// Saves the project to `path` (`.rgis` added when it has no extension) and makes it the
+/// project's file. The project as it is now is the saved state undo can return to.
 fn write(s: &mut Session, path: PathBuf) -> CmdResult {
     let path = if path.extension().is_none() { path.with_extension(crate::project::EXTENSION) } else { path };
-    s.project.save(&path)?;
-    s.dirty = false;
+    let destination = std::path::absolute(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let stripped = s.project.save(&destination)?;
+    s.mark_saved();
     s.edit_counts.clear();
     s.notify(format!("Saved {}", path.display()), false);
-    s.path = Some(path.clone());
-    Ok(json!({"path": path.display().to_string()}))
+    if stripped > 0 {
+        s.notify(format!("{stripped} layer address(es) were saved without their keys, tokens or passwords: after RustGIS closes, add those layers again to give them"), false);
+    }
+    s.path = Some(destination);
+    Ok(json!({"path": path.display().to_string(), "stripped": stripped}))
 }
 
 /// Names the project after its file, as Save As does, so a renamed or copied file opens under
@@ -137,12 +181,18 @@ fn save(s: &mut Session, p: &Value) -> CmdResult {
     write(s, path)
 }
 
+/// Saves with the destination's name, restoring the current name if writing fails.
 fn save_as(s: &mut Session, p: &Value) -> CmdResult {
     let path = PathBuf::from(super::ps(p, "path").ok_or("path is required")?);
-    if let Some(stem) = path.file_stem().and_then(|x| x.to_str()) {
-        s.project.name = stem.to_string();
+    let previous_name = path.file_stem().and_then(|x| x.to_str()).map(|stem| std::mem::replace(&mut s.project.name, stem.to_string()));
+    let result = write(s, path);
+    // Only undoable commands get a Session snapshot; restore this view command's name by hand.
+    if result.is_err()
+        && let Some(name) = previous_name
+    {
+        s.project.name = name;
     }
-    write(s, path)
+    result
 }
 
 fn rename(s: &mut Session, p: &Value) -> CmdResult {
@@ -257,7 +307,7 @@ fn info(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({
         "name": s.project.name,
         "path": s.path.as_ref().map(|p| p.display().to_string()),
-        "unsaved": s.dirty,
+        "unsaved": s.dirty(),
         "maps": s.project.maps.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
         "activeMap": m.name,
         "basemap": m.basemap.code(),
@@ -271,9 +321,10 @@ fn info(s: &mut Session, p: &Value) -> CmdResult {
         "layers": layers,
         "groups": m.groups.iter().map(|g| json!({
             "id": g.id, "name": g.name, "visible": g.visible, "transparency": g.transparency,
-            "minScale": g.min_scale, "maxScale": g.max_scale, "layers": g.children,
+            "minScale": g.min_scale, "maxScale": g.max_scale, "layers": g.children, "parent": g.parent,
         })).collect::<Vec<_>>(),
-        // Web tile layers (XYZ, WMS, vector tiles, styles, archives) draw under the layers above.
+        // Web tile layers (XYZ, WMS, vector tiles, styles, archives), each drawn over the map layer
+        // its `over` names, or under them all.
         // Their addresses lose keys and tokens: the AI Assistant sends this to its provider.
         "tileLayers": super::tiles::list(s, true),
         "tables": s.project.tables.iter().filter(|t| named(&t.name)).map(|t| {

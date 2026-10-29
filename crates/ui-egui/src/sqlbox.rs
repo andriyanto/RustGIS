@@ -44,14 +44,14 @@ const MAX_CHIPS: usize = 40;
 /// and then says it isn't applied.
 pub fn show(
     ui: &mut Ui,
-    slot: &str,
+    slot: impl std::hash::Hash + std::fmt::Debug,
     owner: egui::Id,
     version: u64,
     stored: Option<&str>,
     ds: &Dataset,
     count: impl FnOnce(&str) -> Result<(usize, usize), String>,
 ) -> Option<Apply> {
-    let key = egui::Id::new(("sqlbox_draft", slot));
+    let key = egui::Id::unique(("sqlbox_draft", slot));
     let t = &Tokens::get(ui.ctx());
     let stored = stored.map(str::trim).filter(|w| !w.is_empty());
     let fresh = || Draft {
