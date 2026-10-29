@@ -121,7 +121,7 @@ fn boxed(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     let width = ui.available_width();
     let (frame_r, _) = ui.allocate_exact_size(vec2(width, 28.0), Sense::hover());
     let edit_r = Rect::from_min_max(pos2(frame_r.min.x + 26.0, frame_r.min.y + 2.0), pos2(frame_r.max.x - 24.0, frame_r.max.y - 2.0));
-    let id = egui::Id::new("map_search_box");
+    let id = egui::Id::unique("map_search_box");
     let focused = ui.memory(|m| m.has_focus(id));
     // The arrows are the list's, taken before the text box sees them.
     let (down, up) = if focused {
@@ -155,10 +155,10 @@ fn boxed(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             .hint_text(tl!("Search layers, places, lat/lon…"))
             .font(regular(12.5))
             .desired_width(edit_r.width())
-            .vertical_align(egui::Align::Center),
+            .align(egui::Align2::LEFT_CENTER),
     );
     // Named for screen readers (and scripted clicks): the hint text isn't the box's name.
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, tl!("Search the map")));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, tl!("Search the map")));
     let resp = resp.on_hover_text(tl!(
         "A latitude and longitude (40.7, -74.0 or 40°42'N 74°0'W), a layer, a bookmark or a value in a layer's table. Enter picks the highlighted row; Search places looks the text up as a place"
     ));
@@ -180,7 +180,7 @@ fn boxed(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     if !st.query.is_empty() || st.marker.is_some() {
         let x = Rect::from_center_size(pos2(frame_r.max.x - 13.0, frame_r.center().y), vec2(18.0, 18.0));
         let xr = ui.interact(x, id.with("clear"), Sense::click());
-        xr.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tl!("Clear search")));
+        xr.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tl!("Clear search")));
         if xr.hovered() {
             p.rect_filled(x, CornerRadius::same(4), t.hover);
         }
@@ -244,7 +244,7 @@ fn list_area(app: &mut RustGisApp, ui: &Ui, frame_r: Rect, list: &[Row], t: &Tok
     }
     let width = frame_r.width().max(260.0);
     let mut picked = None;
-    let area = egui::Area::new(egui::Id::new("map_search_list"))
+    let area = egui::Area::new(egui::Id::unique("map_search_list"))
         .order(egui::Order::Foreground)
         .pivot(Align2::LEFT_BOTTOM)
         .fixed_pos(pos2(frame_r.min.x, frame_r.min.y - 4.0))
@@ -316,7 +316,7 @@ fn list_area(app: &mut RustGisApp, ui: &Ui, frame_r: Rect, list: &[Row], t: &Tok
     app.ui.search.scroll = false;
     // Clicking the list mustn't count as clicking away from the box.
     if area.response.contains_pointer() && ui.input(|i| i.pointer.any_pressed()) {
-        ui.memory_mut(|m| m.request_focus(egui::Id::new("map_search_box")));
+        ui.memory_mut(|m| m.request_focus(egui::Id::unique("map_search_box")));
     }
     list.get(picked?).copied()
 }
@@ -332,6 +332,9 @@ fn describe(st: &State, row: &Row) -> (String, &'static str, String, Option<Stri
                 None,
             ),
             Some(Hit::Layer { name, .. }) => (tl!("Layers").to_string(), "contents", name.clone(), None),
+            Some(Hit::Tile { name, overlay, .. }) => {
+                (tl!("Layers").to_string(), "basemap", if *overlay { format!("{} · {}", name, tl!("overlay")) } else { name.clone() }, None)
+            }
             Some(Hit::Bookmark { name }) => (tl!("Bookmarks").to_string(), "bookmark", name.clone(), None),
             Some(Hit::Feature { layer, layer_name, field, value, name, .. }) => {
                 let partial = st.results.partial.contains(layer);
@@ -422,10 +425,19 @@ fn pick(app: &mut RustGisApp, row: Row) {
         }
         Row::Hit(i) => {
             let Some(hit) = st.results.hits.get(i).cloned() else { return };
-            // The query the list was found for (the box may have been typed in since), with the
-            // list's limit, so the index is the row picked.
-            let query = st.searched.clone();
-            if let Err(e) = app.run("map.search", json!({"query": query, "limit": search::LIMIT, "go": i})) {
+            let result = if let Hit::Tile { index, identity, .. } = &hit {
+                let Some(at) = rustgis_engine::cmd::tiles::index_of_identity(&app.session, identity, *index) else {
+                    app.session.notify(tl!("Tile layer has changed; search again"), true);
+                    return;
+                };
+                app.run("map.zoomToTiles", json!({"index": at}))
+            } else {
+                // The query the list was found for (the box may have been typed in since), with the
+                // list's limit, so the index picked is the row picked.
+                let query = st.searched.clone();
+                app.run("map.search", json!({"query": query, "limit": search::LIMIT, "go": i}))
+            };
+            if let Err(e) = result {
                 app.session.notify(e, true);
                 return;
             }
@@ -434,7 +446,7 @@ fn pick(app: &mut RustGisApp, row: Row) {
                     let label = search::format_lat_lon(*lat, *lon);
                     (label.clone(), Some((Coord::new(*lon, *lat), label)))
                 }
-                Hit::Layer { name, .. } | Hit::Bookmark { name } => (name.clone(), None),
+                Hit::Layer { name, .. } | Hit::Tile { name, .. } | Hit::Bookmark { name } => (name.clone(), None),
                 Hit::Feature { value, name, .. } => (name.clone().unwrap_or_else(|| value.clone()), None),
             };
             settle(app, text, marker);

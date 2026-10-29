@@ -8,9 +8,11 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod address;
+pub mod arcgis_auth;
 pub mod boundaries;
 pub mod cache;
 pub mod cog;
+pub mod cubes;
 pub mod draw;
 pub mod earthdata;
 pub mod embeddings;
@@ -37,6 +39,7 @@ pub mod style;
 pub mod symbols;
 pub mod template;
 pub mod usgis;
+pub mod vector_export;
 
 pub use draw::{Drawn, Frame, PlacedTiles, Placement, draw, place, place_raster};
 pub use picture::{Pace, Unfinished, pace, paced, unfinished};

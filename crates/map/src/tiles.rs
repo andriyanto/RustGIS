@@ -124,6 +124,11 @@ pub struct TileLayer {
     /// A transparent layer meant to sit over a basemap (labels, roads, traffic).
     #[serde(default, skip_serializing_if = "is_false")]
     pub overlay: bool,
+    /// The map layer it's drawn just over, under the next one up (#808): new overlays go on top
+    /// of the map's layers, as every new layer does. None: under all the map layers, where
+    /// basemaps sit, as every tile layer did before (and does in a project saved then).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub over: Option<u32>,
     /// How it blends with the tile layers and basemap beneath (Multiply drapes imagery over a
     /// hillshade).
     #[serde(default, skip_serializing_if = "is_normal")]
@@ -139,6 +144,10 @@ pub struct TileLayer {
     /// the tiles' own. Empty for the default look.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub style_layers: String,
+    /// Vector tiles' source layers switched off in the Layers pane (`roads`, `pois`): the style
+    /// layers drawing them are left out, so they neither draw nor answer identify.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "lenient_source_layers")]
+    pub hidden_layers: Vec<String>,
     /// A URL with date placeholders (`{date:YYYY-MM-DD}`), filled from the time slider into
     /// `url` at each step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -153,6 +162,58 @@ pub struct TileLayer {
     /// No date of `time_urls` falls in the slider's window: the layer draws nothing for now.
     #[serde(skip)]
     pub time_hidden: bool,
+    /// Why the archive can't be read (a moved file, or a relative path with no project folder): it draws nothing.
+    #[serde(skip)]
+    pub error: Option<String>,
+    /// A WMS layer's GetFeatureInfo request, from the service's capabilities: what identify asks
+    /// it. Kept for the session only (a project's layer reads the capabilities again); the type
+    /// can be saved, should projects keep it.
+    #[serde(skip)]
+    pub feature_info: Option<rustgis_data::ogc::FeatureInfo>,
+    /// Its legend pictures (a WMS or WMTS layer's, from its service's default style, or given to
+    /// `map.addTiles`): the Layers pane shows the one for the map's scale under it, as ArcGIS
+    /// Pro's Contents pane does. Web addresses only, at most [`MAX_LEGENDS`](rustgis_data::ogc::MAX_LEGENDS).
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "lenient_legends")]
+    pub legends: Vec<rustgis_data::ogc::Legend>,
+    /// Expanded in the Layers pane, its legend and source layers showing.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub expanded: bool,
+    /// Picked in the Layers pane (`map.selectTiles`), for the session only: it holds while no
+    /// map layer is active (the engine's `Session::selected_tile`).
+    #[serde(skip)]
+    pub selected: bool,
+}
+
+/// The longest legend address kept.
+pub const MAX_LEGEND_URL: usize = 4096;
+
+/// Legend pictures as a tile layer keeps them: web addresses of a sane length, scales that are
+/// positive numbers (others are open-ended), at most [`MAX_LEGENDS`](rustgis_data::ogc::MAX_LEGENDS).
+pub fn checked_legends(legends: impl IntoIterator<Item = rustgis_data::ogc::Legend>) -> Vec<rustgis_data::ogc::Legend> {
+    let scale = |v: Option<f64>| v.filter(|v| v.is_finite() && *v > 0.0);
+    legends
+        .into_iter()
+        .map(|l| rustgis_data::ogc::Legend { url: l.url.trim().to_string(), min_scale: scale(l.min_scale), max_scale: scale(l.max_scale) })
+        .filter(|l| is_web(&l.url) && l.url.len() <= MAX_LEGEND_URL)
+        .take(rustgis_data::ogc::MAX_LEGENDS)
+        .collect()
+}
+
+/// A project's legends, checked; one that isn't a legend is left out, and a value that isn't a
+/// list is none, so a damaged entry doesn't make the project unreadable.
+fn lenient_legends<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<rustgis_data::ogc::Legend>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    let list = match value {
+        serde_json::Value::Array(list) => list,
+        _ => Vec::new(),
+    };
+    // Each read field by field: a scale of no number is open-ended, not the legend's loss.
+    let legend = |v: serde_json::Value| {
+        let url = v.get("url")?.as_str()?.to_string();
+        let scale = |k: &str| v.get(k).and_then(serde_json::Value::as_f64);
+        Some(rustgis_data::ogc::Legend { url, min_scale: scale("minScale"), max_scale: scale("maxScale") })
+    };
+    Ok(checked_legends(list.into_iter().filter_map(legend)))
 }
 
 /// The most dates a tile layer lists (as the time slider steps through at most).
@@ -197,6 +258,29 @@ pub fn checked_style_layers(text: &str) -> Result<String, String> {
     }
 }
 
+/// The most source layers a tile layer lists or hides.
+pub const MAX_SOURCE_LAYERS: usize = rustgis_data::source_layers::MAX;
+
+/// Source layer names as a tile layer keeps them: as
+/// [`source_layers::distinct`](rustgis_data::source_layers::distinct) keeps an archive's, sorted
+/// so the same set is the same list.
+pub fn checked_source_layers<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut kept = rustgis_data::source_layers::distinct(names);
+    kept.sort_unstable();
+    kept.into_iter().map(str::to_string).collect()
+}
+
+/// A project's hidden source layers, checked; a name that isn't text is left out, and a value
+/// that isn't a list is none, so a damaged entry doesn't make the project unreadable.
+fn lenient_source_layers<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    let list = match &value {
+        serde_json::Value::Array(list) => list.as_slice(),
+        _ => &[],
+    };
+    Ok(checked_source_layers(list.iter().filter_map(serde_json::Value::as_str)))
+}
+
 fn max_zoom() -> u8 {
     19
 }
@@ -220,6 +304,12 @@ fn is_normal(b: &crate::effects::Blend) -> bool {
 pub const MAX_ZOOM: u8 = 24;
 
 impl TileLayer {
+    /// The local archive that Repair Data Source replaces.
+    pub fn archive_file(&self) -> Option<&str> {
+        (matches!(self.kind, TileKind::PmTiles | TileKind::MbTiles) && is_local_archive(&self.url) && !self.url.starts_with(UPLOAD))
+            .then_some(self.url.as_str())
+    }
+
     pub fn new(name: impl Into<String>, kind: TileKind, url: impl Into<String>) -> TileLayer {
         TileLayer {
             name: name.into(),
@@ -235,21 +325,28 @@ impl TileLayer {
             visible: true,
             opacity: 1.0,
             overlay: false,
+            over: None,
             blend: crate::effects::Blend::Normal,
             id: String::new(),
             layers: Vec::new(),
             style_layers: String::new(),
+            hidden_layers: Vec::new(),
             time_url: None,
             time_at: 0.0,
             time_urls: Vec::new(),
             time_hidden: false,
+            error: None,
+            feature_info: None,
+            legends: Vec::new(),
+            expanded: false,
+            selected: false,
         }
     }
 
     /// Whether the layer draws now: shown, and with a date in the time slider's window when it
     /// follows one.
     pub fn draws(&self) -> bool {
-        self.visible && !self.time_hidden
+        self.visible && !self.time_hidden && self.error.is_none()
     }
 
     /// Checks the address and brings the numbers into range, after reading one from a project
@@ -272,7 +369,9 @@ impl TileLayer {
                 return Err("an uploaded MBTiles file needs a name".into());
             }
         } else if local {
-            check_path(&self.url, if self.kind == TileKind::MbTiles { "mbtiles" } else { "pmtiles" })?;
+            if self.error.is_none() {
+                check_path(&self.url, if self.kind == TileKind::MbTiles { "mbtiles" } else { "pmtiles" })?;
+            }
         } else {
             check_url(&self.url)?;
         }
@@ -314,8 +413,12 @@ impl TileLayer {
 /// The prefix of an MBTiles archive added to the web app, held in memory.
 pub const UPLOAD: &str = "upload:";
 
-/// Whether a PMTiles or MBTiles archive address is a file rather than a web address.
+/// Whether a PMTiles or MBTiles archive address is a file rather than a web address. An address
+/// read through a saved S3 connection is never a file, well formed or not.
 pub fn is_local_archive(url: &str) -> bool {
+    if rustgis_data::s3_address::is_wrapper(url) {
+        return false;
+    }
     let lower = url.to_ascii_lowercase();
     !(lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("s3://"))
 }
@@ -340,8 +443,15 @@ pub fn check_path(path: &str, ext: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether `url` may be fetched: HTTP or HTTPS, with a host, and no longer than 4096 bytes.
+/// Whether `url` may be fetched: HTTP or HTTPS, with a host, and no longer than 4096 bytes. An
+/// address read through a saved S3 connection is judged by the address it wraps (still bounded
+/// by 4096 bytes), and itself by the wrapper's own bound; it needs no login to be kept.
 pub fn check_url(url: &str) -> Result<(), String> {
+    let url = match rustgis_data::s3_address::parse(url) {
+        Ok(Some(b)) => b.url,
+        Ok(None) => url,
+        Err(e) => return Err(e.to_string()),
+    };
     if url.len() > 4096 {
         return Err("the address is too long".into());
     }
@@ -358,8 +468,10 @@ pub fn check_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The host part of an HTTP(S) address.
+/// The host part of an HTTP(S) address (of the address an address read through a saved S3
+/// connection wraps).
 pub fn host_of(url: &str) -> Option<&str> {
+    let url = rustgis_data::s3_address::inner(url);
     let rest = url.split_once("://")?.1;
     let host = rest.split(['/', '?', '#']).next()?;
     let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
@@ -430,5 +542,49 @@ mod tests {
             serde_json::from_str(r#"{"name": "OSM", "kind": "raster", "url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png"}"#)
                 .unwrap_or_else(|e| panic!("{e}"));
         assert!(t.visible && t.opacity == 1.0 && t.max_zoom == 19 && t.tile_size == 256);
+    }
+
+    /// A tile layer's legends and whether they show are kept; a layer without them is written as
+    /// it always was; damaged legends are left out without the rest failing to read.
+    #[test]
+    fn legends_are_kept_and_old_layers_save_as_before() {
+        use rustgis_data::ogc::{Legend, MAX_LEGENDS};
+        let old = r#"{"name":"WMS","kind":"raster","url":"https://maps.example.org/wms?{bbox-epsg-3857}"}"#;
+        let t: TileLayer = serde_json::from_str(old).unwrap();
+        assert!(t.legends.is_empty() && !t.expanded);
+        let saved = serde_json::to_value(&t).unwrap();
+        assert!(saved.get("legends").is_none() && saved.get("expanded").is_none());
+        let mut t = t;
+        t.legends = vec![
+            Legend { url: "https://maps.example.org/legend.png".into(), ..Legend::default() },
+            Legend { url: "https://maps.example.org/far.png".into(), min_scale: Some(5e4), max_scale: None },
+        ];
+        t.expanded = true;
+        let text = serde_json::to_string(&t).unwrap();
+        assert!(
+            text.contains(
+                r#""legends":[{"url":"https://maps.example.org/legend.png"},{"url":"https://maps.example.org/far.png","minScale":50000.0}]"#
+            ),
+            "{text}"
+        );
+        assert_eq!(serde_json::from_str::<TileLayer>(&text).unwrap(), t);
+        // Damaged: entries that aren't legends, not on the web, scales of no number, too many.
+        let many: Vec<String> = (0..40).map(|i| format!(r#""https://x.org/{i}.png""#)).collect();
+        for (legends, want) in [
+            (r#""pink""#.to_string(), 0),
+            (
+                r#"[7, {"url": 3}, {"url": "file:///etc/passwd"}, {"url": "https://ok.org/l.png", "minScale": -4, "maxScale": "x"}]"#
+                    .into(),
+                1,
+            ),
+            (format!("[{}]", many.iter().map(|u| format!(r#"{{"url": {u}}}"#)).collect::<Vec<_>>().join(",")), MAX_LEGENDS),
+        ] {
+            let t: TileLayer =
+                serde_json::from_str(&format!(r#"{{"name":"W","kind":"raster","url":"https://w.org/{{z}}","legends":{legends}}}"#))
+                    .unwrap_or_else(|e| panic!("{legends}: {e}"));
+            assert_eq!(t.legends.len(), want, "{legends}");
+            assert!(t.legends.iter().all(|l| l.min_scale.is_none() && l.max_scale.is_none() || l.min_scale.is_some_and(|m| m > 0.0)));
+        }
+        assert_eq!(checked_legends([Legend { url: format!("https://x.org/{}", "a".repeat(MAX_LEGEND_URL)), ..Legend::default() }]), []);
     }
 }

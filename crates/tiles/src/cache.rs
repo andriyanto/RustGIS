@@ -220,6 +220,42 @@ pub fn clear() {
     GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
+/// The resource a cache key reads: its address without a download budget, a byte range or a
+/// tail, and for a tile of a PMTiles or COG archive, the archive's address.
+fn resource_of(key: &str) -> &str {
+    let key = split_download_limit(key).0;
+    let key = split_tail(key).0;
+    let key = split_range(key).0;
+    if key.starts_with(crate::pmtiles::SCHEME) || key.starts_with(crate::cog::SCHEME) {
+        return key.split_once('@').map_or(key, |(_, archive)| crate::cog::split(archive).0);
+    }
+    key
+}
+
+/// Forgets what was read of one address (and of the archive or file it names), so it is read
+/// again, as [`clear`] does for everything: after the login that signs it changed (a source
+/// whose address stays the same, read again with other keys). Reads under way are kept.
+pub fn forget(url: &str) {
+    let url = crate::cog::split(split_download_limit(url).0).0;
+    let mut c = lock();
+    let dropped: usize = c
+        .slots
+        .iter()
+        .filter(|(k, s)| !matches!(s.entry, Entry::Pending) && resource_of(k) == url)
+        .map(|(_, s)| match &s.entry {
+            Entry::Ready(_, n) => *n,
+            _ => 0,
+        })
+        .sum();
+    c.slots.retain(|k, s| matches!(s.entry, Entry::Pending) || resource_of(k) != url);
+    c.bytes = c.bytes.saturating_sub(dropped);
+    drop(c);
+    crate::pmtiles::forget_archive(url);
+    crate::cog::forget_file(url);
+    rustgis_data::source::remote::forget_file(url);
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Waits (up to `timeout`) for the fetches under way to finish. Native only: in the browser
 /// fetches finish between frames, so this returns at once.
 pub fn wait(timeout: Duration) {
@@ -249,7 +285,7 @@ fn start(url: String, want: Want) {
         let latest = c.latest.unwrap_or_else(Instant::now);
         let now = q.push(url, want, |u| c.slots.get(u).map(|s| s.asked), latest, &mut swept);
         // Under the same lock as the choice: a tile asked for again meanwhile isn't forgotten.
-        forget(&mut c, &swept);
+        forget_dropped(&mut c, &swept);
         now
     };
     launch(now.into_iter().collect());
@@ -263,7 +299,7 @@ fn release(host: &str) {
         let mut c = lock();
         let latest = c.latest.unwrap_or_else(Instant::now);
         let next = q.done(host, |url| c.slots.get(url).map(|s| s.asked), latest);
-        forget(&mut c, &next.drop);
+        forget_dropped(&mut c, &next.drop);
         next
     };
     launch(next.start);
@@ -271,7 +307,7 @@ fn release(host: &str) {
 
 /// Forgets tiles dropped unfetched: no longer under way, and fetched again when next asked for.
 /// Called holding the cache's lock taken to choose them, so a tile can't be asked for between.
-fn forget(c: &mut Cache, dropped: &[Waiting<Want>]) {
+fn forget_dropped(c: &mut Cache, dropped: &[Waiting<Want>]) {
     for w in dropped {
         if matches!(c.slots.get(&w.url), Some(Slot { entry: Entry::Pending, .. })) {
             c.slots.remove(&w.url);
@@ -522,7 +558,7 @@ pub fn download_detailed(url: &str, max: usize, done: DoneDetailed) {
 }
 
 /// How long a download the caller waits for may take: commands run where the app waits too (the
-/// AI Assistant's), so a large file comes through Add Data › From URL, which downloads off the
+/// AI Assistant's), so a large file comes through Home › Add › Add Data › From URL, which downloads off the
 /// frame.
 #[cfg(not(target_arch = "wasm32"))]
 pub const BLOCKING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -538,7 +574,7 @@ pub fn download_blocking(url: &str) -> Result<Vec<u8>, String> {
 pub fn download_blocking_limited(url: &str, max: usize) -> Result<Vec<u8>, String> {
     download_blocking_within(url, max, BLOCKING_TIMEOUT).map_err(|e| {
         if e.contains("timeout") || e.contains("timed out") {
-            format!("{e} (a large file: add it with Add Data › From URL, which downloads in the background)")
+            format!("{e} (a large file: add it with Home › Add › Add Data › From URL, which downloads in the background)")
         } else {
             e
         }
@@ -559,6 +595,15 @@ pub fn download_blocking_within(url: &str, max: usize, timeout: std::time::Durat
 pub fn download_public_within(url: &str, max: usize, timeout: std::time::Duration) -> Result<Vec<u8>, String> {
     crate::address::check(url, None)?;
     native::get(&native::public_agent(timeout), &download_address(url, max))
+}
+
+/// Reads an address's first byte, connecting only to internet addresses (as
+/// [`download_public_within`]), telling what is known of a failure: whether and how a server
+/// serves a file, without reading it ([`crate::s3::public_region`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn probe_blocking(url: &str) -> Result<(), Failure> {
+    crate::address::check(url, None).map_err(|e| Failure::new(url, e))?;
+    native::get_detailed(&native::public_agent(BLOCKING_TIMEOUT), &format!("{url}{RANGE}0-0")).map(|_| ())
 }
 
 /// How a JSON document is POSTed and its answer read (the browser's `fetch`): the address, the
@@ -601,6 +646,64 @@ pub fn post_json(url: &str, body: String, done: Done) {
 pub fn post_json_blocking(url: &str, body: &str) -> Result<Vec<u8>, String> {
     crate::address::check(url, None)?;
     native::post_with(&native::public_agent(BLOCKING_TIMEOUT), url, body)
+}
+
+/// What a `HEAD` request says of a file before any of it is read: the length of its TIFF header
+/// that a server making GeoTIFFs on request announces (`X-TIFF-Header-Length`, Vantor's Transform
+/// API), so a cloud-optimised GeoTIFF's header comes in one range read; its type; and whether
+/// the server says it answers byte ranges (`Accept-Ranges: bytes`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Head {
+    pub tiff_header_length: Option<u64>,
+    pub content_type: Option<String>,
+    pub accepts_ranges: bool,
+}
+
+/// Whether an `Accept-Ranges` value says byte ranges are answered.
+pub fn accepts_byte_ranges(value: &str) -> bool {
+    value.split(',').any(|unit| unit.trim().eq_ignore_ascii_case("bytes"))
+}
+
+/// Called once with what a `HEAD` request said.
+pub type HeadDone = Box<dyn FnOnce(Result<Head, String>) + Send>;
+/// How a `HEAD` request is made (the browser's `fetch`), as [`set_header`] installs it.
+pub type Header = Box<dyn Fn(String, HeadDone) + Send + Sync>;
+
+fn header() -> &'static Mutex<Option<Arc<Header>>> {
+    static H: OnceLock<Mutex<Option<Arc<Header>>>> = OnceLock::new();
+    H.get_or_init(Mutex::default)
+}
+
+/// Replaces how `HEAD` requests are made (the browser's `fetch`, which sees
+/// `X-TIFF-Header-Length` only when the server exposes it to pages). `done` must be called once,
+/// an error status as `HTTP <status>`.
+pub fn set_header(f: impl Fn(String, HeadDone) + Send + Sync + 'static) {
+    *header().lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(Box::new(f)));
+}
+
+/// An `X-TIFF-Header-Length` value: a length in bytes, none when it isn't one.
+pub fn tiff_header_length(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok().filter(|n| *n > 0)
+}
+
+/// Asks for `url`'s headers (`HEAD`), off the frame (a thread natively, the browser's fetch on
+/// the web), counted as a fetch under way. A request signed for S3 isn't made (its signature is
+/// for a GET): it answers with nothing known.
+pub fn head(url: &str, done: HeadDone) {
+    if let Err(e) = crate::address::check(url, None) {
+        done(Err(e));
+        return;
+    }
+    IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+    let done: HeadDone = Box::new(move |r| {
+        done(r);
+        finished();
+    });
+    let h = header().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    match h {
+        Some(h) => h(url.to_string(), done),
+        None => native::head(url.to_string(), done),
+    }
 }
 
 /// Fetches an address's bytes, uncached (through the browser's fetcher, or the worker threads).
@@ -830,7 +933,7 @@ mod native {
         if crate::mbtiles::is_tile(url) || url.starts_with(LOCAL) {
             return String::new();
         }
-        let Some((_, rest)) = url.split_once("://") else { return String::new() };
+        let Some((_, rest)) = rustgis_data::s3_address::reached(url).split_once("://") else { return String::new() };
         let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let authority = rest.get(..end).unwrap_or(rest);
         // Credentials in the address aren't part of the server.
@@ -939,6 +1042,64 @@ mod native {
             .proxy(None)
             .build();
         ureq::Agent::with_parts(config, ureq::unversioned::transport::DefaultConnector::default(), PublicOnly::default())
+    }
+
+    /// Asks for an address's headers on a thread of its own.
+    pub(super) fn head(url: String, done: super::HeadDone) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Past this many under way, a file is read without asking (the usual first read), so
+        // many addresses added at once never hold up as many threads and connections.
+        const MAX_HEADS: usize = 8;
+        static HEADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+        if HEADS.fetch_add(1, Relaxed) >= MAX_HEADS {
+            HEADS.fetch_sub(1, Relaxed);
+            done(Ok(super::Head::default()));
+            return;
+        }
+        std::thread::spawn(move || {
+            let r = head_with(AGENT.get_or_init(agent), &url);
+            HEADS.fetch_sub(1, Relaxed);
+            done(r);
+        });
+    }
+
+    /// Asks for `url`'s headers, following up to 5 redirects, each checked as [`get`] checks
+    /// them.
+    pub(super) fn head_with(agent: &ureq::Agent, url: &str) -> Result<super::Head, String> {
+        let prepared = crate::s3::prepare(url)?;
+        if prepared.signed {
+            return Ok(super::Head::default());
+        }
+        let mut at = prepared.url.clone();
+        for redirects in 0..=5 {
+            let mut req = agent.head(&at);
+            if redirects == 0 {
+                for (k, v) in &prepared.headers {
+                    req = req.header(k.as_str(), v.as_str());
+                }
+            }
+            let resp = req.config().http_status_as_error(false).build().call().map_err(|e| e.to_string())?;
+            let header = |k: &str| resp.headers().get(k).and_then(|v| v.to_str().ok());
+            if resp.status().is_redirection() {
+                let next = crate::template::join(&at, header("location").ok_or("a redirect with no Location")?);
+                crate::address::check(&next, Some(&at))?;
+                if at.starts_with("https://") && !next.starts_with("https://") {
+                    return Err(format!("{next}: a redirect from https to http"));
+                }
+                at = next;
+                continue;
+            }
+            if resp.status().as_u16() >= 400 {
+                return Err(format!("http status: {}", resp.status().as_u16()));
+            }
+            return Ok(super::Head {
+                tiff_header_length: header("x-tiff-header-length").and_then(super::tiff_header_length),
+                content_type: header("content-type").map(str::to_string),
+                accepts_ranges: header("accept-ranges").is_some_and(super::accepts_byte_ranges),
+            });
+        }
+        Err("too many redirects".into())
     }
 
     /// POSTs a JSON document on a thread of its own.
@@ -1060,6 +1221,13 @@ mod native {
         fetch_answer(agent, url, true).map_err(|f| Failure { url: url.to_string(), ..f })
     }
 
+    /// A file's length from a `Content-Range` header (`bytes 0-0/1234`); none when the server
+    /// doesn't know it (`*`), the file is empty or the header can't be read.
+    pub(super) fn content_range_total(header: &str) -> Option<u64> {
+        let (_, len) = header.rsplit_once('/')?;
+        len.trim().parse::<u64>().ok().filter(|len| *len > 0)
+    }
+
     /// The answer to `url`; a refusal keeps the server's answer only when `detail` asks for it,
     /// as tiles a server doesn't have are routine and only their status is read.
     fn fetch_answer(agent: &ureq::Agent, url: &str, detail: bool) -> Result<Vec<u8>, Failure> {
@@ -1074,8 +1242,10 @@ mod native {
         }
         let (url, limit) = super::split_download_limit(url);
         let max = limit.unwrap_or(MAX_BYTES);
-        let (url, tail) = super::split_tail(url);
-        let (url, range) = super::split_range(url);
+        let (url, mut tail) = super::split_tail(url);
+        let (url, mut range) = super::split_range(url);
+        // The last bytes asked for, while the file's length is asked for instead (see below).
+        let mut measuring: Option<u64> = None;
         // An `s3://` address becomes its web address, and a request to an S3 connection's
         // endpoint is signed.
         let prepared = crate::s3::prepare(url)?;
@@ -1105,6 +1275,13 @@ mod native {
             {
                 req = req.header("Authorization", &auth);
             }
+            // An ArcGIS sign-in's token goes to the portal and the servers it covers, asked for at
+            // each hop like Earthdata's.
+            if !prepared.signed
+                && let Some(auth) = crate::arcgis_auth::authorization_fresh(&at)
+            {
+                req = req.header("X-Esri-Authorization", &auth);
+            }
             // An error status is answered, not failed: its headers and body say who refused.
             let mut resp = req.config().http_status_as_error(false).build().call().map_err(unanswered)?;
             let status = resp.status().as_u16();
@@ -1112,8 +1289,34 @@ mod native {
             if status == 401 && crate::earthdata::is_data_host(&at) {
                 return Err(Failure::without_answer("", crate::earthdata::refused_message(url), Reason::Status(status)));
             }
+            // A store that serves ranges but not the last bytes by their count (GitHub's release
+            // files, on Azure storage, answer `bytes=-n` with 501): the file's length from a
+            // one-byte range's `Content-Range`, then the last bytes by their place, at the same
+            // address. A server that gives no length goes on as one without ranges; the one-byte
+            // range redirected is asked for again where it leads, and refused fails as any refusal.
+            if let Some(n) = tail.filter(|_| status == 501 && range.is_none()) {
+                (measuring, tail, range) = (Some(n), None, Some((0, 0)));
+                continue;
+            }
+            if let Some(n) = measuring.filter(|_| status < 300) {
+                measuring = None;
+                let header = resp.headers().get("content-range").and_then(|v| v.to_str().ok());
+                match header.filter(|_| status == 206).and_then(content_range_total) {
+                    Some(len) => {
+                        range = Some((len.saturating_sub(n), len - 1));
+                        // The probe's byte read, so its connection goes back to the pool for the
+                        // next request; a body that won't read is left, the request goes on.
+                        let _ = resp.body_mut().with_config().limit(64).read_to_vec();
+                        continue;
+                    }
+                    None => return Err(format!("{url}: {}", super::NO_RANGES).into()),
+                }
+            }
             if status >= 400 {
-                return Err(if detail {
+                // A signed request's refusal is told by its status alone: an answer's headers and
+                // body are the server's text, and a server may echo the request's Authorization
+                // header (the access key's id) back in it.
+                return Err(if detail && !prepared.signed {
                     refused(&mut resp)
                 } else {
                     Failure::without_answer("", format!("http status: {status}"), Reason::Status(status))
@@ -1221,6 +1424,10 @@ mod native {
         done(Err(format!("{url}: this build has no way to send requests")));
     }
 
+    pub(super) fn head(url: String, done: super::HeadDone) {
+        done(Err(format!("{url}: this build has no way to send requests")));
+    }
+
     pub(super) fn fetch_local(url: String, done: Done) {
         let (path, _) = super::split_range(&url);
         done(Err(format!("{path}: the web app reads PMTiles archives from web addresses only")));
@@ -1237,6 +1444,15 @@ mod tests {
     fn public_downloads_refuse_names_that_resolve_locally() {
         let err = download_public_within("http://localhost:9/doc.json", 1024, std::time::Duration::from_secs(5)).unwrap_err();
         assert!(err.contains("resolves to this computer or the local network"), "{err}");
+    }
+
+    #[test]
+    fn announced_tiff_header_lengths() {
+        assert_eq!(tiff_header_length(" 16384 "), Some(16384));
+        assert!(accepts_byte_ranges("bytes") && accepts_byte_ranges("none, Bytes") && !accepts_byte_ranges("none"));
+        for bad in ["", "0", "-5", "12kb", "18446744073709551616"] {
+            assert_eq!(tiff_header_length(bad), None, "{bad}");
+        }
     }
 
     #[test]
@@ -1378,6 +1594,81 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// The last bytes from a store that serves ranges but answers `bytes=-n` with 501 (GitHub's
+    /// release files, on Azure storage): the file's length from a one-byte range, then the last
+    /// bytes by their place.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_last_bytes_come_from_a_store_without_suffix_ranges() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = asked.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(3) {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                let range = head.lines().find_map(|l| l.strip_prefix("range: ")).unwrap_or("").trim().to_string();
+                seen.lock().unwrap().push(range.clone());
+                let answer = match range.as_str() {
+                    "bytes=-4" => "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                    "bytes=0-0" => {
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/10\r\nContent-Length: 1\r\nConnection: close\r\n\r\n0"
+                            .to_string()
+                    }
+                    "bytes=6-9" => {
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 6-9/10\r\nContent-Length: 4\r\nConnection: close\r\n\r\n6789"
+                            .to_string()
+                    }
+                    _ => "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                };
+                let _ = stream.write_all(answer.as_bytes());
+            }
+        });
+        let agent = native::agent();
+        let got = native::get_detailed(&agent, &format!("http://{addr}/f.parquet{TAIL}4")).unwrap();
+        assert_eq!(got, b"6789");
+        assert_eq!(*asked.lock().unwrap(), ["bytes=-4", "bytes=0-0", "bytes=6-9"]);
+    }
+
+    /// The one-byte range asked for a file's length: redirected, it is asked for again where it
+    /// leads; refused, the refusal's status is kept; answered whole, the server has no ranges.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_length_asked_for_follows_redirects_and_keeps_refusals() {
+        let no_suffix = "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
+        let agent = native::agent();
+        let base = serve(vec![
+            no_suffix.clone(),
+            "HTTP/1.1 302 Found\r\nLocation: /g.parquet\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/10\r\nContent-Length: 1\r\nConnection: close\r\n\r\n0".into(),
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 6-9/10\r\nContent-Length: 4\r\nConnection: close\r\n\r\n6789".into(),
+        ]);
+        assert_eq!(native::get_detailed(&agent, &format!("{base}/f.parquet{TAIL}4")).unwrap(), b"6789");
+        let base = serve(vec![no_suffix.clone(), "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()]);
+        let f = native::get_detailed(&agent, &format!("{base}/f.parquet{TAIL}4")).unwrap_err();
+        assert_eq!(f.status(), Some(404), "{}", f.message);
+        let base = serve(vec![no_suffix, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n0123456789".into()]);
+        let f = native::get_detailed(&agent, &format!("{base}/f.parquet{TAIL}4")).unwrap_err();
+        assert!(f.message.contains(super::NO_RANGES), "{}", f.message);
+        // More last bytes asked for than the file holds: the whole file.
+        let base = serve(vec![
+            "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/3\r\nContent-Length: 1\r\nConnection: close\r\n\r\na".into(),
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-2/3\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc".into(),
+        ]);
+        assert_eq!(native::get_detailed(&agent, &format!("{base}/f.parquet{TAIL}4")).unwrap(), b"abc");
+        // The length as a Content-Range gives it, when it does.
+        assert_eq!(native::content_range_total("bytes 0-0/1234"), Some(1234));
+        assert_eq!(native::content_range_total("bytes 0-0/ 10 "), Some(10));
+        for unknown in ["bytes 0-0/*", "bytes 0-0/0", "bytes 0-0", "bytes 0-0/-5", ""] {
+            assert_eq!(native::content_range_total(unknown), None, "{unknown}");
+        }
     }
 
     /// A refused request keeps who refused it (#509); the plain error reads as it always has.

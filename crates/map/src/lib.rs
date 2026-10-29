@@ -6,14 +6,18 @@ pub mod camera;
 pub mod color;
 pub mod design;
 pub mod effects;
+pub mod fills;
+pub mod geolibre;
 pub mod globe;
 pub mod graphics;
 pub mod layout;
 pub mod lod;
 pub mod palette;
+pub mod paths;
 pub mod planets;
 pub mod presentation;
 pub mod projection;
+pub mod qgis;
 pub mod raster;
 pub mod report;
 pub mod source;
@@ -21,6 +25,7 @@ pub mod symbology;
 pub mod tiles;
 pub mod time;
 pub mod view;
+mod view_memory;
 pub mod world;
 
 pub use camera::Camera;
@@ -28,7 +33,8 @@ pub use color::{Ramp, RampGroup, Rgba};
 pub use globe::{Globe, Projection};
 pub use raster::{RasterDefaults, RasterLayer, RasterRenderer, RasterStyle, Resampling, Stretch};
 pub use symbology::{
-    ClassMethod, LabelClass, LabelMatcher, LabelPlacement, Labeling, LineCap, LineJoin, LineStroke, Marker, Renderer, Symbol,
+    ClassMethod, FontName, Glyph, LabelBackground, LabelClass, LabelKey, LabelMatcher, LabelPlacement, Labeling, LineCap, LineJoin,
+    LineMark, LineMarkers, LineStroke, Marker, MarkerRotation, Placements, Renderer, Symbol,
 };
 pub use tiles::{TileKind, TileLayer};
 
@@ -37,7 +43,7 @@ use rustgis_geom::{Coord, Extent};
 use serde::{Deserialize, Serialize};
 
 /// The backdrop drawn under every layer. Each is drawn from the built-in world outline.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Basemap {
     #[default]
     Paper,
@@ -140,9 +146,30 @@ pub struct Layer {
     #[serde(default)]
     pub extrusion: Option<effects::Extrusion>,
     /// A line layer's stacked strokes, drawn bottom first in place of its single stroke (none:
-    /// the renderer's stroke alone).
+    /// the renderer's stroke alone). A point layer's are its marks: each stroke of markers draws
+    /// its marker at the point, bottom first, in place of the symbol's (see
+    /// [`LineStroke`]); a stroke without markers draws nothing there.
     #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "symbology::de_strokes")]
     pub line_strokes: Vec<symbology::LineStroke>,
+    /// A polygon layer's stacked fills, drawn bottom first inside each polygon in place of its
+    /// symbol's fill (none: that fill alone); the outline is drawn over them (see
+    /// [`fills::FillLayer`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "fills::de_fills")]
+    pub fill_layers: Vec<fills::FillLayer>,
+    /// Draws the stacked strokes in levels (symbol levels): every feature's strokes of one
+    /// [`LineStroke::level`] before any of the next, so road casings join under the cores
+    /// instead of cutting across them where lines meet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stroke_levels: bool,
+    /// Turns each point's marker (and its marks, their offsets with them) by the angle in a
+    /// field, as QGIS's data-defined symbol angle does.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "symbology::de_marker_rotation")]
+    pub marker_rotation: Option<symbology::MarkerRotation>,
+    /// The scale (1:N) its symbol and label sizes are set for: drawn at another scale they grow
+    /// and shrink with the map, as on paper (QGIS's reference scale). `None`: they keep their
+    /// size on screen.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_reference_scale")]
+    pub reference_scale: Option<f64>,
     /// Layers with a higher priority draw above lower ones, whatever their order (the scene's
     /// depth priority).
     #[serde(default)]
@@ -156,6 +183,16 @@ pub struct Layer {
     /// Set for streamed layers, whose `dataset` holds the features of the last view read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<source::SourceLayer>,
+    /// Set for a layer loaded whole from a PostGIS table to be edited: the table its edits are
+    /// saved to, and the rows' versions as loaded (desktop only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postgis: Option<source::PostgisEdit>,
+    /// The GeoPackage table this layer's edits save to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpkg: Option<source::GpkgEdit>,
+    /// Process-local identity, preserved by snapshots but never stored in a project.
+    #[serde(skip, default = "next_layer_instance")]
+    instance_id: u64,
     /// Shared, like the features: an undo snapshot or other copy of the layer doesn't copy it.
     #[serde(skip)]
     projected: std::sync::Arc<Vec<Option<Geometry>>>,
@@ -174,6 +211,9 @@ pub struct Layer {
     /// The projection the cache is in.
     #[serde(skip)]
     projected_for: String,
+    /// Allocation identities and byte totals, shared with render snapshots without retaining rows.
+    #[serde(skip)]
+    view_memory: view_memory::Cache,
     /// Bumped whenever geometry changes so caches rebuild.
     #[serde(default)]
     pub geometry_rev: u64,
@@ -183,11 +223,119 @@ fn yes() -> bool {
     true
 }
 
+fn next_layer_instance() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 impl Layer {
+    /// Identifies this live layer, independently of its reusable map-local ID.
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
+    /// Starts a distinct live instance after copying a layer or its owning map.
+    /// Undo and render snapshots must retain the original identity instead.
+    pub fn renew_instance_id(&mut self) {
+        self.instance_id = next_layer_instance();
+    }
+
+    /// Baseline rows for a layer loaded for source editing.
+    pub fn edit_versions(&self) -> Option<&source::Versions> {
+        self.postgis.as_ref().map(|e| &e.versions).or_else(|| self.gpkg.as_ref().map(|e| &e.versions))
+    }
+
+    /// Local linked paths, followed by the dataset's record-only provenance.
+    pub fn file_paths_mut(&mut self) -> Vec<(&mut String, bool)> {
+        let Layer { dataset, source, raster, gpkg, .. } = self;
+        let mut paths = Vec::new();
+        if let Some(src) = source {
+            if let Some(g) = &mut src.gdal {
+                paths.push((&mut g.path, false));
+            } else if let Some(d) = &mut src.duckdb {
+                if let Some(p) = &mut d.database {
+                    paths.push((p, false));
+                }
+            } else if src.embedded.is_none()
+                && src.postgis.is_none()
+                && src.mysql.is_none()
+                && src.sqlserver.is_none()
+                && let Some(p) = &mut src.path
+            {
+                paths.push((p, false));
+            }
+        }
+        if let Some(r) = raster {
+            if r.embedded.is_none()
+                && let Some(p) = &mut r.path
+            {
+                paths.push((p, false));
+            }
+            if let Some(z) = &mut r.time_zarr {
+                paths.push((&mut z.store, false));
+            }
+        }
+        if let Some(g) = gpkg {
+            paths.push((&mut g.path, false));
+        }
+        if let Some(p) = &mut dataset.source {
+            paths.push((p, true));
+        }
+        paths.retain(|(p, _)| paths::is_local(p));
+        paths
+    }
+
+    /// The original local file replaced by Repair Data Source.
+    pub fn linked_file(&self) -> Option<&str> {
+        let p = if let Some(r) = &self.raster {
+            if r.embedded.is_some() {
+                return None;
+            }
+            r.time_zarr.as_ref().map(|z| z.store.as_str()).or(r.path.as_deref())
+        } else {
+            self.source.as_ref().and_then(source::SourceLayer::linked_file)
+        };
+        p.filter(|p| paths::is_local(p))
+    }
+
+    /// The dataset within the linked container.
+    pub fn linked_table(&self) -> Option<&str> {
+        self.raster.as_ref().and_then(|r| r.subdataset.as_deref()).or_else(|| {
+            self.source.as_ref().and_then(|s| {
+                s.table
+                    .as_deref()
+                    .or_else(|| s.gdal.as_ref().map(|g| g.layer.as_str()))
+                    .or_else(|| s.duckdb.as_ref().and_then(|d| d.table.as_deref()))
+            })
+        })
+    }
+
+    /// Installs a fresh source without changing the layer's identity or configuration.
+    pub fn replace_source(&mut self, src: source::SourceLayer) {
+        self.selection.clear();
+        if let Some(info) = src.info() {
+            self.dataset.fields = info.fields.clone();
+            self.dataset.crs = info.coordinate_system();
+        }
+        self.dataset.source = src.linked_file().map(String::from);
+        self.source = Some(src);
+        self.install(Vec::new());
+    }
+
+    /// The dataset, streamed, raster and time-following Zarr addresses used to read this layer
+    /// again, in that order. Local paths are included; database origins stay password-free.
+    pub fn addresses_mut(&mut self) -> impl Iterator<Item = &mut String> {
+        self.dataset.source.iter_mut().chain(self.source.iter_mut().filter_map(|source| source.path.as_mut())).chain(
+            self.raster.iter_mut().flat_map(|raster| raster.path.iter_mut().chain(raster.time_zarr.iter_mut().map(|zarr| &mut zarr.store))),
+        )
+    }
+
     pub fn new(id: u32, dataset: Dataset) -> Self {
         let renderer = Renderer::Single(Symbol::default_for(dataset.geometry_type, id));
         Layer {
             id,
+            instance_id: next_layer_instance(),
             name: dataset.name.clone(),
             visible: true,
             labels: Labeling::default_for(&dataset),
@@ -208,10 +356,16 @@ impl Layer {
             aggregation: None,
             extrusion: None,
             line_strokes: Vec::new(),
+            fill_layers: Vec::new(),
+            stroke_levels: false,
+            marker_rotation: None,
+            reference_scale: None,
             priority: 0,
             design: design::Design::default(),
             raster: None,
             source: None,
+            postgis: None,
+            gpkg: None,
             projected: Default::default(),
             projected_extents: Default::default(),
             projected_vertices: 0,
@@ -219,6 +373,7 @@ impl Layer {
             projected_rev: u64::MAX,
             projected_for: String::new(),
             geometry_rev: 0,
+            view_memory: Default::default(),
         }
     }
 
@@ -292,6 +447,7 @@ impl Layer {
             self.dataset.fields = info.fields.clone();
         }
         let Some(src) = &mut self.source else { return false };
+        src.window_fields = Some(self.dataset.fields.len());
         // A failed read leaves nothing drawn for it (its error shows in Layers), not the
         // previous view's features.
         match src.poll(block) {
@@ -315,12 +471,20 @@ impl Layer {
 
     /// Replaces a streamed layer's features, keeping the selection (by feature id).
     fn install(&mut self, features: Vec<rustgis_data::Feature>) {
-        let ids: std::collections::HashSet<u64> =
+        let mut ids: std::collections::HashSet<u64> =
             self.selection.iter().filter_map(|r| self.dataset.features.get(*r)).map(|f| f.id).collect();
+        if let Some(src) = &mut self.source {
+            ids.extend(std::mem::take(&mut src.saved_selection));
+        }
         let fields = self.dataset.fields.len();
+        self.clear_cache();
         self.dataset.features = features.into();
+        let mut padded = false;
         for f in &mut self.dataset.features {
-            f.attrs.resize(fields, rustgis_data::Value::Null);
+            if f.attrs.len() != fields {
+                f.attrs.resize(fields, rustgis_data::Value::Null);
+                padded = true;
+            }
         }
         self.dataset.windowed = true;
         if let Some(src) = &mut self.source {
@@ -332,6 +496,23 @@ impl Layer {
             self.dataset.features.iter().enumerate().filter(|(_, f)| ids.contains(&f.id)).map(|(i, _)| i).collect()
         };
         self.touch_geometry();
+        if let Some(cache) = self.source.as_mut().and_then(|s| s.ready_cache.take()) {
+            self.projected = cache.projected;
+            self.projected_extents = cache.extents;
+            self.projected_vertices = cache.vertices;
+            self.projected_for = cache.key;
+            self.projected_rev = self.geometry_rev;
+            let feature_bytes =
+                if padded { rustgis_data::source::memory::features_bytes(&self.dataset.features) } else { cache.feature_bytes };
+            self.view_memory.seed(&self.dataset.features, &self.projected, feature_bytes, cache.projected_bytes);
+        }
+    }
+
+    /// Allocated row, projected-geometry, extent and optional display storage for this layer.
+    /// Snapshots report the same shared allocations; totals are memoized until mutable access
+    /// changes an allocation identity, including edits through the public dataset API.
+    pub fn view_cache_bytes(&self) -> usize {
+        self.view_memory.total(&self.dataset.features, &self.projected, &self.projected_extents, &self.thinned)
     }
 
     /// Every feature of a streamed layer's source (up to the read limit), for tools and for
@@ -341,17 +522,17 @@ impl Layer {
         let mut copy = src.clone();
         if !copy.is_open() {
             copy.open()?;
+            // A source by its web address may still be opening in the background (the view or the
+            // project started it): wait for it, as an export does, rather than read nothing.
+            copy.wait_open(std::time::Duration::from_secs(30));
+            if !copy.is_open() {
+                return Err(copy
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "the layer's source is still opening: try again once it has opened".into()));
+            }
         }
         let (mut ds, _) = copy.read_all()?;
-        // A sample isn't all of them: refuse rather than run a tool on part of the data.
-        let max = rustgis_data::source::MAX_LIMIT;
-        if let Some(n) = copy.info().and_then(|i| i.count).filter(|n| (ds.features.len() as u64) < *n && *n > max as u64) {
-            return Err(format!("the layer has {n} features, more than the {max} read at once"));
-        }
-        // A count the source doesn't know, and a read that hit the limit: maybe not all of them.
-        if copy.info().is_some_and(|i| i.count.is_none()) && ds.features.len() >= max {
-            return Err(format!("the layer has more features than the {max} read at once"));
-        }
         ds.name = self.dataset.name.clone();
         // (A project that lists no fields keeps the source's, as `sync_source` gives it.)
         if !self.dataset.fields.is_empty() {
@@ -364,6 +545,82 @@ impl Layer {
     /// The symbol a row draws with.
     pub fn symbol(&self, row: usize) -> Symbol {
         if self.graphics { graphics::symbol(&self.dataset, row) } else { self.renderer.symbol_for(&self.dataset, row) }
+    }
+
+    /// How far a point row's marker is turned, in degrees clockwise ([`Layer::marker_rotation`]): 0
+    /// without, or where the row's value isn't a number.
+    pub fn marker_turn(&self, row: usize) -> f32 {
+        let Some(r) = self.marker_rotation.as_ref().filter(|_| !self.graphics) else { return 0.0 };
+        r.turn(&self.dataset, row)
+    }
+
+    /// The stacked strokes a line feature row is drawn with: its class's own
+    /// ([`Renderer::strokes_for`]), else the layer's `line_strokes`; none (the single stroke) for
+    /// a graphics layer.
+    pub fn strokes(&self, row: usize) -> &[LineStroke] {
+        if self.graphics {
+            return &[];
+        }
+        // Most layers have no class with strokes of its own: no need to class the feature.
+        if !self.renderer.has_class_strokes() {
+            return &self.line_strokes;
+        }
+        self.renderer.strokes_for(&self.dataset, row).unwrap_or(&self.line_strokes)
+    }
+
+    /// A row's symbol and stacked strokes ([`Layer::symbol`], [`Layer::strokes`]), the feature
+    /// classed once for both.
+    pub fn style(&self, row: usize) -> (Symbol, &[LineStroke]) {
+        if self.graphics || !self.renderer.has_class_strokes() {
+            return (self.symbol(row), self.strokes(row));
+        }
+        let (symbol, strokes) = self.renderer.style_for(&self.dataset, row);
+        (symbol, strokes.unwrap_or(&self.line_strokes))
+    }
+
+    /// How much its symbol and label sizes are multiplied by at the map scale 1:`scale`: its
+    /// reference scale over that ([`Layer::reference_scale`]), kept within [`SIZE_FACTORS`]; 1
+    /// without one.
+    pub fn size_factor(&self, scale: f64) -> f32 {
+        match self.reference_scale {
+            Some(r) if scale.is_finite() && scale > 0.0 => (r / scale).clamp(SIZE_FACTORS.0, SIZE_FACTORS.1) as f32,
+            _ => 1.0,
+        }
+    }
+
+    /// Whether some feature may be drawn with stacked strokes ([`Layer::strokes`]).
+    pub fn has_strokes(&self) -> bool {
+        !self.graphics && (!self.line_strokes.is_empty() || self.renderer.has_class_strokes())
+    }
+
+    /// A polygon row's stacked fills: its class's own, else the layer's `fill_layers` (none: its
+    /// symbol's single fill).
+    pub fn fills(&self, row: usize) -> &[fills::FillLayer] {
+        if self.graphics {
+            return &[];
+        }
+        // A class without fills of its own takes the layer's: a layer with no class fills isn't
+        // classed for them.
+        if !self.renderer.has_class_fills() {
+            return &self.fill_layers;
+        }
+        self.renderer.fills_for(&self.dataset, row).unwrap_or(&self.fill_layers)
+    }
+
+    /// A polygon row's symbol, stacked strokes and stacked fills ([`Layer::style`],
+    /// [`Layer::fills`]), the feature classed once for all three.
+    pub fn style_and_fills(&self, row: usize) -> (Symbol, &[LineStroke], &[fills::FillLayer]) {
+        if self.graphics || !self.renderer.has_class_fills() {
+            let (symbol, strokes) = self.style(row);
+            return (symbol, strokes, self.fills(row));
+        }
+        let (symbol, strokes, fills) = self.renderer.style_fills_for(&self.dataset, row);
+        (symbol, strokes.unwrap_or(&self.line_strokes), fills.unwrap_or(&self.fill_layers))
+    }
+
+    /// Whether some feature may be drawn with stacked fills ([`Layer::fills`]).
+    pub fn has_fills(&self) -> bool {
+        !self.graphics && (!self.fill_layers.is_empty() || self.renderer.has_class_fills())
     }
 
     pub fn is_raster(&self) -> bool {
@@ -406,6 +663,10 @@ impl Layer {
     /// geometry itself for a small layer. Read it back with [`Layer::thinned_cache`].
     pub fn thinned_in(&mut self, flat: &projection::Flat, key: &str, tol: f64) -> &[Option<Geometry>] {
         self.projected_in(flat, key);
+        let budget = self.source.as_ref().map_or(lod::CACHE_BYTES, |s| {
+            let base = self.view_memory.base(&self.dataset.features, &self.projected, &self.projected_extents);
+            s.budget().saturating_sub(base).min(lod::CACHE_BYTES)
+        });
         let Some(level) = lod::level(tol).filter(|_| self.projected_vertices > lod::THIN_ABOVE) else { return &self.projected };
         let levels = std::sync::Arc::make_mut(&mut self.thinned);
         match levels.iter().position(|(l, _)| *l == level) {
@@ -415,13 +676,24 @@ impl Layer {
             }
             None => {
                 let t = lod::tolerance(level);
-                let copy: Vec<Option<Geometry>> = self.projected.iter().map(|g| g.as_ref().map(|g| lod::thin(g, t))).collect();
+                let copy = lod::thin_budgeted(&self.projected, t, budget);
                 // The saving counts against every vertex the copy holds, points included.
                 let all: usize = self.projected.iter().flatten().map(lod::vertices).sum();
-                let kept: usize = copy.iter().flatten().map(lod::vertices).sum();
-                let worth = (kept as f64) <= all as f64 * (1.0 - lod::MIN_SAVING);
-                levels.insert(0, (level, worth.then(|| std::sync::Arc::new(copy))));
+                let copy = copy.filter(|c| {
+                    let kept: usize = c.iter().flatten().map(lod::vertices).sum();
+                    (kept as f64) <= all as f64 * (1.0 - lod::MIN_SAVING)
+                });
+                levels.insert(0, (level, copy.map(std::sync::Arc::new)));
                 levels.truncate(lod::LEVELS_KEPT);
+                let mut bytes = 0usize;
+                levels.retain(|(_, copy)| {
+                    let extra = copy.as_ref().map_or(0, |c| lod::cache_bytes(c));
+                    if bytes.saturating_add(extra) > budget {
+                        return false;
+                    }
+                    bytes += extra;
+                    true
+                });
             }
         }
         self.thinned_cache(tol)
@@ -464,7 +736,13 @@ impl Layer {
     pub fn adopt_cache(&mut self, other: &Layer) -> bool {
         let fits = other.dataset.features.shares(&self.dataset.features)
             && other.geometry_rev == self.geometry_rev
-            && other.is_cached(&other.projected_for);
+            && other.is_cached(&other.projected_for)
+            && self.source.as_ref().is_none_or(|source| {
+                !source.is_pending()
+                    && other.source.as_ref().is_some_and(|old| {
+                        old.budget() <= source.budget() && old.projection == source.projection && old.full_read == source.full_read
+                    })
+            });
         if fits {
             self.projected = other.projected.clone();
             self.projected_extents = other.projected_extents.clone();
@@ -484,6 +762,16 @@ impl Layer {
     /// Marks geometry as changed.
     pub fn touch_geometry(&mut self) {
         self.geometry_rev = self.geometry_rev.wrapping_add(1);
+    }
+
+    /// Puts the selection in range, in order and with each row once: the state selecting leaves
+    /// it in. A selection read from a file goes through this too, or a repeated row would be
+    /// counted, and run, twice.
+    pub fn normalize_selection(&mut self) {
+        let n = self.dataset.features.len();
+        self.selection.retain(|r| *r < n);
+        self.selection.sort_unstable();
+        self.selection.dedup();
     }
 
     /// Whether the layer draws at a scale denominator.
@@ -624,9 +912,14 @@ pub struct ServiceChild {
 /// Most layer groups a map keeps (files are hostile).
 pub const MAX_GROUPS: usize = 2000;
 
+/// Most levels layer groups nest (#836): a top-level group is level 1.
+pub const MAX_GROUP_DEPTH: usize = 8;
+
 /// Related layers under one name (#413): a collapsible folder in the Layers pane whose
 /// visibility, transparency and scale range apply on top of each child's own. Children stay
 /// ordinary layers, kept together in the drawing order; a layer belongs to one group at most.
+/// A group may sit in another (#836, `parent`): its layers, and its subgroups' at any depth,
+/// stay together in the drawing order, and every group above it applies too.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LayerGroup {
     pub id: u32,
@@ -644,9 +937,12 @@ pub struct LayerGroup {
     /// The children draw only when zoomed out beyond 1:`max_scale`, if set.
     #[serde(default)]
     pub max_scale: Option<f64>,
-    /// The children's layer ids.
+    /// The children's layer ids (the layers directly in it, not its subgroups').
     #[serde(default)]
     pub children: Vec<u32>,
+    /// The group this one is in (#836); `None` at the top level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<u32>,
 }
 
 impl LayerGroup {
@@ -660,6 +956,7 @@ impl LayerGroup {
             min_scale: None,
             max_scale: None,
             children: Vec::new(),
+            parent: None,
         }
     }
 
@@ -673,6 +970,24 @@ impl LayerGroup {
     }
 }
 
+/// An item at one level of the Layers pane's outline (#836, [`Map::outline`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Outline {
+    /// A map layer, by id.
+    Layer(u32),
+    /// A layer group, by id.
+    Group(u32),
+}
+
+/// An entry in the drawing order of all a map's layers ([`Map::stack`]), by index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Drawn {
+    /// A map layer: `Map::layers[i]`.
+    Layer(usize),
+    /// A web tile layer: `Map::tiles[i]`.
+    Tile(usize),
+}
+
 /// A map: an ordered list of layers (index 0 draws on top), a basemap and a camera.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Map {
@@ -684,7 +999,8 @@ pub struct Map {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<LayerGroup>,
     pub basemap: Basemap,
-    /// Web tile basemaps and overlays over the basemap and under the layers (index 0 on top).
+    /// Web tile basemaps and overlays (index 0 on top), each drawn over the map layer it names
+    /// (`TileLayer::over`), or under all of them; see [`Map::stack`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tiles: Vec<TileLayer>,
     pub camera: Camera,
@@ -701,10 +1017,10 @@ pub struct Map {
     /// Map-wide label display switches.
     #[serde(default)]
     pub label_display: LabelDisplay,
-    /// The features labelled when labels were locked, as (layer id, row): only they are labelled
-    /// while the lock holds, wherever the map moves. Filled by the renderer.
+    /// The labels placed when labels were locked: only they are drawn while the lock holds,
+    /// wherever the map moves. Filled by the renderer.
     #[serde(skip)]
-    pub label_lock: Option<Vec<(u32, usize)>>,
+    pub label_lock: Option<Vec<LabelKey>>,
     /// Relationships, snapping, topology rules and edit settings.
     #[serde(default)]
     pub editing: design::MapEditing,
@@ -798,6 +1114,20 @@ pub struct LabelDisplay {
 }
 
 impl Map {
+    /// All local linked files and record-only provenance in serialization order.
+    pub fn file_paths_mut(&mut self) -> Vec<(&mut String, bool)> {
+        let mut paths = Vec::new();
+        for tile in &mut self.tiles {
+            if tile.archive_file().is_some() {
+                paths.push((&mut tile.url, false));
+            }
+        }
+        for layer in &mut self.layers {
+            paths.extend(layer.file_paths_mut());
+        }
+        paths
+    }
+
     pub fn new(name: impl Into<String>) -> Self {
         Map {
             name: name.into(),
@@ -822,6 +1152,39 @@ impl Map {
             body: earth(),
             next_layer_id: 1,
         }
+    }
+
+    /// Every address the map keeps to read its data again (service groups and their layers'
+    /// sources, tile layers and their dated addresses, terrain tiles, layers' dataset, streamed and
+    /// raster sources, time-following Zarr stores). Local paths come too: callers judge each one.
+    pub fn addresses_mut(&mut self) -> Vec<&mut String> {
+        let mut addresses = Vec::new();
+        for group in &mut self.service_groups {
+            addresses.push(&mut group.url);
+            for child in &mut group.children {
+                addresses.push(&mut child.source_url);
+            }
+        }
+        for tile in &mut self.tiles {
+            addresses.push(&mut tile.url);
+            if let Some(url) = &mut tile.time_url {
+                addresses.push(url);
+            }
+            for (_, url) in &mut tile.time_urls {
+                addresses.push(url);
+            }
+            // (A legend's address is built from the service's, its key or password included.)
+            for legend in &mut tile.legends {
+                addresses.push(&mut legend.url);
+            }
+        }
+        if let Some(view::Terrain { source: view::TerrainSource::Tiles { url, .. }, .. }) = &mut self.view.terrain {
+            addresses.push(url);
+        }
+        for layer in &mut self.layers {
+            addresses.extend(layer.addresses_mut());
+        }
+        addresses
     }
 
     /// A nonzero id no layer, service group or layer group has: past the highest in use, or (when ids reach
@@ -887,73 +1250,245 @@ impl Map {
         id
     }
 
-    /// Adds a layer group (its children are taken from any other group); returns its id.
+    /// Adds a layer group (its children are taken from any other group and gathered together,
+    /// in its parent when it has one); returns its id. A parent that's missing, or with no room
+    /// for another level, is dropped.
     pub fn add_group(&mut self, mut group: LayerGroup) -> u32 {
         group.id = self.next_id();
         let id = group.id;
+        if group.parent.is_some_and(|p| self.group(p).is_none() || self.group_depth(p) >= MAX_GROUP_DEPTH) {
+            group.parent = None;
+        }
+        self.settle_tiles();
         for g in &mut self.groups {
             g.children.retain(|c| !group.children.contains(c));
         }
+        let mut inside = vec![id];
+        inside.extend(self.chain_ids(group.parent));
         for c in &group.children {
-            self.lift_out(*c);
+            self.lift_out(&[*c], &inside);
         }
         self.groups.push(group);
+        self.gather_chain(id);
+        self.settle_tiles();
         id
     }
 
-    /// Moves a layer that sits between two layers of a group it isn't in (it just left it) to
-    /// just above that group, so the group's layers stay together.
-    fn lift_out(&mut self, layer: u32) {
-        let Some(i) = self.layer_index(layer) else { return };
-        let l = self.layers.remove(i);
-        let mut at = i;
-        while at > 0 && self.splits_group(at) {
+    /// Moves layers that sit together inside a group they aren't in (`inside`: the groups they
+    /// are in, innermost first) to just above that group, so its layers stay together.
+    fn lift_out(&mut self, ids: &[u32], inside: &[u32]) {
+        let Some(first) = self.layers.iter().position(|l| ids.contains(&l.id)) else { return };
+        let order: Vec<u32> = self.layers.iter().map(|l| l.id).filter(|id| !ids.contains(id)).collect();
+        let mut at = first.min(order.len());
+        while at > 0 && self.splits_between(order.get(at - 1).copied(), order.get(at).copied(), inside) {
             at -= 1;
         }
-        self.layers.insert(at.min(self.layers.len()), l);
+        if at != first {
+            // Moving: the tile layers drawn over them keep their place.
+            self.release_tiles(ids);
+            let (members, rest): (Vec<Layer>, Vec<Layer>) = std::mem::take(&mut self.layers).into_iter().partition(|l| ids.contains(&l.id));
+            self.layers = rest;
+            let tail = self.layers.split_off(at.min(self.layers.len()));
+            self.layers.extend(members);
+            self.layers.extend(tail);
+        }
     }
 
     pub fn group(&self, id: u32) -> Option<&LayerGroup> {
         self.groups.iter().find(|g| g.id == id)
     }
 
-    /// The layer group a layer is in, if any.
+    /// The layer group a layer is directly in, if any.
     pub fn group_of(&self, layer: u32) -> Option<&LayerGroup> {
         self.groups.iter().find(|g| g.children.contains(&layer))
     }
 
-    /// Whether a layer is shown: its own box ticked, and its group's if it has one.
+    /// A group and the groups holding it, innermost first: at most [`MAX_GROUP_DEPTH`], ending at
+    /// a parent that's missing or already listed (a loop, as a project file may have).
+    pub fn group_chain(&self, group: u32) -> Vec<&LayerGroup> {
+        let mut out: Vec<&LayerGroup> = Vec::new();
+        let mut next = Some(group);
+        while let Some(id) = next {
+            if out.len() >= MAX_GROUP_DEPTH || out.iter().any(|g| g.id == id) {
+                break;
+            }
+            let Some(g) = self.group(id) else { break };
+            out.push(g);
+            next = g.parent;
+        }
+        out
+    }
+
+    /// The groups a layer is in, its own first (none outside a group).
+    pub fn groups_of(&self, layer: u32) -> Vec<&LayerGroup> {
+        self.group_of(layer).map_or_else(Vec::new, |g| self.group_chain(g.id))
+    }
+
+    /// The ids of a group's chain ([`Map::group_chain`]); none for `None`.
+    fn chain_ids(&self, group: Option<u32>) -> Vec<u32> {
+        group.map_or_else(Vec::new, |g| self.group_chain(g).iter().map(|g| g.id).collect())
+    }
+
+    /// How many levels deep a group is: 1 at the top level.
+    pub fn group_depth(&self, group: u32) -> usize {
+        self.group_chain(group).len()
+    }
+
+    /// Whether a layer is in a group, directly or in one of its subgroups.
+    pub fn layer_in(&self, layer: u32, group: u32) -> bool {
+        self.groups_of(layer).iter().any(|g| g.id == group)
+    }
+
+    /// Each group's chain of ids, itself first: for loops over many layers or groups.
+    fn chains(&self) -> std::collections::HashMap<u32, Vec<u32>> {
+        let parent: std::collections::HashMap<u32, Option<u32>> = self.groups.iter().map(|g| (g.id, g.parent)).collect();
+        self.groups
+            .iter()
+            .map(|g| {
+                let mut chain = vec![g.id];
+                let mut next = g.parent;
+                while let Some(p) = next {
+                    if chain.len() >= MAX_GROUP_DEPTH || chain.contains(&p) {
+                        break;
+                    }
+                    let Some(up) = parent.get(&p) else { break };
+                    chain.push(p);
+                    next = *up;
+                }
+                (g.id, chain)
+            })
+            .collect()
+    }
+
+    /// Each grouped layer's chain of groups, its own first (the first group listing it, as
+    /// [`Map::group_of`] finds it).
+    fn layer_chains(&self) -> std::collections::HashMap<u32, Vec<u32>> {
+        let chains = self.chains();
+        let mut out = std::collections::HashMap::new();
+        for g in &self.groups {
+            let Some(c) = chains.get(&g.id) else { continue };
+            for l in &g.children {
+                out.entry(*l).or_insert_with(|| c.clone());
+            }
+        }
+        out
+    }
+
+    /// The layers in a group and its subgroups at any depth, in drawing order.
+    pub fn group_layers(&self, group: u32) -> Vec<u32> {
+        let chains = self.layer_chains();
+        self.layers.iter().map(|l| l.id).filter(|id| chains.get(id).is_some_and(|c| c.contains(&group))).collect()
+    }
+
+    /// A group's subgroups at any depth (not itself).
+    pub fn subgroups(&self, group: u32) -> Vec<u32> {
+        let chains = self.chains();
+        self.groups.iter().map(|g| g.id).filter(|id| *id != group && chains.get(id).is_some_and(|c| c.contains(&group))).collect()
+    }
+
+    /// How many levels a group and its subgroups take: 1 without subgroups.
+    fn group_height(&self, group: u32) -> usize {
+        self.chains().values().filter_map(|c| c.iter().position(|g| *g == group)).max().map_or(1, |p| p + 1)
+    }
+
+    /// The layers and groups directly in `parent` (`None`: the top level), as the Layers pane
+    /// lists them: in drawing order, top first, then the groups with no layers.
+    pub fn outline(&self, parent: Option<u32>) -> Vec<Outline> {
+        let chains = self.layer_chains();
+        let mut out: Vec<Outline> = Vec::new();
+        let mut seen: std::collections::HashSet<Outline> = std::collections::HashSet::new();
+        for l in &self.layers {
+            let chain = chains.get(&l.id).map_or(&[][..], Vec::as_slice);
+            let item = match parent {
+                None => chain.last().map_or(Outline::Layer(l.id), |g| Outline::Group(*g)),
+                Some(p) => match chain.iter().position(|g| *g == p) {
+                    Some(0) => Outline::Layer(l.id),
+                    Some(k) => match chain.get(k - 1) {
+                        Some(g) => Outline::Group(*g),
+                        None => continue,
+                    },
+                    None => continue,
+                },
+            };
+            if seen.insert(item) {
+                out.push(item);
+            }
+        }
+        let tops = self.chains();
+        for g in &self.groups {
+            // At the top level, a group whose chain ends at it (a missing parent leaves it there).
+            let here = match parent {
+                None => tops.get(&g.id).and_then(|c| c.last()) == Some(&g.id),
+                Some(p) => g.parent == Some(p) && g.id != p,
+            };
+            if here && seen.insert(Outline::Group(g.id)) {
+                out.push(Outline::Group(g.id));
+            }
+        }
+        out
+    }
+
+    /// Whether a layer is shown: its own box ticked, and every group's it is in.
     pub fn shows(&self, l: &Layer) -> bool {
-        l.visible && self.group_of(l.id).is_none_or(|g| g.visible)
+        l.visible && self.groups_of(l.id).iter().all(|g| g.visible)
     }
 
     /// Whether a layer draws at a scale denominator: shown, and within its own scale range and
-    /// its group's.
+    /// its groups'.
     pub fn draws_at(&self, l: &Layer, scale: f64) -> bool {
-        l.visible && l.in_scale_range(scale) && self.group_of(l.id).is_none_or(|g| g.visible && g.in_scale_range(scale))
+        l.visible && l.in_scale_range(scale) && self.groups_of(l.id).iter().all(|g| g.visible && g.in_scale_range(scale))
     }
 
-    /// Whether a layer is within its own scale range and its group's.
+    /// Whether a layer is within its own scale range and its groups'.
     pub fn in_scale_range(&self, l: &Layer, scale: f64) -> bool {
-        l.in_scale_range(scale) && self.group_of(l.id).is_none_or(|g| g.in_scale_range(scale))
+        l.in_scale_range(scale) && self.groups_of(l.id).iter().all(|g| g.in_scale_range(scale))
     }
 
-    /// A layer's opacity with its group's applied.
+    /// A layer's opacity with its groups' applied.
     pub fn layer_opacity(&self, l: &Layer) -> f32 {
-        l.opacity() * self.group_of(l.id).map_or(1.0, LayerGroup::opacity)
+        l.opacity() * self.groups_of(l.id).iter().map(|g| g.opacity()).product::<f32>()
     }
 
-    /// Ids of the layers whose group keeps them from drawing at a scale denominator (hidden, or
-    /// out of its scale range): for loops that change the layers as they go.
+    /// The opacity the groups give each layer in a see-through one (all its groups' multiplied),
+    /// by layer id; a layer left out is opaque as far as its groups go.
+    pub fn group_opacities(&self) -> std::collections::HashMap<u32, f32> {
+        if !self.groups.iter().any(|g| g.transparency > 0.0) {
+            return std::collections::HashMap::new();
+        }
+        let opacity: std::collections::HashMap<u32, f32> = self.groups.iter().map(|g| (g.id, g.opacity())).collect();
+        self.layer_chains()
+            .into_iter()
+            .map(|(l, c)| (l, c.iter().map(|g| opacity.get(g).copied().unwrap_or(1.0)).product::<f32>()))
+            .filter(|(_, o)| *o < 1.0)
+            .collect()
+    }
+
+    /// Ids of the layers whose groups keep them from drawing at a scale denominator (one hidden,
+    /// or out of its scale range): for loops that change the layers as they go.
     pub fn held_by_group(&self, scale: f64) -> std::collections::HashSet<u32> {
-        self.groups.iter().filter(|g| !g.visible || !g.in_scale_range(scale)).flat_map(|g| g.children.iter().copied()).collect()
+        let held: std::collections::HashSet<u32> =
+            self.groups.iter().filter(|g| !g.visible || !g.in_scale_range(scale)).map(|g| g.id).collect();
+        if held.is_empty() {
+            return std::collections::HashSet::new();
+        }
+        // Every group listing a layer counts (a hand-edited file may list it twice).
+        let chains = self.chains();
+        self.groups
+            .iter()
+            .filter(|g| chains.get(&g.id).is_some_and(|c| c.iter().any(|x| held.contains(x))))
+            .flat_map(|g| g.children.iter().copied())
+            .collect()
     }
 
-    /// Folds each group's visibility, transparency and scale range into its children and drops
-    /// the groups: for exports that know only layers.
+    /// Folds each group's visibility, transparency and scale range into its layers (its
+    /// subgroups' too) and drops the groups: for exports that know only layers.
     pub fn bake_groups(&mut self) {
-        for g in std::mem::take(&mut self.groups) {
-            for l in self.layers.iter_mut().filter(|l| g.children.contains(&l.id)) {
+        self.settle_tiles();
+        let chains = self.layer_chains();
+        let groups = std::mem::take(&mut self.groups);
+        for l in &mut self.layers {
+            let Some(chain) = chains.get(&l.id) else { continue };
+            for g in chain.iter().filter_map(|id| groups.iter().find(|g| g.id == *id)) {
                 l.visible &= g.visible;
                 l.transparency = 100.0 * (1.0 - l.opacity() * g.opacity());
                 l.min_scale = match (l.min_scale, g.min_scale) {
@@ -968,27 +1503,63 @@ impl Map {
         }
     }
 
-    /// Puts a layer in a group (out of any other), next to the group's other children in the
-    /// drawing order; `None` takes it out of its group (above the group when it was between two
-    /// of its layers).
+    /// Puts a layer in a group (out of any other), next to the group's other layers in the
+    /// drawing order (at its end nearer to the layer); `None` takes it out of its group (above
+    /// the outermost group when it was between two of its layers).
     pub fn set_group(&mut self, layer: u32, group: Option<u32>) {
         if group.is_some() && self.group_of(layer).map(|g| g.id) == group {
             return;
         }
+        if let Some(gid) = group
+            && let Some(before) = self.nearest_end(gid, &[layer])
+        {
+            // (Checked: the layer and the group exist, and `before` is one of its layers.)
+            let _ = self.place_layer(layer, group, before);
+            return;
+        }
+        self.settle_tiles();
         for g in &mut self.groups {
             g.children.retain(|c| *c != layer);
         }
-        self.lift_out(layer);
-        let Some(gid) = group else { return };
-        let Some(g) = self.groups.iter_mut().find(|g| g.id == gid) else { return };
-        g.children.push(layer);
-        self.gather_group(gid);
+        let inside = self.chain_ids(group);
+        self.lift_out(&[layer], &inside);
+        if let Some(gid) = group
+            && let Some(g) = self.groups.iter_mut().find(|g| g.id == gid)
+        {
+            g.children.push(layer);
+            self.gather_chain(gid);
+        }
+        self.settle_tiles();
+    }
+
+    /// Where layers `moving` (together in the drawing order) join a group at its end nearer to
+    /// them: above its topmost other layer (`Some(Some(id))`) when they are above it, else at its
+    /// end (`Some(None)`). `None` when the group has no other layers, or they sit among them
+    /// already (in a subgroup): they stay there.
+    fn nearest_end(&self, group: u32, moving: &[u32]) -> Option<Option<u32>> {
+        let others: Vec<u32> = self.group_layers(group).into_iter().filter(|id| !moving.contains(id)).collect();
+        let (first, last) = (self.layer_index(*others.first()?)?, self.layer_index(*others.last()?)?);
+        let at = self.layers.iter().position(|l| moving.contains(&l.id))?;
+        match at {
+            a if a < first => Some(others.first().copied()),
+            a if a > last => Some(None),
+            _ => None,
+        }
+    }
+
+    /// Below the lowest layer of the first group of `chain` (innermost first) that has any: the
+    /// end of a group, or of the nearest group holding it when it has no layers.
+    fn end_of(&self, chain: &[u32]) -> Option<usize> {
+        chain.iter().find_map(|g| {
+            let members = self.group_layers(*g);
+            self.layers.iter().rposition(|l| members.contains(&l.id)).map(|i| i + 1)
+        })
     }
 
     /// Puts a layer in a group, or out of any (`None`), and in the drawing order just above the
-    /// layer `before` (`None`: below the group's other layers, or at the bottom out of a group).
-    /// In a group, `before` must be one of its layers; out of one, a place between two layers of a
-    /// group moves up past that group.
+    /// layer `before` (`None`: below the group's other layers, its subgroups' too, or at the
+    /// bottom out of a group). In a group, `before` must be one of its layers or its subgroups';
+    /// a place inside a group the layer isn't going in moves up past that group.
     pub fn place_layer(&mut self, layer: u32, group: Option<u32>, before: Option<u32>) -> Result<(), String> {
         if self.layer_index(layer).is_none() {
             return Err("no such layer".into());
@@ -997,7 +1568,10 @@ impl Map {
             return Err("the layer can't go before itself".into());
         }
         let others: Vec<u32> = match group {
-            Some(g) => self.group(g).ok_or("no such group")?.children.iter().copied().filter(|c| *c != layer).collect(),
+            Some(g) => {
+                self.group(g).ok_or("no such group")?;
+                self.group_layers(g).into_iter().filter(|c| *c != layer).collect()
+            }
             None => Vec::new(),
         };
         if let Some(b) = before {
@@ -1008,6 +1582,9 @@ impl Map {
                 return Err("the layer to go before isn't in the group".into());
             }
         }
+        let inside = self.chain_ids(group);
+        let places = self.pin_tile_places();
+        self.release_tiles(&[layer]);
         for g in &mut self.groups {
             g.children.retain(|c| *c != layer);
         }
@@ -1015,59 +1592,242 @@ impl Map {
         let l = self.layers.remove(from);
         let mut at = match (before, group) {
             (Some(b), _) => self.layer_index(b).unwrap_or(self.layers.len()),
-            // Below the group's lowest layer; alone in it, where it was.
-            (None, Some(_)) => self.layers.iter().rposition(|x| others.contains(&x.id)).map_or(from.min(self.layers.len()), |i| i + 1),
+            // Below the group's lowest layer; in a group with none, at the end of the nearest one
+            // holding it that has some, or where it was.
+            (None, Some(_)) => self.end_of(&inside).unwrap_or(from.min(self.layers.len())),
             (None, None) => self.layers.len(),
         };
-        if group.is_none() {
-            while at > 0 && self.splits_group(at) {
-                at -= 1;
-            }
+        while at > 0 && self.splits(at, &inside) {
+            at -= 1;
         }
-        self.layers.insert(at.min(self.layers.len()), l);
+        let at = at.min(self.layers.len());
+        self.layers.insert(at, l);
         if let Some(g) = group.and_then(|g| self.groups.iter_mut().find(|x| x.id == g)) {
             g.children.push(layer);
         }
+        // (Back where it was taken from: nothing moved.)
+        self.keep_tiles_if_unmoved(at == from, places);
+        self.settle_tiles();
         Ok(())
     }
 
-    /// Moves a group's layers, together, to position `to` among the other layers (past the end,
-    /// the bottom); a position inside another group's run moves up above that group.
+    /// Moves a group's layers (its subgroups' too), together, to position `to` among the other
+    /// layers (past the end, the bottom); a position inside another group's run moves up above
+    /// that group. A subgroup stays in its group: at most to its top or its bottom.
     pub fn move_group(&mut self, group: u32, to: usize) -> Result<(), String> {
-        let children = self.group(group).ok_or("no such group")?.children.clone();
+        let parent = self.group(group).ok_or("no such group")?.parent;
+        let children = self.group_layers(group);
+        let inside = self.chain_ids(parent);
+        let places = self.pin_tile_places();
+        // Where the group's layers are now: put back at the start of their run, unbroken, they
+        // haven't moved.
+        let run: Vec<usize> = self.layers.iter().enumerate().filter(|(_, l)| children.contains(&l.id)).map(|(i, _)| i).collect();
+        let start = run.first().copied().filter(|s| run.iter().enumerate().all(|(k, i)| *i == s + k));
+        self.release_tiles(&children);
         let (members, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.layers).into_iter().partition(|l| children.contains(&l.id));
         self.layers = rest;
         if members.is_empty() {
             return Err("the group has no layers to move".into());
         }
         let mut at = to.min(self.layers.len());
-        while at > 0 && self.splits_group(at) {
+        if let Some(p) = parent {
+            let siblings = self.group_layers(p);
+            let lo = self.layers.iter().position(|l| siblings.contains(&l.id));
+            let hi = self.layers.iter().rposition(|l| siblings.contains(&l.id));
+            at = match (lo, hi) {
+                (Some(lo), Some(hi)) => at.clamp(lo, hi + 1),
+                // Alone in its group: it moves with the group, not in it.
+                _ => run.first().copied().unwrap_or(at).min(self.layers.len()),
+            };
+        }
+        while at > 0 && self.splits(at, &inside) {
             at -= 1;
         }
         let tail = self.layers.split_off(at);
         self.layers.extend(members);
         self.layers.extend(tail);
+        self.keep_tiles_if_unmoved(start == Some(at), places);
+        self.settle_tiles();
         Ok(())
     }
 
-    /// Moves a group's children together in the drawing order, at its topmost child, keeping
-    /// their order; children with no layer are dropped.
+    /// Whether `group` can go in `parent` (`None`: the top level): not in itself or one of its
+    /// subgroups, and no deeper than [`MAX_GROUP_DEPTH`] levels.
+    fn can_nest(&self, group: u32, parent: Option<u32>) -> Result<(), String> {
+        self.group(group).ok_or("no such group")?;
+        let Some(p) = parent else { return Ok(()) };
+        self.group(p).ok_or("no such group to go in")?;
+        if self.group_chain(p).iter().any(|g| g.id == group) {
+            return Err("a group can't go in itself or one of its subgroups".into());
+        }
+        if self.group_depth(p).saturating_add(self.group_height(group)) > MAX_GROUP_DEPTH {
+            return Err(format!("groups nest at most {MAX_GROUP_DEPTH} levels deep"));
+        }
+        Ok(())
+    }
+
+    fn set_parent_of(&mut self, group: u32, parent: Option<u32>) {
+        if let Some(g) = self.groups.iter_mut().find(|g| g.id == group) {
+            g.parent = parent;
+        }
+    }
+
+    /// Puts a group, with its layers and subgroups, in another group or at the top level
+    /// (`None`), in the drawing order just above the layer `before` (`None`: below the other
+    /// group's layers, or at the bottom at the top level). In a group, `before` must be one of
+    /// its layers or its subgroups'; a place inside a group it isn't going in moves up past that
+    /// group.
+    pub fn place_group(&mut self, group: u32, parent: Option<u32>, before: Option<u32>) -> Result<(), String> {
+        self.can_nest(group, parent)?;
+        let members = self.group_layers(group);
+        if let Some(b) = before {
+            if self.layer_index(b).is_none() {
+                return Err("no layer to go before".into());
+            }
+            if members.contains(&b) {
+                return Err("the group can't go before one of its own layers".into());
+            }
+            if parent.is_some_and(|p| !self.layer_in(b, p)) {
+                return Err("the layer to go before isn't in the group".into());
+            }
+        }
+        if members.is_empty() {
+            // Nothing to place: a group with no layers lists at the end of its level, in the
+            // order of the map's groups; at the end (`before` none), after the others there.
+            self.set_parent_of(group, parent);
+            if before.is_none()
+                && let Some(i) = self.groups.iter().position(|g| g.id == group)
+            {
+                let g = self.groups.remove(i);
+                self.groups.push(g);
+            }
+            return Ok(());
+        }
+        let places = self.pin_tile_places();
+        let run: Vec<usize> = self.layers.iter().enumerate().filter(|(_, l)| members.contains(&l.id)).map(|(i, _)| i).collect();
+        let start = run.first().copied().filter(|s| run.iter().enumerate().all(|(k, i)| *i == s + k));
+        self.release_tiles(&members);
+        self.set_parent_of(group, parent);
+        let inside = self.chain_ids(parent);
+        let (moving, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.layers).into_iter().partition(|l| members.contains(&l.id));
+        self.layers = rest;
+        let mut at = match (before, parent) {
+            (Some(b), _) => self.layer_index(b).unwrap_or(self.layers.len()),
+            (None, Some(_)) => self.end_of(&inside).unwrap_or_else(|| run.first().copied().unwrap_or(self.layers.len())),
+            (None, None) => self.layers.len(),
+        };
+        at = at.min(self.layers.len());
+        while at > 0 && self.splits(at, &inside) {
+            at -= 1;
+        }
+        let tail = self.layers.split_off(at);
+        self.layers.extend(moving);
+        self.layers.extend(tail);
+        self.keep_tiles_if_unmoved(start == Some(at), places);
+        self.settle_tiles();
+        Ok(())
+    }
+
+    /// Puts a group, with its layers and subgroups, in another group or at the top level
+    /// (`None`), next to that group's other layers (at the end nearer to where it is), or where
+    /// it is at the top level (above the group it was inside).
+    pub fn set_group_parent(&mut self, group: u32, parent: Option<u32>) -> Result<(), String> {
+        self.can_nest(group, parent)?;
+        if self.group(group).is_some_and(|g| g.parent == parent) {
+            return Ok(());
+        }
+        let members = self.group_layers(group);
+        if let Some(p) = parent
+            && let Some(before) = self.nearest_end(p, &members)
+        {
+            return self.place_group(group, parent, before);
+        }
+        self.settle_tiles();
+        self.set_parent_of(group, parent);
+        let inside = self.chain_ids(parent);
+        self.lift_out(&members, &inside);
+        if let Some(p) = parent {
+            self.gather_chain(p);
+        }
+        self.settle_tiles();
+        Ok(())
+    }
+
+    /// Dissolves a group: its layers and subgroups go up one level, where they are.
+    pub fn ungroup(&mut self, group: u32) -> Result<(), String> {
+        let g = self.group(group).ok_or("no such group")?;
+        let (parent, children) = (g.parent.filter(|p| *p != group), g.children.clone());
+        // The tile layers over the group stay over its layers, where they were.
+        self.settle_tiles();
+        for x in &mut self.groups {
+            if Some(x.id) == parent {
+                x.children.extend(children.iter().copied());
+            }
+            if x.parent == Some(group) {
+                x.parent = parent;
+            }
+        }
+        self.groups.retain(|x| x.id != group);
+        Ok(())
+    }
+
+    /// Gathers a group's layers, and those of every group holding it, the outermost first.
+    fn gather_chain(&mut self, group: u32) {
+        for id in self.chain_ids(Some(group)).into_iter().rev() {
+            self.gather_group(id);
+        }
+    }
+
+    /// Moves a group's layers, its subgroups' too, together in the drawing order at the topmost,
+    /// keeping their order; children with no layer are dropped.
     pub fn gather_group(&mut self, group: u32) {
         let ids: std::collections::HashSet<u32> = self.layers.iter().map(|l| l.id).collect();
         let Some(g) = self.groups.iter_mut().find(|g| g.id == group) else { return };
         g.children.retain(|c| ids.contains(c));
-        let children = g.children.clone();
-        let Some(top) = self.layers.iter().position(|l| children.contains(&l.id)) else { return };
-        let mut members = Vec::new();
+        let members: std::collections::HashSet<u32> = self.group_layers(group).into_iter().collect();
+        let Some(top) = self.layers.iter().position(|l| members.contains(&l.id)) else { return };
+        let mut inner = Vec::new();
         let mut rest = Vec::new();
         for l in std::mem::take(&mut self.layers) {
-            if children.contains(&l.id) { members.push(l) } else { rest.push(l) }
+            if members.contains(&l.id) { inner.push(l) } else { rest.push(l) }
         }
         // Layers above the topmost child stay above.
         let tail = rest.split_off(top.min(rest.len()));
-        rest.extend(members);
+        rest.extend(inner);
         rest.extend(tail);
         self.layers = rest;
+        self.settle_tiles();
+    }
+
+    /// Makes a project file's groups whole (#836): a parent that is the group itself, missing,
+    /// in a loop or past [`MAX_GROUP_DEPTH`] levels is dropped (the group goes to the top
+    /// level), and each group's layers are gathered together, the outermost groups first.
+    pub fn tidy_groups(&mut self) {
+        let ids: std::collections::HashSet<u32> = self.groups.iter().map(|g| g.id).collect();
+        for g in &mut self.groups {
+            if g.parent.is_some_and(|p| p == g.id || !ids.contains(&p)) {
+                g.parent = None;
+            }
+        }
+        let mut parent: std::collections::HashMap<u32, Option<u32>> = self.groups.iter().map(|g| (g.id, g.parent)).collect();
+        for g in &mut self.groups {
+            let mut seen = vec![g.id];
+            let mut next = g.parent;
+            while let Some(p) = next {
+                if seen.contains(&p) || seen.len() >= MAX_GROUP_DEPTH {
+                    g.parent = None;
+                    parent.insert(g.id, None);
+                    break;
+                }
+                seen.push(p);
+                next = parent.get(&p).copied().flatten();
+            }
+        }
+        let mut order: Vec<(usize, u32)> = self.groups.iter().map(|g| (self.group_depth(g.id), g.id)).collect();
+        order.sort_by_key(|(depth, _)| *depth);
+        for (_, id) in order {
+            self.gather_group(id);
+        }
     }
 
     /// The map's layers as they stand (their ids in order, and the next id), cheap to take before
@@ -1084,42 +1844,249 @@ impl Map {
         self.next_layer_id = mark.next;
     }
 
-    /// Inserts a layer on top of the layers of its kind: points above lines above polygons above
-    /// rasters, as GIS apps insert them.
-    fn insert_ranked(&mut self, layer: Layer) {
-        let rank = |l: &Layer| match (l.is_raster(), l.geometry_type()) {
-            (true, _) => 4,
-            (_, GeometryType::Point) => 0,
-            (_, GeometryType::Polyline) => 1,
-            (_, GeometryType::Polygon) => 2,
-            (_, GeometryType::None) => 3,
-        };
-        let r = rank(&layer);
-        let mut pos = self.layers.iter().position(|l| rank(l) >= r).unwrap_or(self.layers.len());
-        // Never between two layers of one group: above the group instead.
-        while pos > 0 && self.splits_group(pos) {
-            pos -= 1;
-        }
-        self.layers.insert(pos, layer);
+    /// Inserts a layer on top of the drawing order, whatever its kind, as GeoLibre adds them
+    /// (#808): above every layer, and above the tile layers drawn over them.
+    fn insert_on_top(&mut self, layer: Layer) {
+        self.layers.insert(0, layer);
     }
 
-    /// Whether a layer put at `pos` in the drawing order would sit between two layers of one group.
-    fn splits_group(&self, pos: usize) -> bool {
-        let (Some(above), Some(below)) = (pos.checked_sub(1).and_then(|i| self.layers.get(i)), self.layers.get(pos)) else {
-            return false;
+    /// The map's layers as the Layers pane lists them at the top level, top first: each layer
+    /// outside a group alone, each top-level group's layers together (its subgroups' too, in
+    /// order), service groups aside.
+    fn units(&self) -> Vec<Vec<u32>> {
+        let group: std::collections::HashMap<u32, u32> =
+            self.layer_chains().into_iter().filter_map(|(l, c)| c.last().map(|top| (l, *top))).collect();
+        let mut units: Vec<Vec<u32>> = Vec::new();
+        // A group's unit, by group.
+        let mut at: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for l in &self.layers {
+            match group.get(&l.id) {
+                Some(g) => match at.get(g).and_then(|k| units.get_mut(*k)) {
+                    Some(u) => u.push(l.id),
+                    None => {
+                        at.insert(*g, units.len());
+                        units.push(vec![l.id]);
+                    }
+                },
+                None => units.push(vec![l.id]),
+            }
+        }
+        units
+    }
+
+    /// Where each tile layer is drawn, by index: just over this map layer (the topmost of its
+    /// group, as a tile layer never goes inside one), or under all of them (None, as for a layer
+    /// it names that the map no longer has).
+    pub fn tile_slots(&self) -> Vec<Option<u32>> {
+        if self.tiles.iter().all(|t| t.over.is_none()) {
+            return vec![None; self.tiles.len()];
+        }
+        let top: std::collections::HashMap<u32, u32> = self
+            .units()
+            .into_iter()
+            .filter_map(|u| u.first().copied().map(|t| (u, t)))
+            .flat_map(|(u, t)| u.into_iter().map(move |l| (l, t)))
+            .collect();
+        self.tiles.iter().map(|t| t.over.and_then(|o| top.get(&o).copied())).collect()
+    }
+
+    /// Where `tile` is drawn (see [`Map::tile_slots`]).
+    pub fn tile_slot(&self, tile: &TileLayer) -> Option<u32> {
+        let over = tile.over?;
+        self.units().into_iter().find(|u| u.contains(&over)).and_then(|u| u.first().copied())
+    }
+
+    /// The drawing order of all the map's layers, top first: the map layers, each with the
+    /// tile layers drawn over it above it, and the tile layers under them all last (#808).
+    pub fn stack(&self) -> Vec<Drawn> {
+        let slots = self.tile_slots();
+        let over = |id: Option<u32>| slots.iter().enumerate().filter(move |(_, s)| **s == id).map(|(i, _)| Drawn::Tile(i));
+        let mut out = Vec::with_capacity(self.layers.len() + self.tiles.len());
+        for (i, l) in self.layers.iter().enumerate() {
+            out.extend(over(Some(l.id)));
+            out.push(Drawn::Layer(i));
+        }
+        out.extend(over(None));
+        out
+    }
+
+    /// The tile layers drawn just over the map layer `over` (None: under all of them), top
+    /// first, by index.
+    pub fn tiles_over(&self, over: Option<u32>) -> Vec<usize> {
+        self.tile_slots().into_iter().enumerate().filter(|(_, s)| *s == over).map(|(i, _)| i).collect()
+    }
+
+    /// Stores each tile layer's place as the layer it's drawn over now (a group's topmost), so a
+    /// change to the groups later leaves it where it is.
+    fn pin_tiles(&mut self) {
+        let slots = self.tile_slots();
+        for (t, s) in self.tiles.iter_mut().zip(slots) {
+            t.over = s;
+        }
+    }
+
+    /// Puts the tile layers in their drawing order (index 0 on top, as the pop-ups, the AI
+    /// Assistant and `map.tiles` read them). Returns where `index` went.
+    fn sort_tiles(&mut self, index: usize) -> usize {
+        let order: Vec<usize> = self.stack().into_iter().filter_map(|d| if let Drawn::Tile(i) = d { Some(i) } else { None }).collect();
+        let mut old: Vec<Option<TileLayer>> = std::mem::take(&mut self.tiles).into_iter().map(Some).collect();
+        self.tiles = order.iter().filter_map(|i| old.get_mut(*i).and_then(Option::take)).collect();
+        // (none is left out: the stack lists every tile layer once)
+        self.tiles.extend(old.into_iter().flatten());
+        order.iter().position(|i| *i == index).unwrap_or(index)
+    }
+
+    /// Moves the tile layer at `index` in the drawing order of all the map's layers: past the
+    /// next tile layer, or past the next map layer (a group's layers at once); `"top"` and
+    /// `"bottom"` take it to the ends. Returns its new index among the tile layers.
+    pub fn move_tile(&mut self, index: usize, to: &str) -> Result<usize, String> {
+        if index >= self.tiles.len() {
+            return Err("no such tile layer".into());
+        }
+        self.pin_tiles();
+        let index = self.sort_tiles(index);
+        // The places a tile layer can be, top first: over each group or layer, then under all.
+        let mut places: Vec<Option<u32>> = self.units().iter().filter_map(|u| u.first().copied()).map(Some).collect();
+        places.push(None);
+        // Sorted, the tile layers of a place are next to each other, in their order.
+        let here = self.tiles.get(index).and_then(|t| t.over);
+        let k = places.iter().position(|p| *p == here).unwrap_or(places.len() - 1);
+        let mates = self.tiles_over(here);
+        let at = mates.iter().position(|i| *i == index).unwrap_or(0);
+        // (the place, and whether it goes on top of the tile layers already there)
+        let (place, on_top, swap) = match to {
+            "up" if at > 0 => (here, false, mates.get(at - 1).copied()),
+            "up" if k > 0 => (places.get(k - 1).copied().flatten(), false, None),
+            "down" if at + 1 < mates.len() => (here, false, mates.get(at + 1).copied()),
+            "down" if k + 1 < places.len() => (places.get(k + 1).copied().flatten(), true, None),
+            "top" => (places.first().copied().flatten(), true, None),
+            "bottom" => (None, false, None),
+            "up" | "down" => return Err("the tile layer can't move further".into()),
+            _ => return Err(format!("unknown move {to:?}: up, down, top or bottom")),
         };
-        self.group_of(above.id).is_some_and(|g| g.children.contains(&below.id))
+        if let Some(other) = swap {
+            self.tiles.swap(index, other);
+            return Ok(other);
+        }
+        let mut t = self.tiles.remove(index);
+        t.over = place;
+        let mates = self.tiles_over(place);
+        let at = if on_top { mates.first().copied().unwrap_or(0) } else { mates.last().map_or(self.tiles.len(), |i| i + 1) };
+        let at = at.min(self.tiles.len());
+        self.tiles.insert(at, t);
+        Ok(self.sort_tiles(at))
+    }
+
+    /// Puts the tile layer at `index` at place `to` in the drawing order of all the map's
+    /// layers without it ([`Map::stack`], 0 = top; past the end, the bottom): over the map layer
+    /// below that place (above its group, as a tile layer never goes inside one). Returns its
+    /// new index among the tile layers.
+    pub fn place_tile(&mut self, index: usize, to: usize) -> Result<usize, String> {
+        if index >= self.tiles.len() {
+            return Err("no such tile layer".into());
+        }
+        self.pin_tiles();
+        let mut t = self.tiles.remove(index);
+        let stack = self.stack();
+        let to = to.min(stack.len());
+        let (above, below) = stack.split_at(to);
+        t.over = below.iter().find_map(|d| match d {
+            Drawn::Layer(i) => self.layers.get(*i).map(|l| l.id),
+            Drawn::Tile(_) => None,
+        });
+        t.over = self.tile_slot(&t);
+        let mates = self.tiles_over(t.over);
+        // After the tile layers of its place drawn above it; else before the others there.
+        let higher = above.iter().filter_map(|d| if let Drawn::Tile(i) = d { Some(*i) } else { None }).filter(|i| mates.contains(i)).max();
+        let at = higher.map_or_else(|| mates.first().copied().unwrap_or(0), |i| i + 1).min(self.tiles.len());
+        self.tiles.insert(at, t);
+        Ok(self.sort_tiles(at))
+    }
+
+    /// Hands the tile layers drawn over any of the layers `moving` (about to move or go) to the
+    /// layer they then sit over: the next one down that stays, so they keep their place.
+    pub fn release_tiles(&mut self, moving: &[u32]) {
+        if self.tiles.iter().all(|t| t.over.is_none()) {
+            return;
+        }
+        self.pin_tiles();
+        let layers = &self.layers;
+        for t in &mut self.tiles {
+            let Some(over) = t.over.filter(|o| moving.contains(o)) else { continue };
+            let from = layers.iter().position(|l| l.id == over).unwrap_or(layers.len());
+            t.over = layers.iter().skip(from).map(|l| l.id).find(|id| !moving.contains(id));
+        }
+        self.sort_tiles(0);
+    }
+
+    /// The tile layers in their drawing order and places, each pinned to the layer it is drawn over now
+    /// under the groups as they are (a move inside a group leaves `over` on a layer that is no
+    /// longer the group's top), as [`Map::release_tiles`] pins them, and sorted into the drawing
+    /// order (`self.tiles` itself, so tile layer indices may change, as `release_tiles` changes
+    /// them too). `None` when no tile layer has a place. Kept whole: a tile layer's `id` may be empty or shared, so it can't tell them
+    /// apart.
+    fn pin_tile_places(&mut self) -> Option<Vec<TileLayer>> {
+        if self.tiles.iter().all(|t| t.over.is_none()) {
+            return None;
+        }
+        self.pin_tiles();
+        // In the drawing order as it is, which a later merge of their places (a layer put in a
+        // group) keeps: the list may be out of it (a change to the groups re-seats tile layers
+        // without sorting them).
+        self.sort_tiles(0);
+        Some(self.tiles.clone())
+    }
+
+    /// Puts the tile layers back as `places` had them, in their drawing order, when the layers
+    /// were `unmoved`: put back where they were taken from (a layer placed on its own spot, a
+    /// group moved to where it is), told by their places, not their ids (which a project may
+    /// repeat). Such a move doesn't hand the tile layers over them to the layer below, as
+    /// [`Map::release_tiles`] did. A layer that only changed group (put in the group just above
+    /// it, say) keeps its tile layers too, and the caller's [`Map::settle_tiles`] then seats them
+    /// over that group's topmost layer, as [`Map::set_group`] does.
+    fn keep_tiles_if_unmoved(&mut self, unmoved: bool, places: Option<Vec<TileLayer>>) {
+        let Some(places) = places else { return };
+        if unmoved {
+            self.tiles = places;
+            self.sort_tiles(0);
+        }
+    }
+
+    /// After a change to the groups: each tile layer's place is a group's topmost layer, or
+    /// one outside a group (see [`Map::pin_tiles`]).
+    pub fn settle_tiles(&mut self) {
+        if self.tiles.iter().any(|t| t.over.is_some()) {
+            self.pin_tiles();
+        }
+    }
+
+    /// Whether a layer (or a group's layers) put at `pos` in the drawing order would sit inside a
+    /// group other than those of `inside` (the groups it is going in, innermost first): between
+    /// two of that group's layers.
+    fn splits(&self, pos: usize, inside: &[u32]) -> bool {
+        let above = pos.checked_sub(1).and_then(|i| self.layers.get(i)).map(|l| l.id);
+        self.splits_between(above, self.layers.get(pos).map(|l| l.id), inside)
+    }
+
+    /// Whether layers `above` and `below` share a group that isn't one of `inside`.
+    fn splits_between(&self, above: Option<u32>, below: Option<u32>, inside: &[u32]) -> bool {
+        let (Some(above), Some(below)) = (above, below) else { return false };
+        let below = self.groups_of(below);
+        self.groups_of(above).iter().any(|g| !inside.contains(&g.id) && below.iter().any(|b| b.id == g.id))
     }
 
     /// Moves the layer at index `from` to index `to` in the drawing order, keeping groups
-    /// together: a group's layer moves only among its group's, and another layer moving into a
-    /// group's run goes past it (above moving up, below moving down).
+    /// together: a group's layer moves only among its group's (its subgroups' included), and a
+    /// layer moving into the run of a group it isn't in goes past it (above moving up, below
+    /// moving down).
     pub fn move_layer(&mut self, from: usize, to: usize) -> Result<(), String> {
         let id = self.layers.get(from).map(|l| l.id).ok_or("no such layer")?;
         let to = to.min(self.layers.len().saturating_sub(1));
-        if let Some(g) = self.group_of(id) {
-            let run: Vec<usize> = self.layers.iter().enumerate().filter(|(_, l)| g.children.contains(&l.id)).map(|(i, _)| i).collect();
-            let (lo, hi) = (run.first().copied().unwrap_or(from), run.last().copied().unwrap_or(from));
+        let inside: Vec<u32> = self.groups_of(id).iter().map(|g| g.id).collect();
+        if let Some(g) = inside.first() {
+            let members = self.group_layers(*g);
+            let lo = self.layers.iter().position(|l| members.contains(&l.id)).unwrap_or(from);
+            let hi = self.layers.iter().rposition(|l| members.contains(&l.id)).unwrap_or(from);
             if to < lo || to > hi {
                 return Err("the layer can't move out of its group (take it out of the group first)".into());
             }
@@ -1127,13 +2094,12 @@ impl Map {
         if to == from {
             return Err("the layer can't move further".into());
         }
+        self.release_tiles(&[id]);
         let l = self.layers.remove(from);
         let mut to = to;
-        if self.group_of(id).is_none() {
-            // `to` is now the index the layer goes in at, among the others.
-            while to > 0 && to < self.layers.len() && self.splits_group(to) {
-                if to < from { to -= 1 } else { to += 1 }
-            }
+        // `to` is now the index the layer goes in at, among the others.
+        while to > 0 && to < self.layers.len() && self.splits(to, &inside) {
+            if to < from { to -= 1 } else { to += 1 }
         }
         self.layers.insert(to.min(self.layers.len()), l);
         Ok(())
@@ -1142,17 +2108,18 @@ impl Map {
     /// Adds a dataset as a new layer; returns its id.
     pub fn add_dataset(&mut self, ds: Dataset) -> u32 {
         let id = self.next_id();
-        self.insert_ranked(Layer::new(id, ds));
+        self.insert_on_top(Layer::new(id, ds));
         id
     }
 
-    /// Adds a layer (from a layer file) with a fresh id among the layers of its kind; returns the id.
+    /// Adds a layer (from a layer file) with a fresh id on top of the drawing order; returns the id.
     pub fn add_layer(&mut self, mut layer: Layer) -> u32 {
         let id = self.next_id();
         layer.id = id;
+        layer.renew_instance_id();
         layer.selection.clear();
         layer.touch_geometry();
-        self.insert_ranked(layer);
+        self.insert_on_top(layer);
         id
     }
 
@@ -1169,7 +2136,7 @@ impl Map {
         let mut l = Layer::new_streamed(id, source);
         l.name = name.into();
         l.dataset.name = l.name.clone();
-        self.insert_ranked(l);
+        self.insert_on_top(l);
         id
     }
 
@@ -1179,6 +2146,41 @@ impl Map {
     pub fn sync_sources(&mut self, view: &Extent, scale: f64, block: bool) -> bool {
         let mut pending = false;
         let held = self.held_by_group(scale);
+        // Hidden resident layers share the budget too; toggling visibility cannot multiply it.
+        let sources = self.layers.iter().filter(|l| l.source.is_some()).count().max(1);
+        let bytes = source::VIEW_BYTES / sources;
+        for layer in &mut self.layers {
+            if let Some(raster) = &mut layer.raster {
+                pending |= raster.poll_reload();
+            }
+            if let Some(src) = &mut layer.source {
+                let changed = src.projection.as_ref().is_some_and(|p| p != &self.projection);
+                let mode_changed = src.full_read != block;
+                let budget_changed = src.byte_budget != bytes;
+                src.projection = Some(self.projection.clone());
+                src.byte_budget = bytes;
+                src.full_read = block;
+                if changed || mode_changed || budget_changed {
+                    let selected = std::mem::take(&mut src.saved_selection);
+                    src.reset();
+                    src.saved_selection = selected;
+                }
+                if changed || (!block && layer.view_cache_bytes() > bytes) {
+                    // Preserve ids while discarding a window that no longer fits. The next
+                    // installed window resolves the selection against its authoritative ids.
+                    let mut selected: Vec<_> =
+                        layer.selection.iter().filter_map(|r| layer.dataset.features.get(*r)).map(|f| f.id).collect();
+                    if let Some(src) = &mut layer.source {
+                        selected.append(&mut src.saved_selection);
+                        src.reset();
+                    }
+                    layer.install(Vec::new());
+                    if let Some(src) = &mut layer.source {
+                        src.saved_selection = selected;
+                    }
+                }
+            }
+        }
         for l in self.layers.iter_mut().filter(|l| l.is_streamed() && l.visible && l.in_scale_range(scale) && !held.contains(&l.id)) {
             pending |= l.sync_source(view, block);
         }
@@ -1188,7 +2190,7 @@ impl Map {
     /// Adds a raster layer; returns its id.
     pub fn add_raster(&mut self, name: impl Into<String>, raster: RasterLayer) -> u32 {
         let id = self.next_id();
-        self.insert_ranked(Layer::new_raster(id, name, raster));
+        self.insert_on_top(Layer::new_raster(id, name, raster));
         id
     }
 
@@ -1207,6 +2209,17 @@ impl Map {
     pub fn adopt_caches(&mut self, other: &Map) {
         for l in &mut self.layers {
             if let Some(o) = other.layer(l.id) {
+                // Complete rendering uses temporary chunk layers, so a failed worker need not
+                // have a projected cache to adopt. Transfer its diagnostic only for the same
+                // source and unchanged owning rows; stale workers must not overwrite edits.
+                if l.dataset.features.shares(&o.dataset.features)
+                    && l.geometry_rev == o.geometry_rev
+                    && let (Some(own), Some(drawn)) = (&mut l.source, &o.source)
+                    && let (Some(a), Some(b)) = (own.chunk_source(), drawn.chunk_source())
+                    && std::sync::Arc::ptr_eq(&a, &b)
+                {
+                    own.error.clone_from(&drawn.error);
+                }
                 l.adopt_cache(o);
             }
         }
@@ -1395,15 +2408,17 @@ impl Map {
         out
     }
 
+    /// Layers eligible for map selection, including the visibility and scale of their groups.
+    pub fn selectable_layers(&mut self, scale: f64) -> impl Iterator<Item = &mut Layer> + '_ {
+        let held = self.held_by_group(scale);
+        self.layers.iter_mut().filter(move |l| l.visible && l.selectable && l.in_scale_range(scale) && !held.contains(&l.id))
+    }
+
     /// Rows of each selectable, visible layer inside a rectangle in the camera's coordinates.
     pub fn hits_in(&mut self, e: &Extent, scale: f64) -> Vec<(u32, Vec<usize>)> {
         let (flat, key) = (self.flat(), self.projection.code());
         let mut out = Vec::new();
-        let held = self.held_by_group(scale);
-        for l in &mut self.layers {
-            if !l.visible || !l.selectable || !l.in_scale_range(scale) || held.contains(&l.id) {
-                continue;
-            }
+        for l in self.selectable_layers(scale) {
             // Only features drawn: the definition query and the display filters let them through.
             let rows = l.drawn_rows(scale);
             let id = l.id;
@@ -1422,6 +2437,20 @@ impl Map {
     }
 }
 
+/// The reference scales a layer takes (1:N), as [`Layer::reference_scale`].
+pub const REFERENCE_SCALES: (f64, f64) = (1.0, 1e9);
+
+/// The most a reference scale shrinks or grows a layer's sizes ([`Layer::size_factor`]): zoomed
+/// far in, its lines would otherwise be drawn thousands of pixels wide.
+pub const SIZE_FACTORS: (f64, f64) = (0.01, 32.0);
+
+/// Reads a layer's reference scale as `layer.referenceScale` would leave it: one out of
+/// [`REFERENCE_SCALES`] (or not a number) is none. A project file is hostile input.
+fn de_reference_scale<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+    let v: Option<f64> = Option::deserialize(d)?;
+    Ok(v.filter(|r| (REFERENCE_SCALES.0..=REFERENCE_SCALES.1).contains(r)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1436,6 +2465,34 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_rotation_is_kept_and_a_crafted_one_reads_as_none() {
+        let mut l =
+            Layer::new(1, Dataset::new("p", GeometryType::Point, vec![rustgis_data::Field::new("a", rustgis_data::FieldType::Double)]));
+        l.dataset.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![rustgis_data::Value::Float(450.0)]);
+        // None isn't written: an older RustGIS reads the layer as before.
+        assert!(serde_json::to_value(&l).unwrap().get("marker_rotation").is_none());
+        l.marker_rotation = Some(symbology::MarkerRotation { field: "a".into(), counterclockwise: true });
+        let v = serde_json::to_value(&l).unwrap();
+        let back: Layer = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(back.marker_rotation, l.marker_rotation);
+        assert_eq!(back.marker_turn(0), -90.0, "450° counterclockwise");
+        for junk in [
+            serde_json::json!(5),
+            serde_json::json!({"field": 3}),
+            serde_json::json!({"field": ""}),
+            serde_json::json!({"field": "x".repeat(10_000)}),
+        ] {
+            let mut v = v.clone();
+            v["marker_rotation"] = junk.clone();
+            let read: Layer = serde_json::from_value(v).unwrap();
+            assert!(read.marker_rotation.is_none(), "{junk}");
+        }
+        // A field the data lacks turns nothing.
+        l.marker_rotation = Some(symbology::MarkerRotation { field: "gone".into(), counterclockwise: false });
+        assert_eq!(l.marker_turn(0), 0.0);
+    }
+
+    #[test]
     fn hostile_line_strokes_in_a_project_are_brought_into_range() {
         // A crafted project file: too many strokes, and widths and offsets far out of range.
         let mut l = Layer::new(1, Dataset::new("lines", GeometryType::Polyline, vec![]));
@@ -1446,6 +2503,163 @@ mod tests {
         assert!(
             back.line_strokes.iter().all(|st| st.width == Some(symbology::MAX_STROKE_WIDTH) && st.offset == -symbology::MAX_STROKE_OFFSET)
         );
+    }
+
+    #[test]
+    fn dash_patterns_are_kept_and_hostile_ones_brought_into_range() {
+        use symbology::{Dash, MAX_DASH_STEP, MAX_DASH_STEPS};
+        // Built: in range, not all 0, at most MAX_DASH_STEPS.
+        assert_eq!(Dash::new(&[4.0, 2.0]).map(|d| d.steps().to_vec()), Some(vec![4.0, 2.0]));
+        assert_eq!(Dash::new(&[3.0]).map(|d| (d.even_steps(), d.period())), Some((vec![3.0, 3.0], 6.0)), "odd: twice over");
+        for bad in [&[][..], &[0.0, 0.0], &[-1.0, 2.0], &[f32::NAN, 1.0], &[MAX_DASH_STEP + 1.0], &[1.0; MAX_DASH_STEPS + 1]] {
+            assert!(Dash::new(bad).is_none(), "{bad:?}");
+        }
+        // Saved as a plain list and read back.
+        let mut l = Layer::new(1, Dataset::new("lines", GeometryType::Polyline, vec![]));
+        l.line_strokes = vec![symbology::LineStroke { dash: Dash::new(&[4.0, 2.0, 1.0, 2.0]), ..Default::default() }];
+        let text = serde_json::to_string(&l).unwrap();
+        assert!(text.contains(r#""dash":[4.0,2.0,1.0,2.0]"#), "{text}");
+        assert_eq!(serde_json::from_str::<Layer>(&text).unwrap().line_strokes, l.line_strokes);
+        // A crafted project's: steps clamped, too many cut, and one without length solid.
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let read = |v: &serde_json::Value| serde_json::from_value::<Layer>(v.clone()).unwrap().line_strokes[0].dash;
+        v["line_strokes"][0]["dash"] = serde_json::json!([1e30, -5, 2]);
+        assert_eq!(read(&v).map(|d| d.steps().to_vec()), Some(vec![MAX_DASH_STEP, 0.0, 2.0]));
+        // Too large for an f32 (infinite once read): the longest step, as a large one is.
+        v["line_strokes"][0]["dash"] = serde_json::json!([1e40, 2]);
+        assert_eq!(read(&v).map(|d| d.steps().to_vec()), Some(vec![MAX_DASH_STEP, 2.0]));
+        v["line_strokes"][0]["dash"] = serde_json::json!(vec![1.0; 5000]);
+        assert_eq!(read(&v).map(|d| d.steps().len()), Some(MAX_DASH_STEPS));
+        for solid in [serde_json::json!([0, 0]), serde_json::json!([]), serde_json::json!([-3])] {
+            v["line_strokes"][0]["dash"] = solid.clone();
+            assert_eq!(read(&v), None, "{solid}");
+            // Read as a stroke alone too, so no empty pattern is ever made.
+            let st = serde_json::from_value::<symbology::LineStroke>(v["line_strokes"][0].clone()).unwrap();
+            assert_eq!(st.dash, None, "{solid}");
+        }
+    }
+
+    #[test]
+    fn markers_along_lines_are_kept_and_hostile_ones_brought_into_range() {
+        use symbology::{LineMark, LineMarkers, MAX_LINE_MARKER_SIZE, MAX_MARKER_INTERVAL, MIN_MARKER_INTERVAL, Placements};
+        let mut l = Layer::new(1, Dataset::new("lines", GeometryType::Polyline, vec![]));
+        let m = LineMarkers {
+            mark: LineMark::Marker(Marker::Triangle),
+            size: 6.0,
+            at: Placements::FIRST.with(Placements::LAST),
+            interval: 20.0,
+            offset_along: -2.0,
+            rotate: false,
+            average_angle: 15.0,
+            angle: 45.0,
+            outline: Some(Rgba::rgb(0, 0, 0)),
+        };
+        l.line_strokes = vec![
+            symbology::LineStroke { markers: Some(m), ..Default::default() },
+            symbology::LineStroke { markers: Some(LineMarkers { mark: LineMark::Hash, ..LineMarkers::default() }), ..Default::default() },
+        ];
+        // Saved with the places as codes, and read back as they were.
+        let text = serde_json::to_string(&l).unwrap();
+        assert!(text.contains(r#""at":["first","last"]"#) && text.contains(r#""mark":"hash""#), "{text}");
+        assert_eq!(serde_json::from_str::<Layer>(&text).unwrap().line_strokes, l.line_strokes);
+        // A stroke without markers is written as before.
+        let plain = serde_json::to_string(&symbology::LineStroke::default()).unwrap();
+        assert!(!plain.contains("markers"), "{plain}");
+
+        // A crafted project's: sizes and intervals clamped, angles within a turn, places it doesn't
+        // know left out (none at all: every interval).
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let read = |v: &serde_json::Value| serde_json::from_value::<Layer>(v.clone()).unwrap().line_strokes[0].markers.unwrap();
+        let mk = &mut v["line_strokes"][0]["markers"];
+        mk["size"] = serde_json::json!(1e30);
+        mk["interval"] = serde_json::json!(0);
+        mk["offset_along"] = serde_json::json!(-1e40);
+        mk["average_angle"] = serde_json::json!(-3);
+        mk["angle"] = serde_json::json!(-90);
+        mk["at"] = serde_json::json!(["last", "sideways"]);
+        let got = read(&v);
+        assert_eq!((got.size, got.interval, got.offset_along), (MAX_LINE_MARKER_SIZE, MIN_MARKER_INTERVAL, -MAX_MARKER_INTERVAL));
+        assert_eq!((got.average_angle, got.angle, got.at), (0.0, 270.0, Placements::LAST));
+        v["line_strokes"][0]["markers"]["at"] = serde_json::json!(["sideways"]);
+        assert_eq!(read(&v).at, Placements::INTERVAL);
+        v["line_strokes"][0]["markers"]["at"] = serde_json::json!(vec!["first"; 5000]);
+        assert_eq!(read(&v).at, Placements::FIRST);
+        // Only what's given: the rest is the default.
+        v["line_strokes"][0]["markers"] = serde_json::json!({});
+        assert_eq!(read(&v), LineMarkers::default());
+    }
+
+    #[test]
+    fn a_reference_scale_scales_sizes_with_the_map_and_hostile_ones_are_dropped() {
+        let mut l = Layer::new(1, Dataset::new("lines", GeometryType::Polyline, vec![]));
+        assert_eq!(l.size_factor(10_000.0), 1.0, "none: sizes stay as set");
+        l.reference_scale = Some(25_000.0);
+        assert_eq!(l.size_factor(25_000.0), 1.0);
+        assert_eq!(l.size_factor(12_500.0), 2.0, "zoomed in twice: twice the size");
+        assert_eq!(l.size_factor(100_000.0), 0.25);
+        assert_eq!(l.size_factor(1.0), SIZE_FACTORS.1 as f32, "zoomed far in: kept in bounds");
+        assert_eq!(l.size_factor(1e12), SIZE_FACTORS.0 as f32);
+        for bad in [0.0, -5.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(l.size_factor(bad), 1.0, "scale {bad}");
+        }
+        // Saved and read back; a crafted project's out of range ones are none.
+        let text = serde_json::to_string(&l).unwrap();
+        assert_eq!(serde_json::from_str::<Layer>(&text).unwrap().reference_scale, Some(25_000.0));
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        for bad in [serde_json::json!(0.0), serde_json::json!(-1.0), serde_json::json!(1e300), serde_json::Value::Null] {
+            v["reference_scale"] = bad.clone();
+            assert_eq!(serde_json::from_value::<Layer>(v.clone()).unwrap().reference_scale, None, "{bad}");
+        }
+        // Without a reference scale nothing is written.
+        l.reference_scale = None;
+        assert!(!serde_json::to_string(&l).unwrap().contains("reference_scale"));
+    }
+
+    #[test]
+    fn hostile_class_strokes_in_a_project_are_brought_into_range() {
+        // The same for a class's own strokes, Unique Values' (and <all other values>') and
+        // Graduated Colors'; a class listed with none is dropped.
+        let wild = vec![symbology::LineStroke { width: Some(f32::MAX), offset: 1e30, ..Default::default() }; 5000];
+        let tame = |v: &[symbology::LineStroke]| {
+            v.len() == symbology::MAX_STROKES
+                && v.iter().all(|st| st.width == Some(symbology::MAX_STROKE_WIDTH) && st.offset == symbology::MAX_STROKE_OFFSET)
+        };
+        let s = Symbol::default_for(GeometryType::Polyline, 0);
+        let mut l = Layer::new(1, Dataset::new("lines", GeometryType::Polyline, vec![]));
+        l.renderer = Renderer::Unique {
+            field: "k".into(),
+            classes: vec![("a".into(), s), ("b".into(), s)],
+            other: s,
+            ramp: Ramp::Ember,
+            class_labels: Default::default(),
+            other_label: None,
+            class_strokes: [("a".to_string(), wild.clone()), ("b".to_string(), Vec::new())].into_iter().collect(),
+            other_strokes: wild.clone(),
+            class_fills: Default::default(),
+            other_fills: Vec::new(),
+        };
+        let back: Layer = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        let Renderer::Unique { class_strokes, other_strokes, .. } = &back.renderer else { panic!("unique renderer expected") };
+        assert!(tame(&class_strokes["a"]) && !class_strokes.contains_key("b") && tame(other_strokes));
+        l.renderer = Renderer::Graduated {
+            field: "k".into(),
+            breaks: vec![1.0],
+            symbols: vec![s],
+            ramp: Ramp::Ember,
+            method: ClassMethod::NaturalBreaks,
+            min: 0.0,
+            classes: 1,
+            class_labels: Default::default(),
+            class_strokes: [(0, wild)].into_iter().collect(),
+            class_fills: Default::default(),
+        };
+        let back: Layer = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        let Renderer::Graduated { class_strokes, .. } = &back.renderer else { panic!("graduated renderer expected") };
+        assert!(tame(&class_strokes[&0]));
+        // A project from before per-class strokes reads with none.
+        let old = r#"{"Unique":{"field":"k","classes":[],"other":{"fill":[0,0,0,255],"stroke":[0,0,0,255],"stroke_width":1,"size":0,"marker":"Circle"},"ramp":"Ember"}}"#;
+        let r: Renderer = serde_json::from_str(old).unwrap();
+        assert!(!r.has_class_strokes());
     }
 
     /// A layer of one long line along the equator with `n` vertices.
@@ -1654,6 +2868,10 @@ mod tests {
             ramp: Ramp::Ember,
             class_labels: Default::default(),
             other_label: None,
+            class_strokes: Default::default(),
+            other_strokes: Vec::new(),
+            class_fills: Default::default(),
+            other_fills: Vec::new(),
         };
         let labels = |l: &Layer, scale| l.shown_legend(scale).map(|v| v.into_iter().map(|e| e.label).collect::<Vec<_>>());
         assert_eq!(labels(l, 1e6), Some(vec!["1".to_string(), "2".to_string()]), "no 9, no <all other values>");

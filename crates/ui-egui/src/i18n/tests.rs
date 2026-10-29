@@ -30,6 +30,8 @@ fn lookup_fallback_and_tags() {
     assert_eq!(tr(Lang::EN, "no such string"), "no such string");
     assert_eq!(lang_from_tag("de_DE.UTF-8").map(Lang::code), Some("de"));
     assert_eq!(lang_from_tag("pt-BR").map(Lang::code), Some("pt"));
+    assert_eq!(lang_from_tag("bn-BD").map(Lang::code), Some("bn"));
+    assert_eq!(lang_from_tag("pl_PL.UTF-8").map(Lang::code), Some("pl"));
     assert_eq!(lang_from_tag("zh-Hans-CN").map(Lang::code), Some("zh"));
     assert_eq!(lang_from_tag("zh_CN.UTF-8").map(Lang::code), Some("zh"));
     assert_eq!(lang_from_tag("zh-TW"), None);
@@ -38,6 +40,26 @@ fn lookup_fallback_and_tags() {
     assert_eq!(lang_from_tag("xx-YY"), None);
     assert_eq!(first_supported(["xx", "fr-CA", "de"]).map(Lang::code), Some("fr"));
     assert_eq!(fmt("{n} of {total} selected", &[("n", "3"), ("total", "{n}")]), "3 of {n} selected");
+}
+
+#[test]
+fn bengali_registration_and_fallback() {
+    let bn = Lang::from_code("bn").unwrap_or(Lang::EN);
+    assert_eq!(bn.name(), "বাংলা");
+    assert_eq!(bn.english(), "Bengali");
+    assert_eq!(bn.script(), Script::Bengali);
+    assert_eq!(tr(bn, "Open"), "খুলুন");
+    assert_eq!(tr(bn, "A string not in the Bengali catalog"), "A string not in the Bengali catalog");
+}
+
+#[test]
+fn polish_registration_and_fallback() {
+    let pl = Lang::from_code("pl").unwrap_or(Lang::EN);
+    assert_eq!(pl.name(), "Polski");
+    assert_eq!(pl.english(), "Polish");
+    assert_eq!(pl.script(), Script::Alphabetic);
+    assert_eq!(tr(pl, "Open"), "Otwórz");
+    assert_eq!(tr(pl, "A string not in the Polish catalog"), "A string not in the Polish catalog");
 }
 
 #[test]
@@ -225,4 +247,25 @@ fn registry_process_plugin_notes_are_in_every_catalog() {
             assert_ne!(tr, key, "{}: {key:?} isn't translated", l.code);
         }
     }
+}
+
+#[test]
+fn vn2000_translations_in_vietnamese_catalog() {
+    let vi = Lang::from_code("vi").unwrap();
+    assert_eq!(tr(vi, "Provinces:"), "Tỉnh thành:");
+    assert_eq!(
+        tr(
+            vi,
+            "Vietnam national coordinate system (VN-2000) using 3-degree Transverse Mercator with a 7-parameter Helmert shift to WGS 84."
+        ),
+        "Hệ tọa độ quốc gia Việt Nam (VN-2000) dùng phép chiếu Transverse Mercator 3 độ với phép chuyển đổi 7 tham số Helmert sang WGS 84."
+    );
+    assert_eq!(
+        tr(vi, "Vietnam national coordinate system (VN-2000) UTM zone 48N (102°E–108°E, central meridian 105°E)."),
+        "Hệ tọa độ quốc gia Việt Nam (VN-2000) múi chiếu UTM 48N (102°Đ–108°Đ, kinh tuyến trục 105°Đ)."
+    );
+    assert_eq!(
+        tr(vi, "Vietnam national coordinate system (VN-2000) UTM zone 49N (108°E–114°E, central meridian 111°E)."),
+        "Hệ tọa độ quốc gia Việt Nam (VN-2000) múi chiếu UTM 49N (108°Đ–114°Đ, kinh tuyến trục 111°Đ)."
+    );
 }

@@ -10,6 +10,7 @@
 pub mod credentials;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod duckdb;
+pub mod edits;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod external;
 pub mod fgb;
@@ -22,6 +23,7 @@ pub mod gpkg;
 mod gpkg_blob;
 pub mod gpkg_mem;
 pub mod lidar;
+pub mod memory;
 pub mod msconn;
 pub mod myconn;
 #[cfg(not(target_arch = "wasm32"))]
@@ -60,12 +62,42 @@ impl Family {
         }
     }
 
-    /// An OGR SQL filter on the geometry type.
+    /// An OGR SQL filter on the geometry type. Curves and surfaces count as lines and polygons:
+    /// an Esri multipatch, read as a TIN, a polyhedral surface or (from a Shapefile) a geometry
+    /// collection of them, is polygons. A collection of anything else fails the conversion to
+    /// polygons and is left out, as before.
     pub fn filter(self) -> &'static str {
         match self {
             Family::Points => "OGR_GEOMETRY IN ('POINT', 'MULTIPOINT')",
-            Family::Lines => "OGR_GEOMETRY IN ('LINESTRING', 'MULTILINESTRING')",
-            Family::Polygons => "OGR_GEOMETRY IN ('POLYGON', 'MULTIPOLYGON')",
+            Family::Lines => "OGR_GEOMETRY IN ('LINESTRING', 'MULTILINESTRING', 'CIRCULARSTRING', 'COMPOUNDCURVE', 'MULTICURVE')",
+            Family::Polygons => {
+                "OGR_GEOMETRY IN ('POLYGON', 'MULTIPOLYGON', 'CURVEPOLYGON', 'MULTISURFACE', 'TRIANGLE', 'TIN', 'POLYHEDRALSURFACE', 'GEOMETRYCOLLECTION')"
+            }
+        }
+    }
+
+    /// The OGR geometry type its features are converted to: curves become straight segments, and
+    /// a surface's faces the parts of a multipolygon.
+    pub fn ogr_type(self) -> &'static str {
+        match self {
+            Family::Points => "MULTIPOINT",
+            Family::Lines => "MULTILINESTRING",
+            Family::Polygons => "MULTIPOLYGON",
+        }
+    }
+
+    /// The family of an OGR layer geometry type as `ogrinfo -json` spells it (`MultiPolygonZ`,
+    /// `TIN`, `CompoundCurve`); `None` for one that mixes them (`GeometryZ`).
+    pub fn of_ogr_type(ty: &str) -> Option<Family> {
+        let ty = ty.to_ascii_lowercase();
+        if ty.contains("point") {
+            Some(Family::Points)
+        } else if ["polygon", "surface", "tin", "triangle"].iter().any(|k| ty.contains(k)) {
+            Some(Family::Polygons)
+        } else if ["linestring", "circularstring", "curve"].iter().any(|k| ty.contains(k)) {
+            Some(Family::Lines)
+        } else {
+            None
         }
     }
 }
@@ -170,11 +202,70 @@ pub struct Batch {
 
 /// A vector data source read in place.
 pub trait FeatureSource: Send + Sync {
+    /// Whether complete, ordered traversal is available without an interaction row limit.
+    fn streams_chunks(&self) -> bool {
+        false
+    }
+    /// Visits every matching feature in source painter order. Release each chunk before the
+    /// next callback. `bytes` targets owned feature storage; an indivisible larger row is emitted alone.
+    /// Callback errors stop traversal. Success returns an empty, complete summary batch.
+    fn visit_chunks(&self, _extent: Option<Extent>, _bytes: usize, _visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
+        Err(DataError::Format("this provider does not support chunk traversal".into()))
+    }
     fn info(&self) -> &SourceInfo;
+    /// Whether features were left out of every read because the coordinate system the source
+    /// declares can't place them, so that defining its projection again can't bring them back.
+    fn lost_to_crs(&self) -> bool {
+        false
+    }
+    /// How many features the source left out when it was opened (and from every read), for a
+    /// whole read's `ReadReport::skipped` to count with what reads skip.
+    fn skipped_at_open(&self) -> usize {
+        0
+    }
     /// Reads the features a request asks for. A source read by its web address fails with
     /// [`remote::NEED`] until the bytes the read needs are fetched: run it with
     /// [`remote::drive`] (see [`FeatureSource::remote`]).
     fn read(&self, req: &Request) -> Result<Batch>;
+    /// A disposable view window bounded by allocated row/geometry/attribute bytes. Providers
+    /// can enforce this during decoding; the fallback probes a small uniform sample before
+    /// sizing the actual read. Full materialization deliberately continues to use `read`.
+    fn read_budgeted(&self, req: &Request, bytes: usize) -> Result<Batch> {
+        let mut request = *req;
+        request.limit = clamp_limit(req.limit).min(128);
+        let mut batch = self.read(&request)?;
+        if req.limit == 0 {
+            batch.features.clear();
+            batch.features.shrink_to_fit();
+            batch.complete = batch.matched == 0;
+            return Ok(batch);
+        }
+        let used = memory::features_bytes(&batch.features);
+        if !batch.complete && used < bytes {
+            // A small probe can hit only unreadable/deleted candidates. An incomplete
+            // empty answer is not proof that the requested extent contains no features.
+            let count = if batch.features.is_empty() {
+                bytes / (std::mem::size_of::<Feature>() * 4)
+            } else {
+                batch.features.len().saturating_mul(bytes / 2) / used.max(1)
+            };
+            let next = clamp_limit(req.limit).min(count).max(1);
+            if next > request.limit {
+                request.limit = next;
+                drop(batch);
+                batch = self.read(&request)?;
+            }
+        }
+        batch.features.shrink_to_fit();
+        while memory::features_bytes(&batch.features) > bytes {
+            if batch.features.len() <= 1 {
+                return Err(DataError::Format("one feature exceeds the view memory budget; load it explicitly for full processing".into()));
+            }
+            memory::halve(&mut batch.features);
+            batch.complete = false;
+        }
+        Ok(batch)
+    }
     /// The file a source reads by its web address, a range at a time.
     fn remote(&self) -> Option<std::sync::Arc<remote::Remote>> {
         None
@@ -241,9 +332,11 @@ pub fn open_shared(file_name: &str, bytes: std::sync::Arc<Vec<u8>>, layer: Optio
     }
 }
 
-/// Whether a web address names a file read in place by range: a FlatGeobuf or a GeoParquet.
+/// Whether a web address names a file read in place by range: a FlatGeobuf or a GeoParquet. An
+/// address read through a saved S3 connection ([`crate::s3_address`]) is judged by the address it
+/// wraps.
 pub fn is_remote_name(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
+    let lower = crate::s3_address::inner(url).to_ascii_lowercase();
     let path = lower.split(['?', '#']).next().unwrap_or(&lower);
     // `s3://` too: the app's fetchers check it and read it from its bucket's web address (signed
     // only for a connection that serves the bucket, see rustgis_tiles::s3).
@@ -369,6 +462,14 @@ impl FeatureSource for Fetching {
         self.0.info()
     }
 
+    fn lost_to_crs(&self) -> bool {
+        self.0.lost_to_crs()
+    }
+
+    fn skipped_at_open(&self) -> usize {
+        self.0.skipped_at_open()
+    }
+
     fn read(&self, req: &Request) -> Result<Batch> {
         read_blocking(&self.0, req)
     }
@@ -383,17 +484,40 @@ pub fn layers(path: &Path) -> Result<Vec<String>> {
     }
 }
 
-/// Reads a whole source into a dataset.
+/// Reads a whole source into a dataset, refusing sources over [`MAX_LIMIT`] and incomplete reads.
 pub fn materialize(src: &dyn FeatureSource) -> Result<(Dataset, ReadReport)> {
     let info = src.info();
+    let too_many = |n| DataError::Format(format!("{}: the layer has {n} features, more than the {MAX_LIMIT} read at once", info.name));
+    // Refuse before reading or allocating a sample when the source already knows its size.
+    if let Some(n) = info.count.filter(|n| *n > MAX_LIMIT as u64) {
+        return Err(too_many(n));
+    }
     let batch = src.read(&Request::all())?;
+    if !batch.complete {
+        if batch.matched > MAX_LIMIT as u64 {
+            return Err(too_many(batch.matched));
+        }
+        return Err(DataError::Format(format!(
+            "{}: could not read the whole source ({} of {} features; read limit {MAX_LIMIT})",
+            info.name,
+            batch.features.len(),
+            batch.matched
+        )));
+    }
+    // Preserve Load All Features' conservative refusal when the source cannot give a count.
+    if info.count.is_none() && batch.features.len() >= MAX_LIMIT {
+        return Err(DataError::Format(format!("{}: the layer has more features than the {MAX_LIMIT} read at once", info.name)));
+    }
     let mut ds = Dataset::new(info.name.clone(), info.geometry_type, info.fields.clone());
     ds.crs = info.coordinate_system();
+    // A streamed Shapefile skips unconvertible shapes rather than retaining empty geometry.
+    // Once materialized, it must still direct CRS repairs back to the original file.
+    ds.crs_incomplete = (info.format == "Shapefile" && batch.skipped > 0) || src.lost_to_crs();
     ds.features = batch.features.into();
-    let mut report = ReadReport { skipped: batch.skipped, messages: info.notes.iter().map(|n| format!("{}: {n}", info.name)).collect() };
-    if !batch.complete {
-        report.messages.push(format!("{}: read a sample of {} of {} features", info.name, ds.features.len(), batch.matched));
-    }
+    let report = ReadReport {
+        skipped: batch.skipped + src.skipped_at_open(),
+        messages: info.notes.iter().map(|n| format!("{}: {n}", info.name)).collect(),
+    };
     if ds.geometry_type == GeometryType::None
         && let Some(g) = ds.features.iter().find_map(|f| f.geometry.as_ref())
     {
@@ -456,6 +580,21 @@ impl Reproject {
         Reproject { crs: if t.is_some() { crs } else { Crs::LonLat }, t }
     }
 
+    /// From a coordinate system already known to convert (`None` for longitude/latitude).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn known(found: Option<(Crs, Transformer)>) -> Reproject {
+        match found {
+            Some((crs, t)) => Reproject { crs, t: Some(t) },
+            None => Reproject { crs: Crs::LonLat, t: None },
+        }
+    }
+
+    /// What converts to longitude/latitude (`None` when coordinates are taken as they are).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn transformer(&self) -> Option<&Transformer> {
+        self.t.as_ref()
+    }
+
     /// Whether coordinates are taken as they are.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn is_lonlat(&self) -> bool {
@@ -471,6 +610,18 @@ impl Reproject {
         let Some(t) = &self.t else { return Some(g) };
         let mut ok = true;
         let out = g.map_coords(&|c| t.to_lonlat(c).unwrap_or(Coord::new(f64::NAN, f64::NAN)));
+        out.for_each_coord(|c| ok &= c.is_finite());
+        ok.then_some(out)
+    }
+
+    /// A longitude/latitude geometry in the source's coordinates.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn to_native(&self, g: &Geometry) -> Option<Geometry> {
+        let out = match &self.t {
+            Some(t) => g.map_coords(&|c| t.from_lonlat(c).unwrap_or(Coord::new(f64::NAN, f64::NAN))),
+            None => g.clone(),
+        };
+        let mut ok = true;
         out.for_each_coord(|c| ok &= c.is_finite());
         ok.then_some(out)
     }
@@ -599,3 +750,7 @@ pub(crate) fn tls_provider() {
 
 #[cfg(test)]
 mod tests;
+
+pub mod chunk_memory;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod spill;

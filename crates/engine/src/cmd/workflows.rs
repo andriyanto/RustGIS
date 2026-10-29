@@ -185,9 +185,21 @@ fn gallery(_: &mut Session, p: &Value) -> CmdResult {
 pub fn gallery_list(kind: &str) -> CmdResult {
     let ids: &[&str] = match kind {
         "ready" => &["buffer", "dissolve", "countPoints", "clip", "summaryStatistics", "selectByLocation"],
-        "feature" => {
-            &["buffer", "clip", "erase", "dissolve", "convexHull", "featureToPoint", "simplify", "countPoints", "calculateGeometry"]
-        }
+        "feature" => &[
+            "buffer",
+            "near",
+            "clip",
+            "erase",
+            "intersect",
+            "identity",
+            "union",
+            "dissolve",
+            "convexHull",
+            "featureToPoint",
+            "simplify",
+            "countPoints",
+            "calculateGeometry",
+        ],
         "raster" => &[],
         k => return Err(format!("unknown gallery '{k}'")),
     };
@@ -362,8 +374,13 @@ fn run_steps(s: &mut Session, model: Model) -> CmdResult {
         return Err(format!("{} has no steps", model.name));
     }
     // A model that came in a file (an opened project, or an imported tool) may not touch files.
+    // Each step is checked as the `gp.run` it is, tool and all, as ModelBuilder's graphs are.
     if !s.trusted_models.contains(&model.name.to_ascii_lowercase())
-        && let Some((i, st)) = model.steps.iter().enumerate().find(|(_, st)| super::items::touches_files("gp.run", &st.params))
+        && let Some((i, st)) = model
+            .steps
+            .iter()
+            .enumerate()
+            .find(|(_, st)| super::items::touches_files("gp.run", &json!({"tool": st.tool, "params": st.params})))
     {
         return Err(format!(
             "step {} ({}) reads or writes files, which a model from a file can't do; make a new model with that step to run it",

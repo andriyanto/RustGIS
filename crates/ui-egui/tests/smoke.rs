@@ -4,6 +4,11 @@ use egui_kittest::kittest::Queryable;
 use rustgis_ui_egui::RustGisApp;
 use serde_json::json;
 
+#[cfg(not(target_arch = "wasm32"))]
+mod remembered_database;
+
+mod remembered_s3;
+/// Builds a headless World Atlas UI for interaction tests.
 fn harness() -> egui_kittest::Harness<'static, RustGisApp> {
     egui_kittest::Harness::builder().with_size(egui::vec2(1400.0, 860.0)).with_max_steps(64).build_ui_state(
         |ui, app: &mut RustGisApp| {
@@ -15,6 +20,7 @@ fn harness() -> egui_kittest::Harness<'static, RustGisApp> {
     )
 }
 
+/// Runs a layer command through Command Search and checks that the search closes.
 fn search_layer_command(h: &mut egui_kittest::Harness<'_, RustGisApp>, command: &str) {
     h.state_mut().ui.command_search = Some(command.into());
     for _ in 0..3 {
@@ -25,6 +31,411 @@ fn search_layer_command(h: &mut egui_kittest::Harness<'_, RustGisApp>, command: 
         h.step();
     }
     assert!(h.state().ui.command_search.is_none());
+}
+
+/// Duplicate names must not redirect a source write or discard to the first matching layer.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn geopackage_edit_dialogs_target_numeric_ids_with_duplicate_names() {
+    use rustgis_engine::data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value, raster::Crs, source::gpkg};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = harness();
+    for table in ["alpha", "beta"] {
+        let path = dir.path().join(format!("{table}.gpkg"));
+        let mut data = Dataset::new(table, GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+        for x in [0.0, 1.0] {
+            data.push(Some(Geometry::Point(Coord::new(x, 0.0))), vec![Value::Text("original".into())]);
+        }
+        gpkg::write_in(&data, &path, Crs::LonLat).unwrap();
+        let loaded = h.state_mut().run("gpkg.addLayer", json!({"path": path, "table": table})).unwrap();
+        h.state_mut().run("layer.rename", json!({"layer": loaded["layer"], "name": "Duplicate"})).unwrap();
+    }
+    let ids: Vec<_> = h.state().session.map().layers.iter().filter(|l| l.gpkg.is_some()).map(|l| l.id).collect();
+    let (upper, lower) = (ids[0], ids[1]);
+    let source = |h: &egui_kittest::Harness<'_, RustGisApp>, id| {
+        let edit = h.state().session.map().layer(id).unwrap().gpkg.as_ref().unwrap();
+        (std::path::PathBuf::from(&edit.path), edit.table.clone())
+    };
+    let (upper_path, upper_table) = source(&h, upper);
+    let (lower_path, lower_table) = source(&h, lower);
+    let stored = |path: &std::path::Path, table: &str| {
+        gpkg::edit::EditTable::open(path, table).unwrap().read_editable(100).unwrap().features[0].attrs[0].clone()
+    };
+    let pending = |h: &mut egui_kittest::Harness<'_, RustGisApp>, id| {
+        h.state_mut().run("gpkg.pendingEdits", json!({"layer": id})).unwrap()["updates"].as_u64().unwrap()
+    };
+    let choose = |h: &mut egui_kittest::Harness<'_, RustGisApp>, from, to| {
+        let from_label = format!("Duplicate (#{from})");
+        h.query_all_by_role(egui::accesskit::Role::ComboBox).find(|n| n.value().as_deref() == Some(from_label.as_str())).unwrap().click();
+        h.run_steps(2);
+        h.get_by_label(&format!("Duplicate (#{to})")).click();
+        h.run_steps(2);
+        assert_eq!(h.state().dialogs.gpkg_layer, Some(to));
+    };
+    let shown_count = |h: &egui_kittest::Harness<'_, RustGisApp>, count: &str| {
+        let label = h.get_by_label("Changed rows").rect();
+        assert!(
+            h.query_all_by_label(count).any(|n| n.rect().left() > label.right() && (n.rect().center().y - label.center().y).abs() < 3.0),
+            "the Changed rows value must display {count}"
+        );
+    };
+    h.state_mut().run("edit.enable", json!({"on": true})).unwrap();
+    h.state_mut().run("edit.setValue", json!({"layer": upper, "row": 0, "field": "name", "value": "upper pending"})).unwrap();
+    for row in [0, 1] {
+        h.state_mut().run("edit.setValue", json!({"layer": lower, "row": row, "field": "name", "value": "lower saved"})).unwrap();
+    }
+    h.state_mut().run("layer.select", json!({"layer": lower})).unwrap();
+    h.state_mut().run("ui.dialog", json!({"name": "gpkgSave"})).unwrap();
+    h.run_steps(3);
+    assert_eq!(h.state().dialogs.gpkg_layer, Some(lower), "the lower duplicate is active");
+    h.get_by_label(&lower_table);
+    assert_eq!(h.state().dialogs.list[2], "2");
+    shown_count(&h, "2");
+    choose(&mut h, lower, upper);
+    h.get_by_label(&upper_table);
+    assert_eq!(h.state().dialogs.list[2], "1", "same display name must still invalidate counts");
+    shown_count(&h, "1");
+    choose(&mut h, upper, lower);
+    h.get_by_label(&lower_table);
+    assert_eq!(h.state().dialogs.list[2], "2");
+    shown_count(&h, "2");
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Save").click();
+    h.run_steps(3);
+    assert_eq!(h.state().dialogs.open, None, "{:?}", h.state().dialogs.error);
+    assert_eq!(pending(&mut h, lower), 0);
+    assert_eq!(pending(&mut h, upper), 1);
+    assert_eq!(stored(&lower_path, &lower_table), Value::Text("lower saved".into()));
+    assert_eq!(stored(&upper_path, &upper_table), Value::Text("original".into()));
+
+    h.state_mut().run("edit.setValue", json!({"layer": lower, "row": 0, "field": "name", "value": "lower discarded"})).unwrap();
+    h.state_mut().run("ui.dialog", json!({"name": "gpkgDiscard"})).unwrap();
+    h.run_steps(3);
+    assert_eq!(h.state().dialogs.gpkg_layer, Some(lower));
+    h.get_by_label(&lower_table);
+    choose(&mut h, lower, upper);
+    h.get_by_label(&upper_table);
+    choose(&mut h, upper, lower);
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Discard").click();
+    h.run_steps(3);
+    assert_eq!(h.state().dialogs.open, None, "{:?}", h.state().dialogs.error);
+    assert_eq!(pending(&mut h, lower), 0);
+    assert_eq!(pending(&mut h, upper), 1);
+    assert_eq!(h.state().session.map().layer(lower).unwrap().dataset.features[0].attrs[0], Value::Text("lower saved".into()));
+    assert_eq!(h.state().session.map().layer(upper).unwrap().dataset.features[0].attrs[0], Value::Text("upper pending".into()));
+    assert_eq!(stored(&lower_path, &lower_table), Value::Text("lower saved".into()));
+    assert_eq!(stored(&upper_path, &upper_table), Value::Text("original".into()));
+
+    // Losing the target must never fall back to the active layer or a same-name layer.
+    for (dialog, button) in [("gpkgSave", "Save"), ("gpkgDiscard", "Discard")] {
+        for target in [None, Some(u32::MAX)] {
+            h.state_mut().run("ui.dialog", json!({"name": dialog})).unwrap();
+            h.state_mut().dialogs.gpkg_layer = target;
+            h.run_steps(3);
+            assert!(h.state().dialogs.list.is_empty());
+            h.get_by_role_and_label(egui::accesskit::Role::Button, button).click();
+            h.run_steps(3);
+            assert_eq!(h.state().dialogs.open, Some(dialog));
+            assert!(h.state().dialogs.error.is_some());
+            assert_eq!(pending(&mut h, upper), 1);
+            assert_eq!(pending(&mut h, lower), 0);
+            assert_eq!(stored(&upper_path, &upper_table), Value::Text("original".into()));
+        }
+    }
+    h.state_mut().run("layer.select", json!({"layer": "Countries"})).unwrap();
+    h.state_mut().run("ui.dialog", json!({"name": "gpkgSave"})).unwrap();
+    assert_eq!(h.state().dialogs.gpkg_layer, Some(upper), "a non-editable active layer falls back to the first editable ID");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_dialog_gpkg(path: &std::path::Path) {
+    use rustgis_engine::data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value, raster::Crs, source::gpkg};
+    let mut data = Dataset::new("roads", GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+    for x in [0.0, 1.0, 2.0] {
+        data.push(Some(Geometry::Point(Coord::new(x, 20.0))), vec![Value::Text("original".into())]);
+    }
+    gpkg::write_in(&data, path, Crs::LonLat).unwrap();
+}
+
+/// Undo rewinds map-local IDs, not a dialog's ownership of a particular live layer.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn geopackage_edit_dialogs_refuse_reused_layer_ids() {
+    use rustgis_engine::data::{Value, source::gpkg::edit::EditTable};
+
+    for same_source in [false, true] {
+        for intervening_frame in [false, true] {
+            for (dialog, button) in [("gpkgSave", "Save"), ("gpkgDiscard", "Discard")] {
+                let dir = tempfile::tempdir().unwrap();
+                let a = dir.path().join("alias-a.gpkg");
+                let b = dir.path().join("alias-b.gpkg");
+                write_dialog_gpkg(&a);
+                write_dialog_gpkg(&b);
+                let mut h = harness();
+                h.state_mut().run("project.new", json!({})).unwrap();
+                h.state_mut().run("edit.enable", json!({"on": true})).unwrap();
+                let id = h.state_mut().run("gpkg.addLayer", json!({"path": a, "table": "roads", "name": "R"})).unwrap()["layer"]
+                    .as_u64()
+                    .unwrap() as u32;
+                assert_eq!(id, 1);
+                let instance = h.state().session.map().layer(id).unwrap().instance_id();
+                h.state_mut().run("ui.dialog", json!({"name": dialog})).unwrap();
+                h.run_steps(3);
+                assert_eq!(h.state().dialogs.list[4], a.to_string_lossy());
+                assert_eq!(h.state().dialogs.gpkg_instance, Some(instance));
+
+                h.state_mut().run("edit.undo", json!({})).unwrap();
+                assert!(h.state().session.map().layer(id).is_none());
+                let replacement = if same_source { &a } else { &b };
+                let other_id =
+                    h.state_mut().run("gpkg.addLayer", json!({"path": replacement, "table": "roads", "name": "R"})).unwrap()["layer"]
+                        .as_u64()
+                        .unwrap() as u32;
+                assert_eq!(other_id, id);
+                let other_instance = h.state().session.map().layer(id).unwrap().instance_id();
+                assert_ne!(other_instance, instance);
+                h.state_mut().run("edit.setValue", json!({"layer": id, "row": 0, "field": "name", "value": "wrong source saved"})).unwrap();
+                if intervening_frame {
+                    h.run_steps(3);
+                    assert!(h.state().dialogs.list.is_empty(), "a replacement must not inherit the old source preview");
+                }
+                // With no intervening frame this clicks the original rendered confirmation.
+                h.get_by_role_and_label(egui::accesskit::Role::Button, button).click();
+                h.run_steps(3);
+                assert_eq!(h.state().dialogs.open, Some(dialog));
+                assert!(h.state().dialogs.error.is_some());
+                assert_eq!(h.state().dialogs.gpkg_instance, Some(instance), "rendering must never adopt the replacement");
+                assert!(h.state().dialogs.list.is_empty());
+                assert_eq!(
+                    h.state().session.map().layer(id).unwrap().dataset.features[0].attrs[0],
+                    Value::Text("wrong source saved".into()),
+                    "Discard must leave the replacement's pending edit intact"
+                );
+                assert_eq!(h.state_mut().run("gpkg.pendingEdits", json!({"layer": id})).unwrap()["updates"], 1);
+                for path in [&a, &b] {
+                    let stored = EditTable::open(path, "roads").unwrap().read_editable(10).unwrap();
+                    assert_eq!(
+                        stored.features[0].attrs[0],
+                        Value::Text("original".into()),
+                        "{button}: same_source={same_source}, intervening_frame={intervening_frame}, {path:?}"
+                    );
+                }
+                h.state_mut().run("ui.dialog", json!({"name": dialog})).unwrap();
+                h.run_steps(3);
+                assert_eq!(h.state().dialogs.gpkg_instance, Some(other_instance));
+                assert_eq!(h.state().dialogs.list[4], replacement.to_string_lossy());
+                assert_eq!(h.state().dialogs.list[2], "1");
+                assert!(h.state().dialogs.error.is_none());
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn geopackage_edit_dialog_counts_follow_edits_and_surviving_undo_snapshots() {
+    use rustgis_engine::data::{Value, source::gpkg::edit::EditTable};
+
+    for (dialog, button) in [("gpkgSave", "Save"), ("gpkgDiscard", "Discard")] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live-counts.gpkg");
+        write_dialog_gpkg(&path);
+        let mut h = harness();
+        h.state_mut().run("project.new", json!({})).unwrap();
+        h.state_mut().run("edit.enable", json!({"on": true})).unwrap();
+        let id = h.state_mut().run("gpkg.addLayer", json!({"path": path, "table": "roads"})).unwrap()["layer"].as_u64().unwrap() as u32;
+        let instance = h.state().session.map().layer(id).unwrap().instance_id();
+        h.state_mut().run("ui.dialog", json!({"name": dialog})).unwrap();
+        h.run_steps(3);
+        assert_eq!(h.state().dialogs.list[2], "0");
+        for row in [0, 1] {
+            h.state_mut().run("edit.setValue", json!({"layer": id, "row": row, "field": "name", "value": "pending"})).unwrap();
+            h.run_steps(3);
+            assert_eq!(h.state().dialogs.list[2], (row + 1).to_string(), "open counts follow subsequent edits");
+        }
+        h.state_mut().run("edit.undo", json!({})).unwrap();
+        h.run_steps(3);
+        assert_eq!(h.state().dialogs.list[2], "1");
+        assert_eq!(h.state().session.map().layer(id).unwrap().instance_id(), instance);
+        assert!(h.state().dialogs.error.is_none());
+        h.state_mut().run("edit.redo", json!({})).unwrap();
+        h.run_steps(3);
+        assert_eq!(h.state().dialogs.list[2], "2");
+        assert_eq!(h.state().session.map().layer(id).unwrap().instance_id(), instance);
+        assert!(h.state().dialogs.error.is_none());
+        let revision = h.state().session.revision;
+        h.run_steps(3);
+        assert_eq!(h.state().session.revision, revision, "pendingEdits must not invalidate its own count cache");
+        // Undoing the layer's addition makes the target unavailable; Redo restores the same
+        // instance, and the stale refusal must go with it rather than sit beside valid counts.
+        for _ in 0..3 {
+            h.state_mut().run("edit.undo", json!({})).unwrap();
+        }
+        h.run_steps(3);
+        assert!(h.state().dialogs.error.as_deref().is_some_and(|e| e.contains("no longer available")), "{:?}", h.state().dialogs.error);
+        for _ in 0..3 {
+            h.state_mut().run("edit.redo", json!({})).unwrap();
+        }
+        h.run_steps(3);
+        assert_eq!(h.state().session.map().layer(id).unwrap().instance_id(), instance);
+        assert_eq!(h.state().dialogs.error, None, "the restored target's stale refusal must clear");
+        assert_eq!(h.state().dialogs.list[2], "2");
+
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Cancel").click();
+        h.run_steps(3);
+        h.state_mut().run("ui.dialog", json!({"name": dialog})).unwrap();
+        h.run_steps(3);
+        assert_eq!(h.state().dialogs.list[2], "2", "reopening counts the current state");
+        h.get_by_role_and_label(egui::accesskit::Role::Button, button).click();
+        h.run_steps(3);
+        assert_eq!(h.state().dialogs.open, None, "{:?}", h.state().dialogs.error);
+        let expected = Value::Text(if button == "Save" { "pending" } else { "original" }.into());
+        let stored = EditTable::open(&path, "roads").unwrap().read_editable(10).unwrap();
+        for row in [0, 1] {
+            assert_eq!(stored.features[row].attrs[0], expected);
+            assert_eq!(h.state().session.map().layer(id).unwrap().dataset.features[row].attrs[0], expected);
+        }
+        assert_eq!(h.state_mut().run("gpkg.pendingEdits", json!({"layer": id})).unwrap()["updates"], 0);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn geopackage_edit_dialogs_refuse_map_and_project_identity_changes() {
+    use rustgis_engine::data::{Value, source::gpkg::edit::EditTable};
+    for project_switch in [false, true] {
+        for (dialog, button) in [("gpkgSave", "Save"), ("gpkgDiscard", "Discard")] {
+            let dir = tempfile::tempdir().unwrap();
+            let a = dir.path().join("a.gpkg");
+            let b = dir.path().join("b.gpkg");
+            write_dialog_gpkg(&a);
+            write_dialog_gpkg(&b);
+            let mut h = harness();
+            h.state_mut().run("map.new", json!({"name": "Editable A"})).unwrap();
+            let id = h.state_mut().run("gpkg.addLayer", json!({"path": a, "table": "roads", "name": "R"})).unwrap()["layer"]
+                .as_u64()
+                .unwrap() as u32;
+            h.state_mut().run("edit.enable", json!({"on": true})).unwrap();
+            h.state_mut().run("edit.setValue", json!({"layer": id, "row": 0, "field": "name", "value": "A pending"})).unwrap();
+            let project = dir.path().join("other.rgis");
+            if project_switch {
+                // Same map index, map name and layer ID: only the opened-project generation differs.
+                let mut other = h.state().session.project.clone();
+                let index = other.active_map;
+                let layer = other.maps[index].layer_mut(id).unwrap();
+                layer.gpkg.as_mut().unwrap().path = b.to_string_lossy().into_owned();
+                layer.dataset.features[0].attrs[0] = Value::Text("B pending".into());
+                let mut session = rustgis_engine::Session::new(other);
+                session.run("project.saveAs", &json!({"path": project})).unwrap();
+            } else {
+                h.state_mut().run("map.new", json!({"name": "Editable B"})).unwrap();
+                let other_id = h.state_mut().run("gpkg.addLayer", json!({"path": b, "table": "roads", "name": "R"})).unwrap()["layer"]
+                    .as_u64()
+                    .unwrap() as u32;
+                assert_eq!(id, other_id, "layer IDs collide across maps");
+                h.state_mut().run("edit.enable", json!({"on": true})).unwrap();
+                h.state_mut().run("edit.setValue", json!({"layer": id, "row": 0, "field": "name", "value": "B pending"})).unwrap();
+                h.state_mut().run("map.activate", json!({"name": "Editable A"})).unwrap();
+            }
+            h.state_mut().run("ui.dialog", json!({"name": dialog})).unwrap();
+            h.run_steps(3);
+            assert_eq!(h.state().dialogs.list[4], a.to_string_lossy());
+            if project_switch {
+                h.state_mut().run("project.open", json!({"path": project})).unwrap();
+            } else {
+                h.state_mut().run("map.activate", json!({"name": "Editable B"})).unwrap();
+            }
+            h.run_steps(3);
+            assert!(h.state().dialogs.list.is_empty(), "the old source preview must disappear");
+            h.get_by_role_and_label(egui::accesskit::Role::Button, button).click();
+            h.run_steps(3);
+            assert_eq!(h.state().dialogs.open, Some(dialog));
+            assert!(h.state().dialogs.error.is_some());
+            assert_eq!(h.state().session.map().layer(id).unwrap().dataset.features[0].attrs[0], Value::Text("B pending".into()));
+            assert_eq!(h.state_mut().run("gpkg.pendingEdits", json!({"layer": id})).unwrap()["updates"], 1);
+            for path in [&a, &b] {
+                let stored = EditTable::open(path, "roads").unwrap().read_editable(10).unwrap();
+                assert_eq!(stored.features[0].attrs[0], Value::Text("original".into()), "{project_switch}: {button}: {path:?}");
+            }
+            h.state_mut().run("ui.dialog", json!({"name": dialog})).unwrap();
+            h.run_steps(3);
+            assert_eq!(h.state().dialogs.list[4], b.to_string_lossy(), "reopening targets the current owner");
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn geopackage_load_dialog_rejects_fractional_row_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rows.gpkg");
+    write_dialog_gpkg(&path);
+    let mut h = harness();
+    h.state_mut().run("ui.dialog", json!({"name": "gpkgAddLayer"})).unwrap();
+    h.state_mut().dialogs.a = path.to_string_lossy().into_owned();
+    h.state_mut().dialogs.c = "roads".into();
+    for input in ["1.5", "0.5", "-1", "1,5", "1,,000", "12,34"] {
+        h.state_mut().dialogs.e = input.into();
+        h.run_steps(3);
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Load").click();
+        h.run_steps(3);
+        assert_eq!(h.state().dialogs.open, Some("gpkgAddLayer"));
+        assert!(h.state().dialogs.error.is_some());
+        assert!(h.state().session.map().layers.iter().all(|l| l.gpkg.is_none()));
+    }
+    h.state_mut().dialogs.e = "1".into();
+    h.run_steps(3);
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Load").click();
+    h.run_steps(3);
+    assert_eq!(h.state().dialogs.open, None, "{:?}", h.state().dialogs.error);
+    let layer = h.state().session.map().layers.iter().find(|l| l.gpkg.is_some()).unwrap();
+    assert_eq!(layer.dataset.features.len(), 1);
+    assert_eq!(
+        layer.dataset.features[0].geometry,
+        Some(rustgis_engine::data::Geometry::Point(rustgis_engine::data::Coord::new(0.0, 20.0)))
+    );
+    h.state_mut().run("ui.dialog", json!({"name": "gpkgAddLayer"})).unwrap();
+    h.state_mut().dialogs.a = path.to_string_lossy().into_owned();
+    h.state_mut().dialogs.c = "roads".into();
+    h.state_mut().dialogs.e = "1,000".into();
+    h.run_steps(3);
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Load").click();
+    h.run_steps(3);
+    assert_eq!(h.state().dialogs.open, None, "{:?}", h.state().dialogs.error);
+    let layer = h.state().session.map().layers.iter().find(|l| l.gpkg.is_some()).unwrap();
+    assert_eq!(layer.dataset.features.len(), 3, "valid thousands grouping must still load all available rows");
+}
+
+/// Both No Fill controls preserve unique-value styling and undo, and stay hidden for points.
+#[test]
+fn polygon_no_fill_is_reachable_from_the_pane_and_the_ribbon() {
+    for pane in [true, false] {
+        let mut h = harness();
+        h.state_mut().run("layer.select", json!({"layer": "Countries"})).unwrap();
+        h.state_mut().run("layer.symbology", json!({"type": "unique", "field": "continent"})).unwrap();
+        h.state_mut().run("layer.outline", json!({"color": "#2E6B4F", "width": 2})).unwrap();
+        let symbol =
+            |h: &egui_kittest::Harness<'_, RustGisApp>| h.state().session.map().layer_by_name("Countries").unwrap().renderer.base_symbol();
+        let before = symbol(&h);
+        if pane {
+            h.state_mut().run("ui.pane.symbology", json!(null)).unwrap();
+        } else {
+            h.state_mut().ui.tab = "Style".into();
+        }
+        h.run_steps(6);
+        h.get_by_label("No Fill").click();
+        h.run_steps(3);
+        let after = symbol(&h);
+        assert_eq!(after.fill.a(), 0);
+        assert_eq!(after.stroke, before.stroke);
+        assert_eq!(after.stroke_width, before.stroke_width);
+        assert_eq!(h.state().session.map().layer_by_name("Countries").unwrap().renderer.kind_label(), "Unique Values");
+        h.state_mut().run("edit.undo", json!(null)).unwrap();
+        assert_eq!(symbol(&h), before);
+        h.state_mut().run("layer.select", json!({"layer": "Cities"})).unwrap();
+        h.run_steps(3);
+        assert!(h.query_by_label("No Fill").is_none(), "points must keep their fill");
+    }
 }
 
 #[test]
@@ -67,6 +478,7 @@ fn command_search_basemap_gallery_selects_and_can_open_tile_dialog() {
         delta: egui::vec2(0.0, -800.0),
         phase: egui::TouchPhase::Move,
         modifiers: egui::Modifiers::NONE,
+        source: egui::MouseWheelSource::Wheel,
     });
     for _ in 0..6 {
         h.step();
@@ -195,6 +607,30 @@ fn command_search_workflow_collects_inputs_before_georeferencing() {
     search_layer_command(&mut h, "deeplearning");
     assert_eq!(h.state().workflow.section, "deepLearning");
     assert_eq!(h.state().ui.right, Some(rustgis_ui_egui::RightPane::Workflows));
+}
+
+/// Clipping follows a selection until the user explicitly opts out, even after changing it.
+#[test]
+fn polygon_clip_defaults_to_selection_and_honors_opt_out() {
+    let mut h = harness();
+    h.state_mut().workflow.layer2 = "Countries".into();
+    h.state_mut().run("ui.pane.workflows", json!(null)).unwrap();
+    h.state_mut().workflow.section = "process";
+    h.state_mut().session.map_mut().layers.iter_mut().find(|l| l.name == "Countries").unwrap().selection.push(0);
+    h.run_steps(4);
+    assert_eq!(h.state().workflow.selected_only, None);
+    let total = h.state().session.map().layer_by_name("Countries").unwrap().dataset.features.len();
+    assert!(h.query_by_label(&format!("(1 of {total})")).is_some());
+    h.get_by_label("Selected only").click();
+    h.run_steps(3);
+    assert_eq!(h.state().workflow.selected_only, Some(false));
+    h.state_mut().session.map_mut().layers.iter_mut().find(|l| l.name == "Countries").unwrap().selection.push(1);
+    h.run_steps(3);
+    assert_eq!(h.state().workflow.selected_only, Some(false));
+    assert!(h.query_by_label(&format!("(2 of {total})")).is_some());
+    h.get_by_label("Selected only").click();
+    h.run_steps(3);
+    assert_eq!(h.state().workflow.selected_only, Some(true));
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -394,13 +830,14 @@ fn nested_ogc_children_sort_on_import_rename_refresh_and_reopen() {
 #[test]
 fn every_tab_pane_and_dialog_renders() {
     let mut h = harness();
+    // Every language is shown: no face in the monospace chain has some of their letters (ə).
+    h.ctx.set_missing_glyph_policy(egui::MissingGlyphPolicy::Tofu);
     for _ in 0..4 {
         h.step();
     }
-    for tab in ["Home", "Data", "Style", "Edit", "Analyze", "View", "Publish", "Plugins", "Settings", "Help"] {
+    for tab in ["Home", "Data", "Style", "Labeling", "Edit", "Analyze", "View", "Publish", "Plugins", "Settings", "Help"] {
         h.state_mut().ui.tab = tab.into();
-        h.step();
-        h.step();
+        h.run();
     }
     for (id, p) in [
         ("ui.pane.symbology", json!(null)),
@@ -414,6 +851,7 @@ fn every_tab_pane_and_dialog_renders() {
         ("ui.dialog", json!({"name": "selectByAttributes"})),
         ("ui.dialog", json!({"name": "goToXY"})),
         ("ui.dialog", json!({"name": "calculateField"})),
+        ("ui.connection", json!({"kind": "s3"})),
         ("ui.commandSearch", json!(null)),
         ("ui.about", json!(null)),
         ("ui.shortcuts", json!(null)),
@@ -421,15 +859,13 @@ fn every_tab_pane_and_dialog_renders() {
         ("ui.backstage", json!({"open": true})),
     ] {
         h.state_mut().run(id, p).unwrap_or_else(|e| panic!("{id}: {e}"));
-        h.step();
-        h.step();
+        h.run();
     }
     h.state_mut().ui.backstage = false;
     // Every language, the collapsed and peeked ribbon.
     for l in rustgis_ui_egui::i18n::Lang::all() {
         h.state_mut().run("ui.language", json!({"code": l.code()})).unwrap();
-        h.step();
-        h.step();
+        h.run();
     }
     h.state_mut().run("ui.language", json!({"code": "auto"})).unwrap();
     assert!(h.state_mut().run("ui.language", json!({"code": "xx"})).is_err());
@@ -642,6 +1078,8 @@ fn browse_lists_thousands_of_plugins_quickly() {
     h.state_mut().plugins.set_registry(Some(Ok(entries)));
     h.state_mut().run("ui.plugins", json!({"open": true, "tab": "browse"})).unwrap();
     h.step();
+    // What it opened shows on the next frame.
+    h.step();
     let _ = h.get_by_label("5000 plugins");
     // Only the visible rows are laid out, so a frame stays cheap with thousands of plugins
     // (about 1 ms in a release build; it was over 100 ms when every card was drawn). The bound
@@ -690,6 +1128,8 @@ fn browse_lists_thousands_of_plugins_quickly() {
 #[test]
 fn language_switch_waits_for_its_font() {
     let mut h = harness();
+    // A machine without a CJK face draws Chinese as boxes, whenever it switches.
+    h.ctx.set_missing_glyph_policy(egui::MissingGlyphPolicy::Tofu);
     h.state_mut().run("ui.language", json!({"code": "en"})).unwrap();
     for _ in 0..4 {
         h.step();
@@ -734,7 +1174,7 @@ fn start_up_preferences() {
     app.start(&Default::default()).unwrap();
     assert!(app.session.map().layers.is_empty());
     assert_eq!(app.session.map().projection.code(), "EPSG:3010");
-    assert!(!app.session.dirty && !app.session.can_undo());
+    assert!(!app.session.dirty() && !app.session.can_undo());
 
     // The web app's `?projection=robinson` without `?blank`: the sample still goes when the
     // preference says blank; an explicit `Some(false)` keeps it.
@@ -771,6 +1211,47 @@ fn start_up_preferences() {
     // Web Mercator is the default, stored as nothing.
     app.run("ui.startup", json!({"blank": false, "projection": "mercator"})).unwrap();
     assert_eq!(store.lock().unwrap().get("start_projection").map(String::as_str), Some(""));
+}
+
+#[test]
+fn connections_persist_and_import_once() {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    let old = json!({"saved":[
+        {"kind":"service","name":"State WMS","address":"https://w.example/wms","extra":{"type":"wms"}},
+        {"kind":"database","name":"Prod","address":"postgres:host=h dbname=g user=u"},
+        {"kind":"database","name":"F","address":"/x/a.duckdb"}
+    ]})
+    .to_string();
+    let old_s3 = json!([{"name":"Lake","endpoint":"","region":"eu-west-1","source":"profile","profile":"work"}]).to_string();
+    let store =
+        Arc::new(Mutex::new(HashMap::from([("data_sources".to_string(), old.clone()), ("s3_connections".to_string(), old_s3.clone())])));
+    let services = || {
+        let (load, save) = (store.clone(), store.clone());
+        rustgis_ui_egui::Services {
+            load_pref: Some(Box::new(move |k| load.lock().unwrap().get(k).cloned())),
+            save_pref: Some(Box::new(move |k, v| {
+                save.lock().unwrap().insert(k.to_string(), v.to_string());
+            })),
+            ..Default::default()
+        }
+    };
+    let mut app = RustGisApp::with_sample().with_services(services());
+    let kinds: Vec<_> = app.session.connections.connections.iter().map(|c| c.kind.as_str()).collect();
+    assert_eq!(kinds, ["wms", "postgres", "s3"]);
+    assert_eq!(app.session.connections.find("Lake").unwrap().options["credentials"], "profile");
+    assert!(store.lock().unwrap().contains_key("connections"));
+    assert_eq!(store.lock().unwrap()["data_sources"], old);
+    assert_eq!(store.lock().unwrap()["s3_connections"], old_s3);
+    app.run("connection.remove", json!({"id":"Prod"})).unwrap();
+    let mut again = RustGisApp::with_sample().with_services(services());
+    assert_eq!(again.session.connections.connections.len(), 2);
+    assert!(again.session.connections.find("Prod").is_none());
+    for id in ["State WMS", "Lake"] {
+        again.run("connection.remove", json!({"id":id})).unwrap();
+    }
+    let empty = RustGisApp::with_sample().with_services(services());
+    assert!(empty.session.connections.connections.is_empty(), "an empty saved list must not import again");
 }
 
 /// Settings › Start-up › Start With a project (#377): the last one opened or saved, or one picked
@@ -821,7 +1302,7 @@ fn start_with_a_project_file_or_the_last_one() {
     assert_eq!(started.session.path.as_deref(), Some(a.as_path()));
     assert_eq!(started.session.map().projection.code(), "EPSG:3010");
     assert!(started.ui.start_view.is_none(), "the Start-up extent isn't applied");
-    assert!(!started.session.dirty && !started.session.can_undo());
+    assert!(!started.session.dirty() && !started.session.can_undo());
     // A shell's blank wins: a file on the command line (true) or --sample (false).
     for (blank, sample) in [(true, false), (false, true)] {
         let mut shell = RustGisApp::with_sample().with_services(services());
@@ -1128,7 +1609,14 @@ fn show_me_points_at_where_a_steps_command_is() {
 #[test]
 fn old_and_unknown_tab_names_open_a_current_tab() {
     let mut h = harness();
-    for (asked, opened) in [("Imagery", "Analyze"), ("Feature Layer", "Style"), ("Share", "Publish"), ("Map", "Home"), ("nope", "Home")] {
+    for (asked, opened) in [
+        ("Imagery", "Analyze"),
+        ("Feature Layer", "Style"),
+        ("Labeling", "Labeling"),
+        ("Share", "Publish"),
+        ("Map", "Home"),
+        ("nope", "Home"),
+    ] {
         let _ = h.state_mut().run("ui.tab", json!({"tab": asked}));
         assert_eq!(h.state().ui.tab, opened, "{asked}");
         h.step();
@@ -1291,7 +1779,9 @@ fn data_from_a_web_address_lands_later() {
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
         let body = br#"{"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [1, 2]}}"#;
-        for stream in listener.incoming().take(1) {
+        // Three requests: an address without a file name is asked for its headers and first
+        // bytes (is it a GeoTIFF?) before it is downloaded.
+        for stream in listener.incoming().take(3) {
             let Ok(mut s) = stream else { continue };
             let mut buf = [0u8; 2048];
             let _ = s.read(&mut buf);
@@ -1317,6 +1807,136 @@ fn data_from_a_web_address_lands_later() {
     assert!(h.state().session.map().layer_by_name("Pin").is_some());
     assert!(h.state().session.notices.iter().any(|n| n.error && n.text.contains("never fetched")));
     assert!(h.state().ui.downloads.is_empty());
+}
+
+/// Add Data From URL reads a cloud-optimised GeoTIFF in place from an address that names no file
+/// (an API such as Vantor's `…/geotiff?…`): its first bytes are probed off the frame, then the
+/// layer reads its tiles by range, never downloading it whole.
+#[test]
+fn an_unnamed_cog_address_is_read_in_place() {
+    use std::io::{Read, Write};
+    let body = rustgis_engine::data::raster::cog::example(2048, 256);
+    let total = body.len();
+    let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = sent.clone();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut buf = [0u8; 4096];
+            let read = s.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..read]).to_ascii_lowercase();
+            // Its headers announce the TIFF header's length, as Vantor's Transform API does.
+            if req.starts_with("head ") {
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nX-TIFF-Header-Length: 8192\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                continue;
+            }
+            let range = req.lines().find_map(|l| l.strip_prefix("range: bytes=")).and_then(|r| {
+                let (a, b) = r.trim().split_once('-')?;
+                Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
+            });
+            let (status, part) = match range {
+                Some((a, b)) if a < body.len() => ("206 Partial Content", &body[a..=b.min(body.len() - 1)]),
+                _ => ("200 OK", &body[..]),
+            };
+            count.fetch_add(part.len(), std::sync::atomic::Ordering::Relaxed);
+            let _ = write!(s, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", part.len());
+            let _ = s.write_all(part);
+        }
+    });
+    let mut h = harness();
+    h.step();
+    let url = format!("http://{addr}/analytics/v1/raster/ortho-with-overviews/geotiff?function=pansharp_ortho&key=k");
+    h.state_mut().run("ui.addUrl", json!({"url": url, "name": "Ortho"})).unwrap();
+    assert!(h.state().ui.downloads.is_empty(), "probed first, not downloaded");
+    for _ in 0..200 {
+        h.step();
+        if h.state().session.map().tiles.iter().any(|t| t.name == "Ortho") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let t = h.state().session.map().tiles.iter().find(|t| t.name == "Ortho").cloned();
+    assert!(t.is_some_and(|t| t.url == url), "added as a tile layer read in place");
+    assert!(h.state().ui.downloads.is_empty() && h.state().ui.cog_probes.is_empty());
+    let read = sent.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(read < total / 4, "{read} of {total} bytes read");
+    // `"as": null` is no `"as"`: probed too, not downloaded, and read in place.
+    let null_url = format!("{url}&n=2");
+    h.state_mut().run("ui.addUrl", json!({"url": null_url, "name": "Null", "as": null})).unwrap();
+    assert!(h.state().ui.downloads.is_empty() && h.state().ui.cog_probes.len() == 1);
+    for _ in 0..200 {
+        h.step();
+        if h.state().session.map().tiles.iter().any(|t| t.name == "Null") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let t = h.state().session.map().tiles.iter().find(|t| t.name == "Null").cloned();
+    assert!(t.is_some_and(|t| t.url == null_url), "added as a tile layer read in place");
+    // A probe under way when another project opens is dropped: its layer never lands there.
+    h.state_mut().run("ui.addUrl", json!({"url": format!("{url}&n=3"), "name": "Late"})).unwrap();
+    h.state_mut().run("project.new", json!({})).unwrap();
+    assert!(h.state().ui.cog_probes.is_empty());
+    for _ in 0..50 {
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(!h.state().session.map().tiles.iter().any(|t| t.name == "Late"));
+}
+
+/// A service layer added from the app (Add From Service, the Connections tree) is read past its
+/// first page off the frame (#764): an ArcGIS layer again from the start in pages ordered by its
+/// object ids, an OGC API collection by its `next` links; the layer is added once the pages are
+/// in, with no note.
+#[test]
+fn service_features_are_read_page_by_page_off_the_frame() {
+    use ogc_server::{Route, Server, arcgis_layer, arcgis_page};
+    let q = "where=1%3D1&outFields=*&f=geojson";
+    let layer = "/arcgis/rest/services/P/MapServer/0";
+    let page = |offset: u32| format!("{layer}/query?{q}&resultOffset={offset}&resultRecordCount=2&orderByFields=OBJECTID");
+    let collection = |ids: &[u32], next: Option<&str>| {
+        let mut c: serde_json::Value = serde_json::from_str(&arcgis_page(ids, false)).unwrap();
+        if let Some(href) = next {
+            c["links"] = json!([{"rel": "next", "href": href}]);
+        }
+        c.to_string()
+    };
+    let server = Server::new(vec![
+        Route::new(&format!("{layer}/query?{q}"), &arcgis_page(&[3, 0], true)),
+        Route::new(layer, &arcgis_layer(2, true)),
+        Route::new(&page(0), &arcgis_page(&[0, 1], true)),
+        Route::new(&page(2), &arcgis_page(&[2, 3], true)),
+        Route::new(&page(4), &arcgis_page(&[4], false)),
+        Route::new("/collections/wells/items?page=2", &collection(&[2], None)),
+        Route::new("/collections/wells/items", &collection(&[0, 1], Some("items?page=2"))),
+    ]);
+    let mut h = harness();
+    h.step();
+    let base = server.base.clone();
+    h.state_mut().run("ui.addUrl", json!({"url": format!("{base}{layer}/query?{q}"), "name": "Parcels", "service": true})).unwrap();
+    h.state_mut().run("ui.addUrl", json!({"url": format!("{base}/collections/wells/items"), "name": "Wells", "service": true})).unwrap();
+    let ids = |app: &RustGisApp, name: &str| {
+        app.session.map().layer_by_name(name).map(|l| l.dataset.features.iter().map(|f| f.attrs[0].as_f64()).collect::<Vec<_>>())
+    };
+    wait_for_ogc(&mut h, |app| ids(app, "Parcels").is_some() && ids(app, "Wells").is_some());
+    let notes: Vec<_> = h.state().session.notices.iter().map(|n| n.text.clone()).collect();
+    let n = |i: &[u32]| Some(i.iter().map(|&i| Some(f64::from(i))).collect::<Vec<_>>());
+    assert_eq!((ids(h.state(), "Parcels"), ids(h.state(), "Wells")), (n(&[0, 1, 2, 3, 4]), n(&[0, 1, 2])), "{notes:?}");
+    assert!(!notes.iter().any(|n| n.contains("aren't read")), "{notes:?}");
+    assert!(h.state().ui.service_pages.is_empty() && h.state().ui.downloads.is_empty());
+    let offsets: Vec<_> = server
+        .requests()
+        .into_iter()
+        .filter(|r| r.path.ends_with("/0/query"))
+        .map(|r| r.query.into_iter().find(|(k, _)| k == "resultOffset").map(|(_, v)| v))
+        .collect();
+    assert_eq!(offsets, [None, Some("0".into()), Some("2".into()), Some("4".into())]);
 }
 
 /// A project by its web address (a `?project=` link) downloads off the frame and replaces the
@@ -1448,6 +2068,572 @@ fn a_service_is_listed_when_its_capabilities_land() {
     h.step();
 }
 
+#[test]
+fn connections_section_and_dialog() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let body = br#"<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink"><Service><Title>Local</Title></Service><Capability><Request><GetMap><Format>image/png</Format><DCPType><HTTP><Get><OnlineResource xlink:href="http://127.0.0.1/wms?"/></Get></HTTP></DCPType></GetMap></Request><Layer><CRS>EPSG:3857</CRS><Layer><Name>a</Name><Title>A</Title></Layer></Layer></Capability></WMS_Capabilities>"#;
+        for stream in listener.incoming().take(1) {
+            let Ok(mut s) = stream else { continue };
+            let mut buf = [0u8; 2048];
+            let _ = s.read(&mut buf);
+            let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let _ = s.write_all(body);
+        }
+    });
+    let mut h = harness();
+    h.state_mut().run("connection.new", json!({"kind":"wms","address":"https://w.example/wms","name":"State WMS","group":"Work"})).unwrap();
+    h.state_mut().run("ui.pane.sources", json!({})).unwrap();
+    h.step();
+    h.get_by_label("Work");
+    h.get_by_label("State WMS");
+    assert!(h.query_by_label("STAC APIs").is_none());
+    assert!(h.state_mut().run("ui.dialog", json!({"name":"newConnection"})).is_err());
+    h.state_mut().run("ui.connection", json!({"kind":"wms"})).unwrap();
+    assert_eq!(h.state().dialogs.open, Some("newConnection"));
+    let address = format!("http://{addr}/wms");
+    h.state_mut().ui.connection.name = "Local".into();
+    h.state_mut().ui.connection.address = address.clone();
+    h.step();
+    h.step();
+    h.get_by_label("Test").click();
+    for _ in 0..100 {
+        h.step();
+        if h.state().dialogs.info.as_ref().is_some_and(|s| s.contains("1 layers")) || h.state().dialogs.error.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(h.state().dialogs.error, None);
+    assert!(
+        h.state().dialogs.info.as_ref().is_some_and(|s| s.contains("Local: 1 layers")),
+        "info: {:?}, pending: {}",
+        h.state().dialogs.info,
+        h.state().ui.connection.test.is_some()
+    );
+    assert_eq!(h.state().session.connections.connections.len(), 1);
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Save").click();
+    h.step();
+    assert_eq!(h.state().dialogs.open, None);
+    let c = h.state().session.connections.find("Local").unwrap();
+    assert_eq!(c.address, address);
+    let id = c.id.clone();
+    h.state_mut().run("ui.connection", json!({"id":"Local"})).unwrap();
+    assert_eq!(h.state().dialogs.open, Some("editConnection"));
+    assert_eq!(h.state().ui.connection.name, "Local");
+    h.state_mut().ui.connection.group = "Lab".into();
+    h.step();
+    h.step();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Save").click();
+    h.step();
+    let c = h.state().session.connections.find("Local").unwrap();
+    assert_eq!(c.group, "Lab");
+    assert_eq!(c.id, id);
+    h.step();
+    h.step();
+    h.get_by_label("Local").click_secondary();
+    // The menu settles over a few frames; clicking its first layout can miss "Remove".
+    for _ in 0..4 {
+        h.step();
+    }
+    h.get_by_label("Remove").click();
+    h.step();
+    assert!(h.state().session.connections.find("Local").is_none());
+}
+
+#[test]
+fn add_service_keeps_and_picks_connections() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let body = br#"<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink"><Service><Title>Local</Title></Service><Capability><Request><GetMap><Format>image/png</Format><DCPType><HTTP><Get><OnlineResource xlink:href="http://127.0.0.1/wms?"/></Get></HTTP></DCPType></GetMap></Request><Layer><CRS>EPSG:3857</CRS><Layer><Name>a</Name><Title>A</Title></Layer></Layer></Capability></WMS_Capabilities>"#;
+        for stream in listener.incoming().take(3) {
+            let mut stream = stream.unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf).unwrap();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            stream.write_all(body).unwrap();
+        }
+    });
+    let wait_for_listing = |h: &mut egui_kittest::Harness<'_, RustGisApp>| {
+        for _ in 0..100 {
+            h.step();
+            if h.state().ui.service.as_ref().is_some_and(|c| c.listing.is_some() || c.error.is_some() || c.failure.is_some()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let conn = h.state().ui.service.as_ref().unwrap();
+        assert_eq!(conn.error, None);
+        assert!(conn.failure.is_none());
+        assert_eq!(conn.listing.as_ref().unwrap()["layers"][0]["name"], "a");
+        h.step();
+    };
+    let mut h = harness();
+    let url = format!("http://{addr}/wms");
+    let other = h.state_mut().run("connection.new", json!({"kind":"wms","address":url,"name":"Other user"})).unwrap();
+    let other_id = other["id"].as_str().unwrap().to_string();
+    h.state_mut().run("ui.addService", json!({"url":url,"type":"wms"})).unwrap();
+    wait_for_listing(&mut h);
+    assert_eq!(h.state().session.connections.connections.len(), 1, "connecting never saves automatically");
+    assert_eq!(h.state().dialogs.connection, None);
+    h.get_by_label("Save as Connection").click();
+    h.step();
+    let same_address: Vec<_> = h.state().session.connections.connections.iter().filter(|c| c.address == url).collect();
+    assert_eq!(same_address.len(), 2, "an existing address is not a connection identity");
+    let saved = same_address.into_iter().find(|c| c.id != other_id).unwrap();
+    let saved_id = saved.id.clone();
+    assert_ne!(saved.name, other["name"].as_str().unwrap(), "the new connection has a unique default name");
+    assert_eq!(saved.kind, "wms");
+    assert_eq!(h.state().dialogs.connection.as_deref(), Some(saved_id.as_str()));
+    h.step();
+    assert!(h.query_by_label("Save as Connection").is_none());
+
+    h.state_mut().ui.service = None;
+    h.state_mut().run("ui.dialog", json!({"name":"addService"})).unwrap();
+    h.step();
+    h.step();
+    h.query_all_by_role(egui::accesskit::Role::ComboBox).find(|n| n.value().as_deref() == Some("Pick one…")).unwrap().click();
+    h.step();
+    // What it opened shows on the next frame.
+    h.step();
+    h.get_by_label("Other user").click();
+    h.step();
+    assert_eq!(h.state().dialogs.connection.as_deref(), Some(other_id.as_str()));
+    assert_eq!(h.state().dialogs.text, url);
+    wait_for_listing(&mut h);
+    assert!(h.query_by_label("Save as Connection").is_none());
+
+    let edited = format!("{url}?x=1");
+    h.state_mut().dialogs.text = edited.clone();
+    h.state_mut().run("ui.addService", json!({"url":edited,"type":"wms"})).unwrap();
+    wait_for_listing(&mut h);
+    assert_eq!(h.state().dialogs.connection.as_deref(), Some(other_id.as_str()));
+    h.get_by_label("Save as Connection");
+    assert_eq!(h.state().session.connections.connections.len(), 2);
+    server.join().unwrap();
+}
+
+#[test]
+fn add_database_picks_and_keeps_connections() {
+    let mut h = harness();
+    let address = "postgres:host=db.example dbname=gis user=me";
+    let picked = h.state_mut().run("connection.new", json!({"kind":"postgres","address":address,"name":"Picked DB"})).unwrap();
+    let picked_id = picked["id"].as_str().unwrap().to_string();
+    h.state_mut().run("ui.dialog", json!({"name":"addDatabase"})).unwrap();
+    h.step();
+    h.step();
+    h.query_all_by_role(egui::accesskit::Role::ComboBox).find(|n| n.value().as_deref() == Some("Pick one…")).unwrap().click();
+    h.step();
+    // What it opened shows on the next frame.
+    h.step();
+    h.get_by_label("Picked DB").click();
+    h.step();
+    assert_eq!(h.state().dialogs.a, address);
+    assert_eq!(h.state().dialogs.connection.as_deref(), Some(picked_id.as_str()));
+    assert!(h.state().dialogs.b.is_empty(), "picking a connection never fills the password");
+    // Simulate a successful List Tables without needing a database server.
+    h.state_mut().dialogs.listed = Some(address.into());
+    h.step();
+    assert!(h.query_by_label("Save as Connection").is_none());
+
+    // The same address entered by hand is still a new connection.
+    h.state_mut().dialogs.connection = None;
+    h.step();
+    h.get_by_label("Save as Connection").click();
+    h.step();
+    let same_address: Vec<_> = h.state().session.connections.connections.iter().filter(|c| c.address == address).collect();
+    assert_eq!(same_address.len(), 2);
+    let saved = same_address.into_iter().find(|c| c.id != picked_id).unwrap();
+    let saved_id = saved.id.clone();
+    assert_eq!(saved.kind, "postgres");
+    assert_ne!(saved.name, "Picked DB");
+    assert_eq!(h.state().dialogs.connection.as_deref(), Some(saved_id.as_str()));
+    h.step();
+    assert!(h.query_by_label("Save as Connection").is_none());
+    h.state_mut().dialogs.connection = None;
+    h.state_mut().dialogs.listed = None;
+    h.step();
+    assert!(h.query_by_label("Save as Connection").is_none(), "an unlisted endpoint cannot be kept");
+}
+
+/// A blank name connects as "default"; once that endpoint is kept, the form shows it as the
+/// selected saved connection instead of offering to keep it again.
+#[test]
+fn s3_dialog_selects_the_kept_connection_after_a_blank_name_connect() {
+    let mut h = harness();
+    h.state_mut().run("ui.dialog", json!({"name":"s3"})).unwrap();
+    h.step();
+    h.step();
+    // Other tests may have live process-wide connections, so the section can start collapsed.
+    if h.query_by_role_and_label(egui::accesskit::Role::Button, "Connect").is_none() {
+        h.get_by_label("Connection").click();
+        h.run_steps(3);
+    }
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Connect").click();
+    h.step();
+    h.get_by_label("Save as Connection").click();
+    h.step();
+    h.step();
+    assert_eq!(h.state().session.connections.connections.len(), 1);
+    assert!(h.query_by_label("Save as Connection").is_none());
+    assert!(h.query_by_label("Rename it to save it: a connection has this name").is_none());
+    assert!(h.query_all_by_role(egui::accesskit::Role::ComboBox).any(|n| n.value().as_deref() == Some("default")));
+    rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::s3::disconnect("default");
+}
+
+/// A table list and the table chosen belong to the address they were listed for: editing the
+/// address by hand drops them, so Add never reads a table name against another database.
+#[test]
+fn add_database_drops_stale_tables_when_the_address_is_edited() {
+    use egui::accesskit::Role;
+    let mut h = harness();
+    let address = "postgres:host=db.example dbname=gis user=me";
+    h.state_mut().run("ui.dialog", json!({"name":"addDatabase"})).unwrap();
+    h.state_mut().dialogs.a = address.into();
+    h.state_mut().dialogs.list = vec!["public.parcels".into()];
+    h.state_mut().dialogs.c = "public.parcels".into();
+    h.state_mut().dialogs.listed = Some(address.into());
+    h.step();
+    h.step();
+    assert_eq!(h.state().dialogs.c, "public.parcels", "an unchanged address keeps its tables");
+    h.query_all_by_role(Role::TextInput).find(|n| n.value().as_deref() == Some(address)).unwrap().focus();
+    h.step();
+    h.key_press(egui::Key::End);
+    h.event(egui::Event::Text("x".into()));
+    h.step();
+    h.step();
+    assert_eq!(h.state().dialogs.a, format!("{address}x"));
+    assert!(h.state().dialogs.list.is_empty());
+    assert!(h.state().dialogs.c.is_empty());
+    assert_eq!(h.state().dialogs.listed, None);
+}
+
+/// A failed re-list can't leave the old tables behind: they would no longer be tied to an address
+/// the stale-listing check can see, and the table chosen could be sent to another database.
+#[test]
+fn add_database_failed_relist_drops_the_old_tables() {
+    let mut h = harness();
+    // Nothing listens on port 9 of the loopback address: listing is refused at once.
+    let address = "postgres:host=127.0.0.1 port=9 dbname=gis user=me";
+    h.state_mut().run("ui.dialog", json!({"name":"addDatabase"})).unwrap();
+    h.state_mut().dialogs.a = address.into();
+    h.state_mut().dialogs.list = vec!["public.parcels".into()];
+    h.state_mut().dialogs.c = "public.parcels".into();
+    h.state_mut().dialogs.listed = Some(address.into());
+    h.step();
+    h.step();
+    h.get_by_label("List Tables").click();
+    h.step();
+    h.step();
+    assert!(h.state().dialogs.error.is_some(), "the listing must have failed");
+    assert_eq!(h.state().dialogs.listed, None);
+    assert!(h.state().dialogs.list.is_empty());
+    assert!(h.state().dialogs.c.is_empty());
+}
+
+/// Collections belong to the API they were listed from: typing another address drops them.
+#[test]
+fn stac_dialog_drops_stale_collections_when_the_address_is_edited() {
+    use egui::accesskit::Role;
+    let mut h = harness();
+    let api = "https://one.example/stac/v1";
+    h.state_mut().run("ui.dialog", json!({"name":"stac"})).unwrap();
+    h.state_mut().ui.stac.api = api.into();
+    h.state_mut().ui.stac.collections = vec![("old-collection".into(), "Old".into())];
+    h.state_mut().ui.stac.collection = "old-collection".into();
+    h.step();
+    h.step();
+    h.query_all_by_role(Role::TextInput).find(|n| n.value().as_deref() == Some(api)).unwrap().focus();
+    h.step();
+    h.key_press(egui::Key::End);
+    h.event(egui::Event::Text("2".into()));
+    h.step();
+    h.step();
+    assert_eq!(h.state().ui.stac.api, format!("{api}2"));
+    assert!(h.state().ui.stac.collections.is_empty());
+    assert!(h.state().ui.stac.collection.is_empty(), "the collection picked belongs to the old API");
+}
+
+#[test]
+fn stac_dialog_keeps_and_picks_connections() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let body = br#"{"collections":[{"id":"c1","title":"C"}]}"#;
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 2048];
+        let _ = stream.read(&mut buf).unwrap();
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
+            .unwrap();
+        stream.write_all(body).unwrap();
+    });
+    let mut h = harness();
+    let api = format!("http://{addr}/stac");
+    h.state_mut().ui.stac.api = api.clone();
+    h.state_mut().run("ui.dialog", json!({"name":"stac"})).unwrap();
+    h.step();
+    h.get_by_label("Collections").click();
+    for _ in 0..100 {
+        h.step();
+        if !h.state().ui.stac.collections.is_empty() || h.state().ui.stac.error.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(h.state().ui.stac.error, None);
+    assert_eq!(h.state().ui.stac.collections, vec![("c1".to_string(), "C".to_string())]);
+    assert_eq!(h.state().ui.stac.listed, api);
+    assert!(h.state().session.connections.connections.is_empty(), "listing never saves automatically");
+    h.step();
+    h.get_by_label("Save as Connection").click();
+    h.step();
+    assert_eq!(h.state().session.connections.connections.len(), 1);
+    let saved = &h.state().session.connections.connections[0];
+    let saved_id = saved.id.clone();
+    assert_eq!(saved.kind, "stac");
+    assert_eq!(saved.address, api);
+    assert_eq!(h.state().ui.stac.connection.as_deref(), Some(saved_id.as_str()));
+    h.step();
+    assert!(h.query_by_label("Save as Connection").is_none());
+
+    h.state_mut().run("connection.edit", json!({"id":saved_id,"name":"Picked STAC"})).unwrap();
+    h.state_mut().ui.stac.api = "https://other.example/stac".into();
+    h.step();
+    h.query_all_by_role(egui::accesskit::Role::ComboBox).find(|n| n.value().as_deref() == Some("Other")).unwrap().click();
+    h.step();
+    // What it opened shows on the next frame.
+    h.step();
+    h.get_by_label("Picked STAC").click();
+    h.step();
+    assert_eq!(h.state().ui.stac.api, api);
+    assert!(h.state().ui.stac.collections.is_empty(), "the existing combo resets collections when picking a saved API");
+    assert_eq!(h.state().ui.stac.connection.as_deref(), Some(saved_id.as_str()));
+    server.join().unwrap();
+}
+
+#[test]
+fn connections_postgres_requires_an_address() {
+    use egui::accesskit::Role;
+    let mut h = harness();
+    for address in ["", " \t "] {
+        h.state_mut().run("ui.connection", json!({"kind":"postgres"})).unwrap();
+        h.state_mut().ui.connection.address = address.into();
+        h.step();
+        h.step();
+        h.get_by_role_and_label(Role::Button, "Save").click();
+        h.step();
+        assert_eq!(h.state().dialogs.open, Some("newConnection"));
+        assert!(h.state().dialogs.error.is_some());
+        assert!(h.state().session.connections.connections.is_empty());
+        h.get_by_role_and_label(Role::Button, "Test").click();
+        h.step();
+        assert!(h.state().dialogs.error.as_ref().unwrap().contains("isn't a postgres address"));
+        assert!(h.state().dialogs.info.is_none());
+        assert!(h.state().session.connections.connections.is_empty());
+    }
+    let address = "host=127.0.0.1 port=9 dbname=connection_form user=u";
+    h.state_mut().ui.connection.name = "Bare PostgreSQL".into();
+    h.state_mut().ui.connection.address = address.into();
+    h.step();
+    h.get_by_role_and_label(Role::Button, "Save").click();
+    h.step();
+    assert_eq!(h.state().dialogs.open, None);
+    let connection = h.state().session.connections.find("Bare PostgreSQL").unwrap();
+    let id = connection.id.clone();
+    assert_eq!(connection.address, format!("postgres:{address}"));
+    h.state_mut().run("ui.connection", json!({"id":id})).unwrap();
+    h.state_mut().ui.connection.address = "  ".into();
+    h.step();
+    h.step();
+    h.get_by_role_and_label(Role::Button, "Save").click();
+    h.step();
+    assert_eq!(h.state().dialogs.open, Some("editConnection"));
+    assert!(h.state().dialogs.error.is_some());
+    assert_eq!(h.state().session.connections.find(&id).unwrap().address, format!("postgres:{address}"));
+}
+
+#[test]
+fn connections_test_feedback_tracks_edited_inputs() {
+    use egui::accesskit::Role;
+    use std::io::{Read, Write};
+    use std::time::Duration;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = format!("http://{}/stac", listener.local_addr().unwrap());
+    let (started, requests) = std::sync::mpsc::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let bodies: [&[u8]; 3] =
+            [br#"{"collections":[{"id":"old","title":"Old"}]}"#, br#"{"collections":[{"id":"current","title":"Current"}]}"#, b"not JSON"];
+        for body in bodies {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0; 2048];
+            assert!(stream.read(&mut buf).unwrap() > 0, "the client must send a request before the response is released");
+            if started.send(()).is_err() || wait.recv_timeout(Duration::from_secs(5)).is_err() {
+                break;
+            }
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            stream.write_all(body).unwrap();
+        }
+    });
+    let mut h = harness();
+    h.state_mut().run("ui.connection", json!({"kind":"stac"})).unwrap();
+    h.state_mut().ui.connection.name = "Endpoint".into();
+    h.state_mut().ui.connection.address = address.clone();
+    h.step();
+    h.step();
+    h.get_by_role_and_label(Role::Button, "Test").click();
+    h.step();
+    requests.recv_timeout(Duration::from_secs(5)).unwrap();
+    let old = h.state().ui.connection.test.as_ref().unwrap().1.clone();
+    h.query_all_by_role(Role::TextInput).find(|n| n.value().as_deref() == Some(&address)).unwrap().focus();
+    h.step();
+    h.key_press(egui::Key::End);
+    h.event(egui::Event::Text("/changed".into()));
+    h.step();
+    assert_eq!(h.state().ui.connection.address, format!("{address}/changed"));
+    assert!(h.state().ui.connection.test.is_none(), "editing must discard the pending test");
+    assert_eq!(h.state().dialogs.info, None);
+    release.send(()).unwrap();
+    for _ in 0..250 {
+        h.step();
+        if old.lock().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(old.lock().unwrap().is_some(), "the discarded request must actually finish");
+    assert_eq!(h.state().dialogs.info, None);
+    assert_eq!(h.state().dialogs.error, None);
+
+    // A new test can run immediately; editing also clears its completed success or failure.
+    for succeeds in [true, false] {
+        h.get_by_role_and_label(Role::Button, "Test").click();
+        h.step();
+        requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        release.send(()).unwrap();
+        for _ in 0..250 {
+            h.step();
+            if h.state().ui.connection.test.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(h.state().ui.connection.test.is_none());
+        if succeeds {
+            assert!(h.state().dialogs.info.as_ref().unwrap().contains("1 collections"));
+            assert_eq!(h.state().dialogs.error, None);
+        } else {
+            assert!(h.state().dialogs.error.is_some());
+            assert_eq!(h.state().dialogs.info, None);
+        }
+        let name = h.state().ui.connection.name.clone();
+        h.query_all_by_role(Role::TextInput).find(|n| n.value().as_deref() == Some(&name)).unwrap().focus();
+        h.step();
+        h.key_press(egui::Key::End);
+        h.event(egui::Event::Text(" changed".into()));
+        h.step();
+        assert_eq!(h.state().ui.connection.name, format!("{name} changed"));
+        assert_eq!(h.state().dialogs.info, None);
+        assert_eq!(h.state().dialogs.error, None);
+    }
+    server.join().unwrap();
+    assert!(h.state().session.connections.connections.is_empty());
+}
+
+/// Expanding a connection lists its datasets, a click selects and Add Selected adds each as its
+/// own undo step, and Refresh forgets the list.
+#[test]
+fn connections_tree_browses_and_adds() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let body = format!(
+            r#"<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink"><Service><Title>Local</Title></Service><Capability><Request><GetMap><Format>image/png</Format><DCPType><HTTP><Get><OnlineResource xlink:href="http://{addr}/wms?"/></Get></HTTP></DCPType></GetMap></Request><Layer><CRS>EPSG:3857</CRS><Layer><Name>a</Name><Title>A</Title></Layer><Layer><Name>b</Name><Title>B</Title></Layer></Layer></Capability></WMS_Capabilities>"#
+        );
+        for stream in listener.incoming().take(1) {
+            let Ok(mut s) = stream else { continue };
+            let mut buf = [0u8; 2048];
+            let _ = s.read(&mut buf);
+            let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let _ = s.write_all(body.as_bytes());
+        }
+    });
+    // Frames 0.05 s apart, so two clicks fall within egui's double-click delay.
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1400.0, 860.0)).with_max_steps(64).with_step_dt(0.05).build_ui_state(
+        |ui, app: &mut RustGisApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        RustGisApp::with_sample(),
+    );
+    h.state_mut().run("connection.new", json!({"kind":"wms","address":format!("http://{addr}/wms"),"name":"Local"})).unwrap();
+    h.state_mut().run("ui.pane.sources", json!({})).unwrap();
+    h.step();
+    assert!(h.query_by_label("A").is_none(), "nothing is listed before the connection is opened");
+    h.get_by_label("Local").click();
+    for _ in 0..100 {
+        h.step();
+        if h.query_by_label("A").is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(h.query_by_label("A").is_some(), "the layers are listed under the connection");
+    let before = h.state().session.map().tiles.len();
+    h.get_by_label("A").click();
+    h.step();
+    h.get_by_label("B").click();
+    h.step();
+    assert_eq!(h.state().ui.connection_tree.picks.len(), 2);
+    // The selection is added from a dataset's menu: each layer is its own undo step.
+    h.get_by_label("B").click_secondary();
+    h.step();
+    h.step();
+    h.get_by_label("Add Selected (2)").click();
+    h.step();
+    h.step();
+    assert_eq!(h.state().session.map().tiles.len(), before + 2);
+    assert!(h.state().ui.connection_tree.picks.is_empty());
+    h.state_mut().run("edit.undo", json!(null)).unwrap();
+    // Each layer was its own step: one undo takes one layer.
+    assert_eq!(h.state().session.map().tiles.len(), before + 1);
+    h.state_mut().run("edit.undo", json!(null)).unwrap();
+    assert_eq!(h.state().session.map().tiles.len(), before);
+    // A double-click adds the one dataset, leaving nothing selected.
+    // (egui counts clicks in a row: let the earlier ones age out of its triple-click window first.)
+    for _ in 0..14 {
+        h.step();
+    }
+    h.get_by_label("A").click();
+    h.step();
+    h.get_by_label("A").click();
+    h.step();
+    h.step();
+    assert_eq!(h.state().session.map().tiles.len(), before + 1);
+    assert!(h.state().ui.connection_tree.picks.is_empty());
+    h.state_mut().run("edit.undo", json!(null)).unwrap();
+    assert_eq!(h.state().session.map().tiles.len(), before);
+    // Recent now lists the added layer under "Local" too, above the connection's own row.
+    h.query_all_by_label("Local").last().unwrap().click_secondary();
+    h.step();
+    // What it opened shows on the next frame.
+    h.step();
+    h.get_by_label("Refresh").click();
+    h.step();
+    h.step();
+    assert!(h.query_by_label("A").is_none(), "refreshing forgets the list until it is read again");
+}
+
 /// Save in the web app (issue #197): the browser has no save dialog, so the first Save and every
 /// Save As ask for the file name, and Save then downloads under it; an opened file keeps its name.
 #[test]
@@ -1455,7 +2641,10 @@ fn web_save_asks_for_the_file_name() {
     let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, Vec<u8>)>::new()));
     let log = got.clone();
     let services = rustgis_ui_egui::Services {
-        download: Some(Box::new(move |name: &str, bytes: Vec<u8>| log.lock().unwrap().push((name.to_string(), bytes)))),
+        download: Some(Box::new(move |name: &str, bytes: Vec<u8>| {
+            log.lock().unwrap().push((name.to_string(), bytes));
+            Ok(())
+        })),
         ..Default::default()
     };
     let app = RustGisApp::with_sample().with_services(services);
@@ -1489,7 +2678,7 @@ fn web_save_asks_for_the_file_name() {
     assert_eq!(h.state().dialogs.open, None);
     assert_eq!(names(&got), ["Trip plan.rgis"]);
     assert_eq!(h.state().session.project.name, "Trip plan");
-    assert!(!h.state().session.dirty);
+    assert!(!h.state().session.dirty());
     // Saved once: Save downloads under that name again without asking; Save As asks.
     h.state_mut().run("ui.save", json!(null)).unwrap();
     assert_eq!(h.state().dialogs.open, None);
@@ -1531,7 +2720,7 @@ fn save_project_dialog_needs_downloads() {
     h.step();
     assert!(h.state().dialogs.error.is_some());
     assert_eq!(h.state().session.project.name, "World Atlas");
-    assert!(h.state().session.dirty);
+    assert!(h.state().session.dirty());
 }
 
 #[test]
@@ -1878,6 +3067,8 @@ fn ogc_group_context_menus_refresh_all_or_one_child() {
     let before = server.requests().len();
     h.get_by_label("Places").click_secondary();
     h.step();
+    // What it opened shows on the next frame.
+    h.step();
     h.get_by_label("Refresh").click();
     wait_for_ogc(&mut h, |app| app.ui.service_import.is_none());
     assert!(serde_json::to_string(&h.state().session.map().layer(point).unwrap().dataset).unwrap().contains("New Place"));
@@ -1887,6 +3078,8 @@ fn ogc_group_context_menus_refresh_all_or_one_child() {
     }
     let before = server.requests().len();
     h.get_by_label("My OGC Layer").click_secondary();
+    h.step();
+    // What it opened shows on the next frame.
     h.step();
     h.get_by_label("Refresh").click();
     wait_for_ogc(&mut h, |app| app.ui.service_import.is_none());
@@ -2058,6 +3251,8 @@ fn a_run_opens_again_in_its_tool_from_the_history() {
     assert!(h.query_all_by_label_contains(" UTC").next().is_some(), "when it ran");
     h.get_by_role_and_label(egui::accesskit::Role::Button, "⋯").click_accesskit();
     h.step();
+    // What it opened shows on the next frame.
+    h.step();
     h.get_by_label("Open in Tool").click_accesskit();
     h.step();
     let app = h.state();
@@ -2146,6 +3341,8 @@ fn dynamic_text_is_a_menu_of_values_that_starts_the_text() {
     h.step();
     h.get_by_label("Dynamic Text").click_accesskit();
     h.step();
+    // What it opened shows on the next frame.
+    h.step();
     h.get_by_label("Map scale  {scale}").click_accesskit();
     h.step();
     assert_eq!(h.state().session.tool.code(), "graphicText");
@@ -2167,6 +3364,8 @@ fn dynamic_text_is_a_menu_of_values_that_starts_the_text() {
     // Another tool forgets the value.
     h.get_by_label("Dynamic Text").click_accesskit();
     h.step();
+    // What it opened shows on the next frame.
+    h.step();
     h.get_by_label("Current date  {date}").click_accesskit();
     h.step();
     assert_eq!(h.state().ui.dynamic_text, Some("{date}"));
@@ -2182,6 +3381,53 @@ fn dynamic_text_is_a_menu_of_values_that_starts_the_text() {
     // Choosing Text again by command (Command Search, a script) starts plain text.
     h.state_mut().run("tool.set", json!({"tool": "graphicText"})).unwrap();
     assert_eq!(h.state().ui.dynamic_text, None);
+}
+
+#[test]
+fn popup_titles_leave_room_for_controls() {
+    use egui::accesskit::Role;
+
+    for title in ["Oak".to_string(), "HIDDEN INTERSECTION Tab Sign (Oversized) ".repeat(4), "長い地物名".repeat(30)] {
+        for count in [1, 2] {
+            let mut h = harness();
+            h.ctx.set_missing_glyph_policy(egui::MissingGlyphPolicy::Tofu);
+            let features: Vec<_> = (0..count)
+                .map(|_| json!({"type": "Feature", "properties": {"name": title}, "geometry": {"type": "Point", "coordinates": [0, 0]}}))
+                .collect();
+            h.state_mut()
+                .run(
+                    "layer.addDataText",
+                    json!({
+                        "fileName": "popup.geojson",
+                        "name": "A layer with a name much longer than the popup header can hold",
+                        "text": json!({"type": "FeatureCollection", "features": features}).to_string()
+                    }),
+                )
+                .unwrap();
+            h.state_mut().run("map.zoomToExtent", json!({"extent": [-5, -4, 5, 4]})).unwrap();
+            h.ctx.data_mut(|d| d.insert_temp(egui::Id::unique("identify_popup_limit"), egui::vec2(240.0, 360.0)));
+            h.state_mut().run("ui.identify", json!({"lon": 0, "lat": 0})).unwrap();
+            h.run_steps(6);
+
+            let title_rect = h.query_all_by_label(&title).map(|n| n.rect()).min_by(|a, b| a.min.y.total_cmp(&b.min.y)).unwrap();
+            let close = h.get_by_role_and_label(Role::Button, "×").rect();
+            assert!(close.max.x <= title_rect.min.x - 12.0 + 240.0, "close must stay inside the popup");
+            assert!(title_rect.max.x < close.min.x, "title must leave room for close");
+            if count > 1 {
+                let previous = h.get_by_role_and_label(Role::Button, "‹").rect();
+                assert!(title_rect.max.x < previous.min.x, "title must leave room for all navigation controls");
+                h.get_by_role_and_label(Role::Button, "›").click();
+                h.run_steps(3);
+                assert_eq!(h.state().map.popup.as_ref().unwrap().index, 1);
+                h.get_by_role_and_label(Role::Button, "‹").click();
+                h.run_steps(3);
+                assert_eq!(h.state().map.popup.as_ref().unwrap().index, 0);
+            }
+            h.get_by_role_and_label(Role::Button, "×").click();
+            h.run_steps(3);
+            assert!(h.state().map.popup.is_none(), "close must remain clickable");
+        }
+    }
 }
 
 #[test]
@@ -2276,9 +3522,141 @@ fn help_shortcuts_lists_the_keymap() {
     h.step();
     h.state_mut().run("ui.shortcuts", json!(null)).unwrap();
     h.step();
-    let undo = if cfg!(target_os = "macos") { "⌘Z" } else { "Ctrl+Z" };
-    assert!(h.query_by_label(undo).is_some(), "Help › Shortcuts lists Undo's key");
+    // What it opened shows on the next frame.
+    h.step();
+    // Named by the OS egui reads (a browser's from its user agent), not the build's (#799): the
+    // harness tells Linux, whatever runs it.
+    assert!(h.query_by_label("Ctrl+Z").is_some(), "Help › Shortcuts lists Undo's key");
+    h.ctx.set_os(egui::os::OperatingSystem::Mac);
+    h.step();
+    assert!(h.query_by_label("⌘Z").is_some(), "with ⌘ on a Mac");
     assert!(h.query_by_label("Map Tool: Explore").is_some(), "and what Esc does");
+}
+
+#[test]
+fn geometry_calculator_switching_back_creates_a_unique_field() {
+    use rustgis_ui_egui::rustgis_engine::{
+        data::{Dataset, Field, FieldType, Geometry, GeometryType, Value},
+        geom::Coord,
+    };
+
+    let mut h = harness();
+    h.state_mut().run("ui.language", json!({"code": "en"})).unwrap();
+
+    let mut ds = Dataset::new("Geometry mode test", GeometryType::Point, vec![Field::new("x_deg", FieldType::Double)]);
+    ds.push(Some(Geometry::Point(Coord::new(117.0, 3.0))), vec![Value::Float(99.0)]);
+
+    let id = h.state_mut().session.map_mut().add_dataset(ds);
+    // Another layer is active: the dialog still calculates the table's layer.
+    let mut other = Dataset::new("Active layer", GeometryType::Point, vec![Field::new("x_deg", FieldType::Double)]);
+    other.push(Some(Geometry::Point(Coord::new(10.0, 3.0))), vec![Value::Float(5.0)]);
+    let other = h.state_mut().session.map_mut().add_dataset(other);
+    h.state_mut().session.active_layer = Some(other);
+    h.state_mut().run("ui.dialog", json!({"name": "calculateGeometry", "layer": id})).unwrap();
+    h.step();
+    h.step();
+
+    h.get_by_label("Existing field").click();
+    h.step();
+    h.step();
+
+    h.get_by_label("New field").click();
+    h.step();
+    h.step();
+
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Calculate").click();
+    h.step();
+    h.step();
+
+    assert!(h.state().dialogs.open.is_none(), "calculation should close the dialog");
+    let ds = &h.state().session.map().layer(id).unwrap().dataset;
+    let old = ds.field_index("x_deg").unwrap();
+    let new = ds.field_index("x_deg_2").expect("a unique field should be created");
+    assert_eq!(ds.value(0, old).as_f64(), Some(99.0));
+    assert_eq!(ds.value(0, new).as_f64(), Some(117.0));
+    let active = &h.state().session.map().layer(other).unwrap().dataset;
+    assert!(active.field_index("x_deg_2").is_none(), "the active layer is left alone");
+    assert_eq!(active.value(0, 0).as_f64(), Some(5.0));
+}
+
+#[test]
+fn unique_symbology_lets_the_user_choose_a_text_field_before_applying() {
+    use rustgis_ui_egui::rustgis_engine::data::{Dataset, Field, FieldType, Geometry, GeometryType, Value};
+    use rustgis_ui_egui::rustgis_engine::geom::Coord;
+
+    let mut h = harness();
+    let mut ds = Dataset::new(
+        "Text attributes",
+        GeometryType::Point,
+        vec![Field::new("id", FieldType::Integer), Field::new("category", FieldType::Text), Field::new("other", FieldType::Text)],
+    );
+    ds.push(Some(Geometry::Point(Coord::new(117.0, 3.0))), vec![Value::Int(1), Value::Text("village".into()), Value::Text("town".into())]);
+    let id = h.state_mut().session.map_mut().add_dataset(ds);
+    h.state_mut().session.active_layer = Some(id);
+    h.state_mut().run("ui.pane.symbology", json!(null)).unwrap();
+    h.step();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Unique Values").click();
+    h.step();
+    assert_eq!(h.state().ui.symbology_pending.as_ref().map(|pending| pending.field.as_str()), Some("category"));
+    h.get_by_role_and_label(egui::accesskit::Role::ComboBox, "Field").click();
+    h.step();
+    h.step(); // Combo popups enter the accessibility tree on the following frame.
+    h.get_by_label("other").click();
+    h.step();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Apply").click();
+    h.step();
+    let layer = h.state().session.map().layer(id).unwrap();
+    assert!(matches!(layer.renderer, rustgis_ui_egui::rustgis_engine::map::Renderer::Unique { ref field, .. } if field == "other"));
+    assert_eq!(h.state().ui.symbology_pending, None);
+}
+
+#[test]
+fn unique_symbology_pending_choice_follows_its_context() {
+    for change in ["map", "project", "renderer", "undo", "external renderer", "layer"] {
+        let mut h = harness();
+        h.state_mut().run("layer.select", json!({"layer": "Cities"})).unwrap();
+        h.state_mut().run("layer.symbology", json!({"type": "unique", "field": "name"})).unwrap();
+        h.state_mut().run("layer.symbology", json!({"type": "single"})).unwrap();
+        // A second map deliberately has the same layer IDs and renderer as the first.
+        let mut other = h.state().session.map().clone();
+        other.name = "Other map".into();
+        h.state_mut().session.project.maps.push(other);
+        h.state_mut().run("ui.pane.symbology", json!(null)).unwrap();
+        h.step();
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Unique Values").click();
+        h.step();
+        assert!(h.state().ui.symbology_pending.is_some());
+        // Failed commands leave the valid choice available for retry.
+        assert!(h.state_mut().run("layer.symbology", json!({"type": "unique", "field": "missing field"})).is_err());
+        assert!(h.state().ui.symbology_pending.is_some());
+        if change != "external renderer" {
+            h.state_mut().ui.close_right(rustgis_ui_egui::RightPane::Symbology);
+        }
+        match change {
+            "map" => {
+                h.state_mut().run("map.activate", json!({"name": "Other map"})).unwrap();
+            }
+            "project" => {
+                h.state_mut().run("project.sample", json!(null)).unwrap();
+            }
+            "renderer" => {
+                h.state_mut().run("layer.symbology", json!({"type": "unique", "field": "name"})).unwrap();
+            }
+            "undo" => {
+                h.state_mut().run("edit.undo", json!(null)).unwrap();
+            }
+            "external renderer" => {
+                // Commands from other clients can bypass RustGisApp::run.
+                h.state_mut().session.run("layer.symbology", &json!({"type": "unique", "field": "name"})).unwrap();
+                h.step();
+            }
+            "layer" => {
+                h.state_mut().run("layer.select", json!({"layer": "Countries"})).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(h.state().ui.symbology_pending.is_none(), "pending choice survived {change}");
+    }
 }
 
 #[test]
@@ -2312,4 +3690,61 @@ fn map_and_layout_tabs_rename_from_their_menus() {
     let p = &h.state().session.project;
     assert_eq!(p.maps[0].name, "Renamed Map");
     assert_eq!(p.layouts.last().map(|l| l.name.as_str()), Some("Renamed Layout"));
+}
+
+#[test]
+fn line_strokes_editor_edits_one_class() {
+    use rustgis_engine::map::symbology::ClassRef;
+    let mut h = harness();
+    let app = h.state_mut();
+    app.run("layer.select", json!({"layer": "Rivers"})).unwrap();
+    app.run("layer.symbology", json!({"layer": "Rivers", "type": "unique", "field": "scalerank"})).unwrap();
+    let pair = json!([{"color": "#000000", "width": 6}, {"color": "#FFFFFF", "width": 2}]);
+    app.run("layer.lineStrokes", json!({"layer": "Rivers", "value": "1", "strokes": pair})).unwrap();
+    app.run("ui.pane.symbology", json!({})).unwrap();
+    h.step();
+    h.step();
+    let class_strokes = |h: &egui_kittest::Harness<'_, RustGisApp>, c: &ClassRef| {
+        h.state().session.map().layer_by_name("Rivers").unwrap().renderer.class_strokes(c).unwrap().len()
+    };
+    // The layer's strokes first; class 1 is marked as having its own.
+    h.query_all_by_role(egui::accesskit::Role::ComboBox).find(|n| n.value().as_deref() == Some("All classes")).unwrap().click();
+    h.step();
+    // What it opened shows on the next frame.
+    h.step();
+    h.get_by_label("1 •").click_accesskit();
+    h.step();
+    h.step();
+    assert!(h.query_by_label("Stroke 2").is_some(), "class 1's two strokes are listed");
+    // Back to the layer's strokes: the class borrows them, and Add Stroke gives it its own again.
+    h.get_by_label("Use the Layer's Strokes").click_accesskit();
+    h.step();
+    h.step();
+    assert_eq!(class_strokes(&h, &ClassRef::Value("1".into())), 0);
+    assert!(h.query_by_label_contains("drawn with the layer's strokes").is_some());
+    h.get_by_label("Add Stroke").click_accesskit();
+    h.step();
+    h.step();
+    assert_eq!(class_strokes(&h, &ClassRef::Value("1".into())), 1);
+    assert!(h.state().session.map().layer_by_name("Rivers").unwrap().line_strokes.is_empty(), "the layer's own are untouched");
+}
+
+/// Out-of-range band input shows the raster's range and keeps calculation disabled.
+#[test]
+fn zonal_statistics_shows_available_band_range() {
+    use egui_kittest::kittest::NodeT;
+    use rustgis_engine::data::raster::{ColorHint, Crs, GeoTransform, Raster};
+    let mut h = harness();
+    let gt = GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 1.0, pixel_height: -1.0 };
+    let raster = Raster::new("dem", 1, 1, vec![vec![1.0]], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+    h.state_mut().session.map_mut().add_raster("dem", rustgis_engine::map::RasterLayer::from_path(raster, "dem.tif"));
+    h.state_mut().run("ui.pane.workflows", json!(null)).unwrap();
+    h.state_mut().workflow.section = "zonalStats";
+    h.state_mut().workflow.layer = "dem".into();
+    h.state_mut().workflow.layer2 = "Countries".into();
+    h.state_mut().workflow.zonal_stats.bands = "2".into();
+    h.run_steps(4);
+    assert!(h.query_by_label("Raster has bands 1 to 1.").is_some());
+    assert!(h.query_by_label("Band must be a positive integer, list of bands, or 'all'.").is_some());
+    assert!(h.get_by_label("Calculate Statistics").accesskit_node().is_disabled());
 }

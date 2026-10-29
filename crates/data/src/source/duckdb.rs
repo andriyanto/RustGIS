@@ -15,6 +15,7 @@
 
 use super::Family;
 use super::external::{self, TempFile, fnv1a, output, stamp, touch};
+use crate::secrets::Secret;
 use crate::{DataError, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -111,8 +112,10 @@ impl Database {
         match self {
             Database::File(p) => p.file_stem().and_then(|s| s.to_str()).unwrap_or("database").to_string(),
             Database::Postgres(d) => {
-                let get = |k: &str| d.split_whitespace().find_map(|kv| kv.strip_prefix(&format!("{k}=")).map(str::to_string));
-                get("dbname")
+                // Quoted values (`dbname='my gis'`) as libpq reads them.
+                super::pgconn::keyword_pairs(d)
+                    .into_iter()
+                    .find_map(|(k, v)| (k == "dbname").then_some(v))
                     .unwrap_or_else(|| d.rsplit('/').next().unwrap_or("postgres").split('?').next().unwrap_or("postgres").to_string())
             }
             Database::Mysql(a) => super::myconn::database_name(a).unwrap_or_else(|| "mysql".into()),
@@ -128,20 +131,112 @@ fn split_password(dsn: &str) -> (String, Option<String>) {
 
 pub use super::pgconn::public_label;
 
-fn passwords() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
-    static P: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> = std::sync::OnceLock::new();
-    P.get_or_init(Default::default)
+/// A password remembered for a connection's address. `connection_id` names the saved connection
+/// it was activated for (see [`set_connection_password`]); `None` is one typed for the address.
+struct Entry {
+    password: Secret,
+    connection_id: Option<String>,
 }
 
-/// Remembers a connection's password for this session (never saved: projects name connections
-/// without them, and libpq's `PGPASSWORD` or `~/.pgpass` serve when it isn't remembered).
+type Passwords = std::collections::HashMap<String, Entry>;
+
+static PASSWORDS: std::sync::LazyLock<std::sync::Mutex<Passwords>> = std::sync::LazyLock::new(Default::default);
+
+fn lock() -> std::sync::MutexGuard<'static, Passwords> {
+    PASSWORDS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Remembers a connection's password for this session, as typed for its address (the saved
+/// connections' own are activated by [`set_connection_password`]): projects name connections
+/// without them, and libpq's `PGPASSWORD` or `~/.pgpass` serve when it isn't remembered.
 pub fn remember_password(dsn: &str, password: &str) {
-    passwords().lock().unwrap_or_else(|e| e.into_inner()).insert(dsn.to_string(), password.to_string());
+    lock().insert(dsn.to_string(), Entry { password: Secret::new(password), connection_id: None });
+}
+
+/// Makes saved connection `id`'s password the one connections to `dsn` use (`Some`), replacing
+/// whatever was remembered for the address; or takes away a password a saved connection
+/// activated there, whichever one (`None`), leaving one typed for the address.
+pub fn set_connection_password(dsn: &str, id: &str, password: Option<&str>) {
+    let mut all = lock();
+    match password {
+        Some(p) => {
+            all.insert(dsn.to_string(), Entry { password: Secret::new(p), connection_id: Some(id.to_string()) });
+        }
+        None => {
+            if all.get(dsn).is_some_and(|e| e.connection_id.is_some()) {
+                all.remove(dsn);
+            }
+        }
+    }
+}
+
+/// Whether this driver's exact address slot is currently owned by saved connection `id`.
+/// Unlike runtime selection, this also accounts for a later explicitly typed address password.
+pub fn has_connection_password(dsn: &str, id: &str) -> bool {
+    lock().get(dsn).is_some_and(|entry| entry.connection_id.as_deref() == Some(id))
+}
+
+/// Tries an explicitly supplied password, restoring the previous address slot and its ownership
+/// when `refused` classifies the outcome as an authentication refusal. Other failures retain
+/// the new password. Never holds the cache lock during network I/O.
+pub fn try_connection_password<T>(dsn: &str, id: &str, password: &str, run: impl FnOnce() -> T, refused: impl FnOnce(&T) -> bool) -> T {
+    let previous = lock().insert(dsn.to_string(), Entry { password: Secret::new(password), connection_id: Some(id.to_string()) });
+    let result = run();
+    if refused(&result) {
+        let mut all = lock();
+        // A concurrent login or Forget supersedes this attempt, even if the server refused it.
+        if all.get(dsn).is_some_and(|entry| entry.connection_id.as_deref() == Some(id) && entry.password.expose() == password) {
+            if let Some(previous) = previous {
+                all.insert(dsn.to_string(), previous);
+            } else {
+                all.remove(dsn);
+            }
+        }
+    }
+    result
+}
+
+/// Takes away every password saved connection `id` activated.
+pub fn forget_connection_password(id: &str) {
+    lock().retain(|_, e| e.connection_id.as_deref() != Some(id));
+}
+
+/// Takes away every password a saved connection activated, leaving the typed ones.
+pub fn forget_connection_passwords() {
+    lock().retain(|_, e| e.connection_id.is_none());
 }
 
 /// The password remembered for a connection this session, if any.
 pub(crate) fn remembered_password(dsn: &str) -> Option<String> {
-    passwords().lock().unwrap_or_else(|e| e.into_inner()).get(dsn).cloned()
+    lock().get(dsn).map(|e| e.password.expose().to_string())
+}
+
+/// The password a database client's own environment variable gives for `kind` (`postgres`:
+/// `PGPASSWORD`, `mysql`: `MYSQL_PWD`, `sqlserver`: `SQLCMDPASSWORD`); an empty one is none. The
+/// one rule the drivers' explicit connections and the saved connections share, so an ambient
+/// password ranks the same wherever it is asked for.
+pub fn ambient_password(kind: &str) -> Option<String> {
+    ambient_password_in(kind, |name| std::env::var(name).ok())
+}
+
+fn ambient_password_in(kind: &str, get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let variable = match kind {
+        "postgres" => "PGPASSWORD",
+        "mysql" => "MYSQL_PWD",
+        "sqlserver" => "SQLCMDPASSWORD",
+        _ => return None,
+    };
+    get(variable).filter(|p| !p.is_empty())
+}
+
+/// Whether a password is remembered for a connection this session, typed or activated.
+pub fn has_password(dsn: &str) -> bool {
+    lock().contains_key(dsn)
+}
+
+/// Whether a password typed for this address (not one a saved connection activated) is remembered.
+pub fn has_explicit_password(dsn: &str) -> bool {
+    lock().get(dsn).is_some_and(|e| e.connection_id.is_none())
 }
 
 /// The remembered password of a query's database, handed to DuckDB's PostgreSQL client in its
@@ -149,7 +244,7 @@ pub(crate) fn remembered_password(dsn: &str) -> Option<String> {
 /// would show it.
 fn password(database: Option<&Database>) -> Option<String> {
     match database? {
-        Database::Postgres(dsn) => passwords().lock().unwrap_or_else(|e| e.into_inner()).get(dsn).cloned(),
+        Database::Postgres(dsn) => remembered_password(dsn),
         Database::File(_) | Database::Mysql(_) | Database::Sqlserver(_) => None,
     }
 }
@@ -176,7 +271,7 @@ pub fn available() -> bool {
 /// A live-only database named for a query: add its tables instead.
 fn live_not_here() -> DataError {
     DataError::Unsupported(
-        "SQL queries don't run on MySQL, MariaDB or SQL Server databases: add their tables with Add Data › Database…".into(),
+        "SQL queries don't run on MySQL, MariaDB or SQL Server databases: add their tables with Home › Add › Add Data › Database…".into(),
     )
 }
 
@@ -793,6 +888,72 @@ fn ours(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Each kind reads only its own client's variable, and an empty one is none (a fake
+    /// environment: the process's is never changed).
+    #[test]
+    fn ambient_password_follows_each_clients_variable() {
+        let env = |name: &str| match name {
+            "PGPASSWORD" => Some("pg-env".to_string()),
+            "MYSQL_PWD" => Some("my-env".to_string()),
+            "SQLCMDPASSWORD" => Some(String::new()),
+            _ => None,
+        };
+        assert_eq!(ambient_password_in("postgres", env).as_deref(), Some("pg-env"));
+        assert_eq!(ambient_password_in("mysql", env).as_deref(), Some("my-env"));
+        assert_eq!(ambient_password_in("sqlserver", env), None);
+        assert_eq!(ambient_password_in("s3", env), None);
+    }
+
+    #[test]
+    fn refused_password_does_not_restore_over_a_newer_login_or_forget() {
+        let dsn = "host=refused_password_newer_slot";
+        remember_password(dsn, "original");
+        try_connection_password(
+            dsn,
+            "refused-attempt",
+            "bad",
+            || {
+                remember_password(dsn, "newer");
+            },
+            |_| true,
+        );
+        assert_eq!(remembered_password(dsn).as_deref(), Some("newer"));
+        try_connection_password(
+            dsn,
+            "refused-attempt",
+            "bad",
+            || {
+                forget_connection_password("refused-attempt");
+            },
+            |_| true,
+        );
+        assert!(!has_password(dsn));
+    }
+
+    #[test]
+    fn remembered_database_cache_ownership_and_explicit_preservation() {
+        let a = "host=remembered_cache_a user=one";
+        let b = "mysql://remembered_cache_b/db";
+        set_connection_password(a, "cache-c1", Some("one"));
+        assert!(!has_explicit_password(a));
+        assert_eq!(remembered_password(a).as_deref(), Some("one"));
+        set_connection_password(a, "cache-c2", Some("two"));
+        forget_connection_password("cache-c1");
+        assert_eq!(remembered_password(a).as_deref(), Some("two"));
+        set_connection_password(a, "cache-c1", None);
+        assert!(!has_password(a));
+        remember_password(a, "explicit");
+        set_connection_password(a, "cache-c2", None);
+        assert!(has_explicit_password(a));
+        assert_eq!(remembered_password(a).as_deref(), Some("explicit"));
+        set_connection_password(b, "cache-c2", Some("owned"));
+        forget_connection_passwords();
+        assert!(!has_password(b));
+        assert_eq!(remembered_password(a).as_deref(), Some("explicit"));
+        assert_eq!(password(Some(&Database::Postgres(a.into()))).as_deref(), Some("explicit"));
+        lock().remove(a);
+    }
+
     #[test]
     fn databases_by_name() {
         // Quoted passwords with spaces, spaced `=`, escapes; an `@` past a URI's authority.
@@ -815,6 +976,9 @@ mod tests {
         assert_eq!(d, Database::Postgres("host=db.example dbname=gis user=me".into()));
         assert_eq!(d.label(), "postgres:host=db.example dbname=gis user=me");
         assert_eq!(d.short(), "gis");
+        // Quoted values (as `pg.connect` writes them) are named without their quotes, whole.
+        assert_eq!(Database::Postgres("host='h' dbname='my gis' user='o\\'neil'".into()).short(), "my gis");
+        assert_eq!(Database::Postgres("host='h' dbname='gis'".into()).short(), "gis");
         assert_eq!(password(Some(&d)).as_deref(), Some("pw1"));
         assert_eq!(Database::parse(&d.label()), d);
         let u = Database::parse("postgresql://me:pw2@db.example:5433/osm?sslmode=require");

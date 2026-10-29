@@ -1,7 +1,7 @@
 //! The Project backstage: start a project (blank or from the sample), open, save and export.
 
 use egui::{Align2, CornerRadius, Rect, Sense, Stroke, Ui, pos2, vec2};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::chrome::header_layout;
 use crate::theme::{BRAND, Tokens, regular, semibold};
@@ -93,6 +93,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
     });
 }
 
+/// Draws the project start choices; import cards dispatch commands without replacing the project.
 fn start(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     ui.horizontal(|ui| {
         let (r, _) = ui.allocate_exact_size(vec2(44.0, 44.0), Sense::hover());
@@ -107,17 +108,29 @@ fn start(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing = vec2(18.0, 0.0);
         if card(ui, t, "Map", "A blank map with a basemap", "new_map") {
-            let _ = app.run("project.new", Value::Null);
-            app.ui.backstage = false;
-            app.map.invalidate();
+            let _ = app.run_by_user("project.new", Value::Null);
+            if !crate::saveprompt::waiting(app) {
+                app.ui.backstage = false;
+                app.map.invalidate();
+            }
         }
         if card(ui, t, "World Atlas", "Countries, cities, rivers and lakes", "basemap") {
-            let _ = app.run("project.sample", Value::Null);
-            app.ui.backstage = false;
-            app.map.invalidate();
+            let _ = app.run_by_user("project.sample", Value::Null);
+            if !crate::saveprompt::waiting(app) {
+                app.ui.backstage = false;
+                app.map.invalidate();
+            }
         }
         if card(ui, t, "Open…", "Open a .rgis project", "open") {
             let _ = app.run("ui.open", Value::Null);
+        }
+        if card(ui, t, "GeoLibre Project…", "A .geolibre project as a map", "open") {
+            let _ = app.run("ui.openItem", json!({"kind": "geolibreProject"}));
+            app.ui.backstage = false;
+        }
+        if card(ui, t, "QGIS Project…", "A .qgs or .qgz project as a map", "open") {
+            let _ = app.run("ui.openItem", json!({"kind": "qgisProject"}));
+            app.ui.backstage = false;
         }
     });
     ui.add_space(28.0);
@@ -139,8 +152,10 @@ fn start(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     });
 }
 
+/// A project choice whose visible title is also its accessible button name.
 fn card(ui: &mut Ui, t: &Tokens, title: &str, sub: &str, icon: &str) -> bool {
     let (r, resp) = ui.allocate_exact_size(vec2(200.0, 160.0), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), tl!(title)));
     ui.painter().rect_filled(r, CornerRadius::same(10), if resp.hovered() { t.hover } else { t.pane });
     ui.painter().rect_stroke(
         r,
@@ -176,6 +191,7 @@ fn about(ui: &mut Ui, t: &Tokens) {
         regular(12.5),
         t.text_dim,
     );
+    crate::chrome::licence_links(ui);
 }
 
 #[cfg(test)]

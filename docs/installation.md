@@ -33,7 +33,7 @@ builds of the desktop app and `rustgis-cli`. The same files, grouped by platform
 | Linux x64 / arm64 (any distribution, no install) | `RustGIS-<version>-linux-x86_64.AppImage` / `RustGIS-<version>-linux-aarch64.AppImage` |
 | Linux x64 / arm64 (other) | `RustGIS-<version>-linux-x86_64.tar.gz` / `RustGIS-<version>-linux-aarch64.tar.gz` |
 
-On macOS the command line tool is a separate `rustgis-cli-<version>-macos-<arch>.tar.gz`;
+On macOS the command-line tool is a separate `rustgis-cli-<version>-macos-<arch>.tar.gz`;
 the other packages include it (the Windows installers and the MSIX add `rustgis-cli` to every
 new terminal). `SHA256SUMS` lists the checksum of every file.
 
@@ -44,19 +44,18 @@ only the parts that changed, with the `.zsync` file published beside each AppIma
 On Windows, `setup.exe` installs for your account in `%LOCALAPPDATA%\Programs\RustGIS` and needs
 no admin rights; the `.msi` installs for every user in `Program Files` and suits managed
 deployment (`msiexec /i RustGIS-<version>-windows-x86_64.msi /qn`). Both add a Start menu
-entry, open `.rgis` projects and uninstall from **Settings › Apps**.
+entry, open `.rgis` projects, list RustGIS under **Open with** for `.geojson`, and
+uninstall from **Settings › Apps**.
 
 The `.msix` is the package submitted to the Microsoft Store, which signs it. It is unsigned
 on the release page, so Windows only installs it from the
 [Store](https://apps.microsoft.com/detail/9ppjw8h561lq); outside the Store, download an installer
 or the portable zip instead.
 
-The macOS DMG and command line tool are signed with a Developer ID and notarized by Apple, so
-they open without a warning. From the release after 0.1.0, the notarization ticket is also
-stapled to RustGIS.app, so it opens even when the Mac cannot reach Apple's servers. If macOS
-says Apple could not verify RustGIS 0.1.0, connect to the internet and open it again, or run
-`xattr -dr com.apple.quarantine /Applications/RustGIS.app`. The Windows builds are not yet
-signed: choose **More info › Run anyway** if SmartScreen warns about an unknown publisher.
+The macOS app needs macOS 11 or later. It is signed and notarized by Apple, so it opens without a
+warning; the command-line tool is too, but macOS checks it online the first time it runs. The
+`setup.exe`, `.msi` and portable zip are not signed: if SmartScreen warns about an unknown
+publisher, choose **More info › Run anyway**.
 
 ## Package managers
 
@@ -66,7 +65,7 @@ RustGIS is also published to these package managers, which keep it up to date:
 | --- | --- |
 | Windows ([winget](https://learn.microsoft.com/windows/package-manager/)) | `winget install OpenGeos.RustGIS` |
 | macOS ([Homebrew](https://brew.sh)) | `brew install --cask opengeos/rustgis/rustgis` |
-| macOS and Linux, command line tool only (Homebrew) | `brew install opengeos/rustgis/rustgis-cli` |
+| macOS and Linux, command-line tool only (Homebrew) | `brew install opengeos/rustgis/rustgis-cli` |
 | Arch Linux ([AUR](https://aur.archlinux.org/packages/rustgis-bin)) | `yay -S rustgis-bin` (or any AUR helper) |
 | Fedora ([COPR](https://copr.fedorainfracloud.org/coprs/giswqs/rustgis/)) | `sudo dnf copr enable giswqs/rustgis && sudo dnf install rustgis` |
 
@@ -77,18 +76,20 @@ managers shortly after it is published (winget after Microsoft's review).
 
 ## From source
 
-RustGIS builds from source with a recent stable Rust toolchain (1.90 or later).
+RustGIS builds from source with a recent stable Rust toolchain (1.90 or later), a C compiler (for
+the bundled SQLite and the Zstandard decoder) and `curl` (to download the sample data).
 
 ```sh
 git clone https://github.com/opengeos/RustGIS.git
 cd RustGIS
 cargo run --release -p rustgis            # the desktop app
-cargo build --release -p rustgis-cli      # the command line tool
+cargo build --release -p rustgis-cli      # the command-line tool
 ```
 
-The build downloads the Natural Earth sample data (a few hundred KB) from
-[rustgis-assets](https://github.com/opengeos/rustgis-assets). To build offline, download the
-four files from `https://assets.rustgis.app/data/` once and point the build at them:
+The build downloads the Natural Earth sample data from
+[rustgis-assets](https://github.com/opengeos/rustgis-assets). To build offline, download
+`countries.geojson`, `countries_chn.geojson`, `cities.geojson`, `rivers.geojson` and
+`lakes.geojson` from `https://assets.rustgis.app/data/` once and point the build at them:
 
 ```sh
 RUSTGIS_DATA_DIR=/path/to/data cargo build --release
@@ -106,7 +107,7 @@ RUSTGIS_DATA_DIR=/path/to/data cargo build --release
 ## Web app
 
 RustGIS also runs in the browser, compiled to WebAssembly: open
-**[web.rustgis.app](https://web.rustgis.app)**. It is the same app with three differences:
+**[web.rustgis.app](https://web.rustgis.app)**. It is the same app, with these differences:
 
 - **Open** and **Add Data** use the browser's file picker, and you can drop files on the page.
   GeoJSON, CSV, GeoTIFF, ASCII grids, `.rgis` projects and the other formats in
@@ -116,7 +117,10 @@ RustGIS also runs in the browser, compiled to WebAssembly: open
   ask for the file name first; the browser decides which folder downloads go to (Firefox, for
   one, saves to its Downloads folder unless told to ask). A project opened from a file is named
   after it, and **Save** downloads it under that name again.
-- The interface uses the built-in font, because a web page can't read installed fonts.
+- The interface uses the built-in font, because a web page can't read installed fonts. Choosing
+  Chinese, Japanese, Korean or Persian downloads a font for that script.
+- Process plugins (including Python plugins), and the formats read through GDAL or DuckDB,
+  need the desktop app or `rustgis-cli`.
 
 The web app opens the way **Settings › Start-up** says (remembered in the browser). The URL can
 override that for one visit: add `?blank` to start with an empty project,
@@ -126,6 +130,9 @@ open on an area, `?lang=de` (or any language code) to pick the interface languag
 `?gpu=0`) to turn GPU Rendering on (off) for the visit, or `?webgl` to force
 WebGL2. Combine them with `&`, so a self-hosted build can link to
 `?blank&projection=EPSG:3010&extent=10.5,55,24.5,69.5`.
+
+`?registry=<address>` opens the Plugin Manager's Browse tab on another plugin registry for the
+visit; installing still asks first.
 
 Links can carry data too: `?data=<address>` adds a file by its web address (any format Add Data
 reads, downloaded in the background; repeat it for up to 16, and the map zooms to the first that
@@ -199,10 +206,64 @@ cargo xtask web-pwa ../../dist/web   # add the service worker (offline start), a
 The service worker is left out of `trunk serve`, so a development build is never served from a
 stale cache.
 
+### Self-host the web app with Docker
+
+A ready-made image of the web app, served by nginx, is published to the GitHub Container
+Registry for x86-64 and arm64, so you need only [Docker](https://docs.docker.com/get-docker/):
+
+```sh
+docker run --rm -p 8080:8080 ghcr.io/opengeos/rustgis   # http://localhost:8080
+```
+
+`latest` (also tagged `edge`) is the newest build of `main`; `0.5.0` or `0.5` is a given
+release (releases have images from 0.5.0 on).
+
+To build the image yourself, the `Dockerfile` at the root of the repository builds the web app
+the way the deploy does:
+
+```sh
+docker build -t rustgis .
+docker run --rm -p 8080:8080 rustgis
+```
+
+The image holds only the built files and runs nginx as a non-root user on port 8080. Its pages
+check for a newer build on every load, so the app's new-version notice offers the next image you
+deploy. Unlike web.rustgis.app, it carries no analytics. Put it behind a reverse proxy that
+serves HTTPS: browsers install the app and start its service worker only over HTTPS (or on
+`localhost`). The app's addresses are relative, so the proxy can also serve it under a path,
+such as `https://example.com/rustgis/`, passing requests on without the path. Signing in to
+ArcGIS from your copy needs an OAuth app of your own whose redirect URLs list the copy's
+`oauth-callback.html`, as RustGIS's own app accepts only web.rustgis.app's (see
+[Secured ArcGIS services](user-guide/data-formats.md#secured-arcgis-services)).
+
+The image is for the platform of the machine that builds it. To build it for another, such as
+on an Apple silicon Mac for an x86-64 server, add `--platform linux/amd64` to `docker build`.
+With a builder that can build several platforms (one made by `docker buildx create --use`, or
+Docker Desktop's containerd image store),
+`docker buildx build --platform linux/amd64,linux/arm64 -t <registry>/rustgis --push .`
+publishes one image for both. The app itself is WebAssembly, so it is compiled once, on the
+machine that builds it, whichever platforms the image is for.
+
+### The command line in Docker
+
+`ghcr.io/opengeos/rustgis-cli` holds the [command line](cli.md), `rustgis-cli`, on a slim Debian,
+for x86-64 and arm64, with the same tags. It runs in `/data`, so mount the folder to work on
+there:
+
+```sh
+docker run --rm -v "$PWD:/data" ghcr.io/opengeos/rustgis-cli info cities.geojson
+docker run --rm -v "$PWD:/data" ghcr.io/opengeos/rustgis-cli render cities.geojson map.png --basemap ocean
+```
+
+It runs as a user with ID 1000, the first user on most Linux systems, so the files it writes are
+yours; elsewhere, add `--user "$(id -u):$(id -g)" -e HOME=/tmp`. The optional GDAL, DuckDB and
+GeoLibre programs aren't in the image. To build it yourself:
+`docker build -f packaging/docker/cli.Dockerfile -t rustgis-cli .`
+
 ## Fonts
 
-RustGIS uses an installed sans-serif when it finds one (Segoe UI, San Francisco, Inter, Noto
-Sans, Open Sans or DejaVu Sans) and falls back to a built-in face. Set
+RustGIS uses an installed sans-serif when it finds one (Segoe UI, San Francisco, Arial, Inter,
+Noto Sans, Open Sans or DejaVu Sans) and falls back to a built-in face. Set
 `RUSTGIS_BUILTIN_FONTS=1` to always use the built-in face.
 
 ## Settings, data and cache folders
@@ -212,12 +273,12 @@ The desktop app and the command line keep their files in three folders:
 | Folder | Holds | Windows | macOS | Linux |
 | --- | --- | --- | --- | --- |
 | Settings | preferences (`prefs.json`), the crash log, AI Assistant sign-ins and skills | `%APPDATA%\RustGIS` | `~/Library/Application Support/RustGIS` | `$XDG_CONFIG_HOME/rustgis` (`~/.config/rustgis`) |
-| Data | installed plugins and the GeoLibre runner | `%LOCALAPPDATA%\RustGIS` | `~/Library/Application Support/RustGIS` | `$XDG_DATA_HOME/rustgis` (`~/.local/share/rustgis`) |
+| Data | installed plugins, the GeoLibre runner and recovery copies of unsaved work | `%LOCALAPPDATA%\RustGIS` | `~/Library/Application Support/RustGIS` | `$XDG_DATA_HOME/rustgis` (`~/.local/share/rustgis`) |
 | Cache | GDAL and DuckDB conversions | `%LOCALAPPDATA%\RustGIS\cache` | `~/Library/Caches/RustGIS` | `$XDG_CACHE_HOME/rustgis` (`~/.cache/rustgis`) |
 
 Set `RUSTGIS_CONFIG_DIR`, `RUSTGIS_APP_DATA_DIR` or `RUSTGIS_CACHE_DIR` to use another folder
 instead, for a portable install on a USB drive, for example. The folder is used as is, and RustGIS
-keeps the same files in it (`plugins/` and `geolibre/` in the data folder, `gdal/` and `duckdb/`
+keeps the same files in it (`plugins/`, `geolibre/` and `recovery/` in the data folder, `gdal/` and `duckdb/`
 in the cache folder). `RUSTGIS_PLUGINS_DIR`, `RUSTGIS_GDAL_CACHE` and `RUSTGIS_DUCKDB_CACHE` name
 the plugins folder and the GDAL and DuckDB caches themselves, ahead of these.
 
@@ -234,17 +295,22 @@ It holds the version, the operating system, the error message and where in RustG
 An error message can quote what RustGIS was working on, such as a file path or a layer name, so
 read the log first and remove anything you don't want to share.
 
+Unsaved work isn't lost with it: the next launch offers the copy autosave kept (see
+[Autosave and recovery](user-guide/workspace.md#autosave-and-recovery)).
+
 ## If the app doesn't start
 
 The desktop app draws its window with the graphics card through Direct3D 12 on Windows, Metal on
 macOS and Vulkan on Linux, with OpenGL as a fallback. A graphics driver that crashes there closes
 the app before it can open a window or write `crash.log`. Choose another graphics interface with
-`--backend`, from a terminal or in the target of a shortcut to `rustgis.exe`:
+`--backend` (`dx12`, `vulkan`, `gl` or `metal`, or several separated by commas), from a terminal
+or in the target of a shortcut to `rustgis.exe`:
 
 ```sh
 rustgis --backend gl       # OpenGL
 rustgis --backend dx12     # Direct3D 12 (Windows)
 rustgis --backend vulkan   # Vulkan
+rustgis --backend metal    # Metal (macOS)
 ```
 
 The `WGPU_BACKEND` environment variable takes the same names, for every launch. On Windows,

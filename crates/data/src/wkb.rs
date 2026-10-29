@@ -18,7 +18,7 @@ pub fn decode(bytes: &[u8]) -> Option<Geometry> {
 
 /// Encodes a geometry as ISO WKB (2D, little-endian).
 pub fn encode(g: &Geometry) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(wkb_size(g));
     let head = |out: &mut Vec<u8>, ty: u32| {
         out.push(1);
         out.extend_from_slice(&ty.to_le_bytes());
@@ -64,6 +64,69 @@ pub fn encode(g: &Geometry) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Encodes a geometry only when it fits a single-type ISO WKB column.
+pub fn encode_single(g: &Geometry) -> Option<Vec<u8>> {
+    let (ty, count) = match g {
+        Geometry::Point(_) => return Some(encode(g)),
+        Geometry::MultiPoint(v) if v.len() == 1 => return v.first().map(|c| encode(&Geometry::Point(*c))),
+        Geometry::Line(p) if p.len() == 1 => (2_u32, p.first()?.len()),
+        Geometry::Polygon(p) if p.len() == 1 => (3_u32, p.first()?.len()),
+        _ => return None,
+    };
+    let mut out = Vec::with_capacity(wkb_size(g).checked_sub(9)?);
+    out.push(1);
+    out.extend_from_slice(&ty.to_le_bytes());
+    out.extend_from_slice(&u32::try_from(count).ok()?.to_le_bytes());
+    match g {
+        Geometry::Line(p) => {
+            for c in p.first()? {
+                out.extend_from_slice(&c.x.to_le_bytes());
+                out.extend_from_slice(&c.y.to_le_bytes());
+            }
+        }
+        Geometry::Polygon(p) => {
+            for r in p.first()? {
+                out.extend_from_slice(&u32::try_from(r.len()).ok()?.to_le_bytes());
+                for c in r {
+                    out.extend_from_slice(&c.x.to_le_bytes());
+                    out.extend_from_slice(&c.y.to_le_bytes());
+                }
+            }
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
+/// Whether a WKB header carries Z or M dimensions.
+pub fn has_zm(bytes: &[u8]) -> bool {
+    let Some(raw) = bytes.get(1..5).and_then(|b| <[u8; 4]>::try_from(b).ok()) else { return false };
+    let ty = match bytes.first() {
+        Some(0) => u32::from_be_bytes(raw),
+        Some(1) => u32::from_le_bytes(raw),
+        _ => return false,
+    };
+    ty & 0xC000_0000 != 0 || (ty & 0x0FFF_FFFF) / 1000 > 0
+}
+
+/// Encoded width: 16 bytes per coordinate, 4 per count and 5 per geometry head.
+fn wkb_size(g: &Geometry) -> usize {
+    let ring = |r: &[Coord]| 4 + 16 * r.len();
+    match g {
+        Geometry::Point(_) => 5 + 16,
+        Geometry::MultiPoint(v) => 5 + 4 + v.len() * (5 + 16),
+        Geometry::Line(parts) => 5 + 4 + parts.iter().map(|p| 5 + ring(p)).sum::<usize>(),
+        Geometry::Polygon(polys) => 5 + 4 + polys.iter().map(|p| 5 + 4 + p.iter().map(|r| ring(r)).sum::<usize>()).sum::<usize>(),
+    }
+}
+
+/// One field of a coordinate chunk; `None` when the chunk is too short.
+#[inline]
+fn f64_at(ch: &[u8], off: usize, little: bool) -> Option<f64> {
+    let a: [u8; 8] = ch.get(off..off + 8)?.try_into().ok()?;
+    Some(if little { f64::from_le_bytes(a) } else { f64::from_be_bytes(a) })
 }
 
 struct Reader<'a> {
@@ -141,11 +204,16 @@ impl Reader<'_> {
 
     /// A coordinate sequence, and whether every coordinate is finite. `None` when malformed.
     fn coords(&mut self, h: Head) -> Option<(Vec<Coord>, bool)> {
-        let n = self.count(h, h.dims * 8)?;
+        let stride = h.dims * 8;
+        let n = self.count(h, stride)?;
+        let end = self.pos + n * stride;
+        let run = self.b.get(self.pos..end)?;
+        self.pos = end;
         let mut v = Vec::with_capacity(n);
         let mut finite = true;
-        for _ in 0..n {
-            let c = self.coord(h)?;
+        // The run is bounds-checked once; each chunk is exactly one coordinate.
+        for ch in run.chunks_exact(stride) {
+            let c = Coord::new(f64_at(ch, 0, h.little)?, f64_at(ch, 8, h.little)?);
             finite &= c.is_finite();
             v.push(c);
         }
@@ -209,7 +277,14 @@ impl Reader<'_> {
 
 /// Merges the members of a multi-geometry or collection into one geometry of the first member's
 /// kind; members of other kinds are dropped.
-fn merge(parts: Vec<Geometry>) -> Option<Geometry> {
+fn merge(mut parts: Vec<Geometry>) -> Option<Geometry> {
+    if parts.len() == 1 {
+        // A lone member needs no regrouping; a one-point multipoint still collapses.
+        return match parts.pop()? {
+            Geometry::MultiPoint(v) if v.len() == 1 => v.first().copied().map(Geometry::Point),
+            g => Some(g),
+        };
+    }
     let first = parts.first()?.kind();
     let mut points = Vec::new();
     let mut lines = Vec::new();
@@ -241,13 +316,55 @@ mod tests {
     }
 
     #[test]
+    fn single_columns_keep_their_type_and_reject_multiple_parts() {
+        let line = vec![Coord::new(0.0, 0.0), Coord::new(1.0, 1.0)];
+        for (g, ty) in [(Geometry::Point(Coord::new(2.0, 3.0)), 1_u32), (Geometry::Line(vec![line.clone()]), 2), (square(), 3)] {
+            let bytes = encode_single(&g).unwrap();
+            assert_eq!(bytes.get(1..5), Some(ty.to_le_bytes().as_slice()));
+            assert_eq!(decode(&bytes), Some(g));
+        }
+        let point = Coord::new(2.0, 3.0);
+        assert_eq!(encode_single(&Geometry::MultiPoint(vec![point])), Some(encode(&Geometry::Point(point))));
+        assert_eq!(encode_single(&Geometry::MultiPoint(vec![point, point])), None);
+        assert_eq!(encode_single(&Geometry::Line(vec![line.clone(), line])), None);
+        assert_eq!(encode_single(&Geometry::Polygon(vec![vec![], vec![]])), None);
+    }
+
+    #[test]
+    fn dimension_headers_detect_iso_and_ewkb_in_both_byte_orders() {
+        for (ty, expected) in
+            [(1_u32, false), (1002, true), (2003, true), (3001, true), (0x8000_0001, true), (0x4000_0001, true), (0x2000_0001, false)]
+        {
+            for little in [false, true] {
+                let mut bytes = vec![u8::from(little)];
+                bytes.extend_from_slice(&if little { ty.to_le_bytes() } else { ty.to_be_bytes() });
+                assert_eq!(has_zm(&bytes), expected);
+                for n in 0..5 {
+                    assert!(!has_zm(&bytes[..n]));
+                }
+            }
+        }
+        assert!(!has_zm(&[7, 255, 255, 255, 255]));
+    }
+
+    #[test]
     fn round_trips() {
         for g in [
             Geometry::Point(Coord::new(1.5, -2.0)),
             Geometry::MultiPoint(vec![Coord::new(1.0, 2.0), Coord::new(3.0, 4.0)]),
             Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(1.0, 1.0)]]),
+            Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(1.0, 1.0)], vec![Coord::new(2.0, 2.0), Coord::new(3.0, 3.0)]]),
             square(),
+            Geometry::Polygon(vec![vec![
+                vec![Coord::new(0.0, 0.0), Coord::new(9.0, 0.0), Coord::new(9.0, 9.0), Coord::new(0.0, 0.0)],
+                vec![Coord::new(1.0, 1.0), Coord::new(2.0, 1.0), Coord::new(2.0, 2.0), Coord::new(1.0, 1.0)],
+            ]]),
+            Geometry::Polygon(vec![
+                vec![vec![Coord::new(0.0, 0.0), Coord::new(1.0, 0.0), Coord::new(1.0, 1.0), Coord::new(0.0, 0.0)]],
+                vec![vec![Coord::new(5.0, 5.0), Coord::new(6.0, 5.0), Coord::new(6.0, 6.0), Coord::new(5.0, 5.0)]],
+            ]),
         ] {
+            assert_eq!(encode(&g).len(), wkb_size(&g));
             assert_eq!(decode(&encode(&g)), Some(g));
         }
     }

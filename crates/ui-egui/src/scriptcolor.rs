@@ -8,6 +8,7 @@ use std::ops::Range;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId, Stroke};
 use rustgis_engine::cmd::workflows::{MAX_SCRIPT_LINES, refused_in_script};
+use rustgis_engine::string_end;
 
 /// What a piece of a script is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,19 +123,13 @@ fn json_spans(text: &str, at: usize, broken: bool, out: &mut Vec<Span>) {
         let s = i;
         match c {
             b'"' => {
-                i += 1;
-                while let Some(&c) = b.get(i) {
-                    i += 1;
-                    match c {
-                        // The escaped char, whole: a multi-byte one isn't cut.
-                        b'\\' => i = next_char(text, i),
-                        b'"' => break,
-                        _ => {}
-                    }
-                }
+                // Past its closing quote, or to the end when nothing closes it.
+                i = text.get(i + 1..).and_then(string_end).map_or(text.len(), |n| i + n + 2);
                 // A key is a string with a colon after it.
                 let after = text.get(i..).map(str::trim_start);
-                let kind = if after.is_some_and(|a| a.starts_with(':')) { Kind::Key } else { Kind::Str };
+                // (A command's parameter description marks a key that may be left out with `?`:
+                // `"size"?: number`, `"layer"?,`. A script's JSON never has one there.)
+                let kind = if after.is_some_and(|a| a.starts_with(':') || a.starts_with('?')) { Kind::Key } else { Kind::Str };
                 push(s..i, kind, out);
             }
             b'-' | b'0'..=b'9' => {
@@ -170,11 +165,6 @@ fn json_spans(text: &str, at: usize, broken: bool, out: &mut Vec<Span>) {
     }
 }
 
-/// The byte after the char starting at `i` of `text` (its end when `i` is past it).
-fn next_char(text: &str, i: usize) -> usize {
-    text.get(i..).and_then(|t| t.chars().next()).map_or(text.len(), |c| i + c.len_utf8())
-}
-
 /// The colours of a script, one per kind. The theme's text, dimmed text and accent, and colours
 /// of the script's own for the rest: the theme's green and amber are made for icons and marks and
 /// read poorly as small text on the light theme's white, and comments are a colour of their own,
@@ -207,21 +197,44 @@ impl Palette {
 pub fn job(script: &str, unknown: &[String], palette: Palette, font: &FontId) -> LayoutJob {
     let mut job = LayoutJob::default();
     for s in spans(script, unknown) {
-        let color = match s.kind {
-            Kind::Plain | Kind::Key => palette.text,
-            Kind::Comment => palette.comment,
-            Kind::Punct | Kind::Unread => palette.dim,
-            Kind::Id => palette.id,
-            Kind::BadId => palette.bad,
-            Kind::Str => palette.string,
-            Kind::Num | Kind::Literal => palette.number,
-        };
-        // What won't run is underlined too, not told by its colour alone (WCAG 1.4.1).
-        let underline = if s.broken || s.kind == Kind::BadId { Stroke::new(1.0, palette.bad) } else { Stroke::NONE };
-        let format = TextFormat { font_id: font.clone(), color, underline, italics: s.kind == Kind::Comment, ..Default::default() };
-        job.append(script.get(s.range).unwrap_or_default(), 0.0, format);
+        append(&mut job, script, &s, palette, font);
     }
     job
+}
+
+/// A command's signature or one of its parameters, for the Script suggestions' help (#662),
+/// coloured as the script colours a command and its JSON, so the help reads as what's typed.
+/// `id` leads, in the id's colour, when given.
+pub fn help_job(id: Option<&str>, text: &str, palette: Palette, font: &FontId) -> LayoutJob {
+    let full = format!("{}{text}", id.unwrap_or_default());
+    let at = full.len() - text.len();
+    let mut spans = Vec::new();
+    if at > 0 {
+        spans.push(Span { range: 0..at, kind: Kind::Id, broken: false });
+    }
+    json_spans(text, at, false, &mut spans);
+    let mut job = LayoutJob::default();
+    for s in &spans {
+        append(&mut job, &full, s, palette, font);
+    }
+    job
+}
+
+/// `s` of `text` appended to `job` in its colour.
+fn append(job: &mut LayoutJob, text: &str, s: &Span, palette: Palette, font: &FontId) {
+    let color = match s.kind {
+        Kind::Plain | Kind::Key => palette.text,
+        Kind::Comment => palette.comment,
+        Kind::Punct | Kind::Unread => palette.dim,
+        Kind::Id => palette.id,
+        Kind::BadId => palette.bad,
+        Kind::Str => palette.string,
+        Kind::Num | Kind::Literal => palette.number,
+    };
+    // What won't run is underlined too, not told by its colour alone (WCAG 1.4.1).
+    let underline = if s.broken || s.kind == Kind::BadId { Stroke::new(1.0, palette.bad) } else { Stroke::NONE };
+    let format = TextFormat { font_id: font.clone(), color, underline, italics: s.kind == Kind::Comment, ..Default::default() };
+    job.append(text.get(s.range.clone()).unwrap_or_default(), 0.0, format);
 }
 
 /// Works out a script's colours once per change of the script (or theme, or of the ids no
@@ -242,7 +255,7 @@ pub type Cache = egui::cache::FrameCache<LayoutJob, Highlighter>;
 /// commands don't change while the app runs.
 pub fn unknown_ids_cached(ui: &egui::Ui, session: &rustgis_engine::Session, script: &str) -> std::sync::Arc<Vec<String>> {
     type Kept = (u64, u64, std::sync::Arc<Vec<String>>);
-    let key = egui::Id::new("script_unknown_ids");
+    let key = egui::Id::unique("script_unknown_ids");
     let (text, plugins) = (egui::util::hash(script), rustgis_engine::plugins::revision());
     if let Some((t, p, ids)) = ui.data(|d| d.get_temp::<Kept>(key))
         && (t, p) == (text, plugins)
@@ -509,13 +522,15 @@ mod tests {
         assert!(!underlined("map.zoomFull"), "a good id isn't");
     }
 
-    /// A run's results, however long, stay in view under the buttons, in a scroll of their own.
+    /// A run's results, however long, stay in view under the buttons, in a scroll of their own. The
+    /// line above them, the run and when it started, too.
     #[test]
     fn long_results_stay_in_view() {
         use egui_kittest::kittest::Queryable;
         let mut app = crate::RustGisApp::with_sample();
         app.workflow.script = "map.zoomFull\n".repeat(300);
         app.workflow.script_out = (0..12).map(|i| (format!("line {i}: {}", "a long error ".repeat(30)), true)).collect();
+        app.workflow.script_last = Some(crate::analysispane::ScriptRun { n: 1, secs: 0.5, at: 1_800_000_000 });
         let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(500.0, 700.0)).build_ui_state(
             |ui, app: &mut crate::RustGisApp| crate::analysispane::script_pane(app, ui, &crate::theme::Tokens::light()),
             app,
@@ -524,6 +539,22 @@ mod tests {
         assert!(h.get_by_label("Run").rect().max.y < 700.0);
         let first = h.get_by_label_contains("line 0:").rect();
         assert!(first.min.y < 700.0, "the first result shows: {first:?}");
+        let run = h.get_by_label_contains("Run #1 (").rect();
+        assert!(run.max.y < first.min.y, "the run above them");
+        // Scrolled down, the results move under the run's line, which stays where it was: it's
+        // not in their scroll.
+        h.event(egui::Event::PointerMoved(first.center()));
+        h.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -100_000.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+        });
+        // egui eases a wheel's scroll over frames, asking for a repaint until it's done.
+        h.run_steps(60);
+        assert!(h.get_by_label_contains("line 0:").rect().min.y < first.min.y, "the results scrolled");
+        assert_eq!(h.get_by_label_contains("Run #1 (").rect(), run, "the run's line didn't move");
     }
 
     /// The kept unknown ids follow the script: a change is read again, the same script isn't.
@@ -592,5 +623,23 @@ mod tests {
         h.get_by_role(egui::accesskit::Role::MultilineTextInput).type_text("z");
         h.run();
         assert!(h.state().workflow.script.contains('z'));
+    }
+
+    /// The help's signature and parameters take the script's colours: the id, keys (`?` marks
+    /// one that may be left out) and string values.
+    #[test]
+    fn help_reads_in_the_scripts_colours() {
+        let palette = super::Palette::of(&crate::theme::Tokens::light());
+        let font = egui::FontId::monospace(12.0);
+        // The colour where `piece` starts (egui joins neighbouring pieces of one format).
+        let colour = |job: &egui::text::LayoutJob, piece: &str| {
+            let at = job.text.find(piece)?;
+            job.sections.iter().find(|s| (s.byte_range.start.0..s.byte_range.end.0).contains(&at)).map(|s| s.format.color)
+        };
+        let sig = super::help_job(Some("map.body"), " {name?, basemap?}", palette, &font);
+        assert_eq!(colour(&sig, "map.body"), Some(palette.id));
+        let p = super::help_job(None, r#""name"?: "earth"|"moon" (map.bodies lists them)"#, palette, &font);
+        assert_eq!(colour(&p, r#""name""#), Some(palette.text), "a key, `?` and all");
+        assert_eq!(colour(&p, r#""moon""#), Some(palette.string));
     }
 }

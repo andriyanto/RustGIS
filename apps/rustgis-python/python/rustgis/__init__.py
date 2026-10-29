@@ -12,7 +12,8 @@ are shortcuts for the common ones, and ``Layer`` wraps one layer of the map.
 >>> s.save("atlas.rgis")
 
 In Jupyter, ``rustgis.Map`` shows the RustGIS app in the cell, in step with its session
-(``pip install "rustgis[jupyter]"``).
+(``pip install "rustgis[jupyter]"``); in a Qt application, ``rustgis.qt.MapWidget`` does
+(``pip install "rustgis[qt]"``).
 """
 
 from __future__ import annotations
@@ -157,7 +158,10 @@ class Layer:
                 (colours by class) or ``"proportional"`` (symbol sizes by value).
             field: The field the colours or sizes come from (not for ``"single"``).
             **params: More ``layer.symbology`` parameters: ``classes`` (1 to 12), ``method``
-                (``"naturalBreaks"``, ``"equalInterval"``, ``"quantile"``), ``ramp``.
+                (``"naturalBreaks"``, ``"equalInterval"``, ``"quantile"``,
+                ``"geometricInterval"``, ``"standardDeviation"``, ``"arithmeticProgression"``,
+                ``"headTailBreaks"``, ``"manual"``),
+                ``breaks`` (manual: the classes' upper bounds), ``ramp``.
 
         Returns:
             The layer, so calls can be chained.
@@ -587,6 +591,36 @@ class _Api:
             params["name"] = name
         return self.run("map.addTiles", url=url, **params)
 
+    def add_pmtiles(
+        self,
+        url: PathLike,
+        name: Optional[str] = None,
+        source_layers: Optional[List[str]] = None,
+        style: Optional[Union[List[Dict[str, Any]], str]] = None,
+        **params: Any,
+    ) -> Any:
+        """Adds a raster or vector PMTiles archive through ``map.addTiles``.
+
+        Args:
+            url: A web address or local file path. Local archives are not embedded in the
+                notebook app; use a web address accessible to the browser there.
+            name: The tile layer's name (the archive's file name when left out).
+            source_layers: Vector source-layer names for the default look; omitted for all.
+            style: An array of MapLibre style layers, or its JSON text. Each style layer's
+                source is the archive itself, and its ``source-layer`` chooses what it draws
+                instead of ``source_layers``. Omit for the default look.
+            **params: More ``map.addTiles`` parameters, e.g. ``opacity`` or ``attribution``.
+
+        Returns:
+            The tile layer's position, kind and name, as for :meth:`add_tiles`.
+        """
+        params["kind"] = "pmtiles"
+        if source_layers is not None:
+            params["layers"] = source_layers
+        if style is not None:
+            params["styleLayers"] = style
+        return self.add_tiles(os.fspath(url), name=name, **params)
+
     def remove_layer(self, layer: Union[str, int, Layer]) -> None:
         """Removes a layer from the map (``undo`` brings it back).
 
@@ -681,6 +715,12 @@ class Session(_Api):
         data: Files to add as layers (GeoJSON, CSV, Shapefile, GeoPackage, GeoParquet,
             FlatGeobuf, KML, GPX, GeoTIFF and more).
         plugins: Load the plugins installed for the desktop app first.
+        use_saved_secrets: Use the connections the desktop app saved, with the passwords and
+            keys it keeps in the system keychain (read only when a command needs one).
+            Parameters given to a command win. Off by default: nothing reads the keychain.
+            When the keychain can't be used the session goes on without the saved secret and
+            logs one ``WARNING`` to the ``rustgis`` logger; that diagnostic never raises or emits
+            a Python warning (a command that needed the secret still raises its own error).
 
     Example:
         >>> s = rustgis.Session(data=["parcels.gpkg"])
@@ -695,11 +735,12 @@ class Session(_Api):
         sample: bool = False,
         data: Optional[Union[PathLike, Iterable[PathLike]]] = None,
         plugins: bool = False,
+        use_saved_secrets: bool = False,
     ) -> None:
         """Starts a session, optionally opening a project, the sample and data files."""
         if plugins:
             load_plugins()
-        self._engine = _Engine()
+        self._engine = _Engine(use_saved_secrets)
         if sample:
             self.run("project.sample")
         if project is not None:

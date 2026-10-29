@@ -151,6 +151,7 @@ pub struct Conn {
 
 fn err(e: tiberius::error::Error) -> DataError {
     match e {
+        tiberius::error::Error::Server(t) if t.code() == 18456 => DataError::Login(t.message().to_string()),
         tiberius::error::Error::Server(t) => DataError::Format(t.message().to_string()),
         e => DataError::Format(e.to_string()),
     }
@@ -259,7 +260,7 @@ fn open_on(rt: &tokio::runtime::Runtime, config: &Config, password: Option<&str>
         .await
     })
     .map_err(|_| DataError::Format(format!("couldn't connect within {} s", config.connect_timeout.as_secs())))?
-    .map_err(err)
+    .map_err(|e| err(e).redact_secret(password.unwrap_or("")))
 }
 
 fn connect_blocking(config: &Config, password: Option<&str>) -> Result<(tokio::runtime::Runtime, Client, u32, String, u32)> {
@@ -299,7 +300,7 @@ impl Conn {
                     if broken(&e) {
                         *guard = None;
                     }
-                    return Err(err(e));
+                    return Err(err(e).redact_secret(self.password.as_deref().unwrap_or("")));
                 }
             }
         }
@@ -329,8 +330,8 @@ fn integrated_ok() -> &'static Mutex<HashSet<String>> {
 /// never SQLCMDPASSWORD or the Windows identity to an address not explicitly added this session.
 pub fn connect(address: &str, ask: bool) -> Result<Arc<Conn>> {
     let config = config(address)?;
-    let password = super::duckdb::remembered_password(address)
-        .or_else(|| if ask { std::env::var("SQLCMDPASSWORD").ok().filter(|p| !p.is_empty()) } else { None });
+    let password =
+        super::duckdb::remembered_password(address).or_else(|| if ask { super::duckdb::ambient_password("sqlserver") } else { None });
     let _ = auth_method(&config.login, password.as_deref())?;
     if config.login == Login::Integrated && !ask && !integrated_ok().lock().unwrap_or_else(|e| e.into_inner()).contains(address) {
         return Err(DataError::Format("signing in as the Windows user needs the database added this session".into()));
