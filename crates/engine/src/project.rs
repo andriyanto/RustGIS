@@ -229,6 +229,7 @@ impl From<TableFile> for Table {
                 crs: None,
                 crs_incomplete: false,
                 windowed: false,
+                zm: Default::default(),
             },
         }
     }

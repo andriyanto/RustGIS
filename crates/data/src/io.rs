@@ -618,6 +618,59 @@ pub fn geometry_from_geojson(g: &Json) -> Option<Geometry> {
     }
 }
 
+/// The heights (third coordinates) of a GeoJSON geometry that [`geometry_from_geojson`] reads,
+/// one per vertex in its order (NaN where a position has two numbers); `None` when it has none.
+pub fn geojson_heights(g: &Json) -> Option<Vec<f64>> {
+    fn walk(v: &Json, depth: usize, out: &mut Vec<f64>) {
+        let Some(a) = v.as_array() else { return };
+        if depth == 0 {
+            out.push(a.get(2).and_then(Json::as_f64).unwrap_or(f64::NAN));
+        } else {
+            a.iter().for_each(|x| walk(x, depth - 1, out));
+        }
+    }
+    let depth = match g.get("type")?.as_str()? {
+        "Point" => 0,
+        "MultiPoint" | "LineString" => 1,
+        "MultiLineString" | "Polygon" => 2,
+        "MultiPolygon" => 3,
+        "GeometryCollection" => {
+            let first = g.get("geometries")?.as_array()?.iter().find(|m| geometry_from_geojson(m).is_some())?;
+            return geojson_heights(first);
+        }
+        _ => return None,
+    };
+    let mut z = Vec::new();
+    walk(g.get("coordinates")?, depth, &mut z);
+    z.iter().any(|v| !v.is_nan()).then_some(z)
+}
+
+/// [`geometry_to_geojson`] with heights, one per vertex in `for_each_coord` order: a vertex with
+/// one gets a third coordinate.
+pub fn geometry_to_geojson_z(g: &Geometry, z: Option<&[f64]>) -> Json {
+    let Some(z) = z.filter(|z| z.len() == g.coord_count()) else { return geometry_to_geojson(g) };
+    let mut k = 0usize;
+    let mut c = |c: &Coord| {
+        let h = z.get(k).copied().unwrap_or(f64::NAN);
+        k += 1;
+        if h.is_nan() { json!([c.x, c.y]) } else { json!([c.x, c.y, h]) }
+    };
+    let mut l = |v: &[Coord]| Json::Array(v.iter().map(&mut c).collect());
+    match g {
+        Geometry::Point(p) => json!({"type": "Point", "coordinates": c(p)}),
+        Geometry::MultiPoint(v) => json!({"type": "MultiPoint", "coordinates": l(v)}),
+        Geometry::Line(parts) if let [only] = parts.as_slice() => json!({"type": "LineString", "coordinates": l(only)}),
+        Geometry::Line(parts) => json!({"type": "MultiLineString", "coordinates": parts.iter().map(|p| l(p)).collect::<Vec<_>>()}),
+        Geometry::Polygon(polys) if let [only] = polys.as_slice() => {
+            json!({"type": "Polygon", "coordinates": only.iter().map(|r| l(r)).collect::<Vec<_>>()})
+        }
+        Geometry::Polygon(polys) => json!({"type": "MultiPolygon", "coordinates": polys
+            .iter()
+            .map(|rings| rings.iter().map(|r| l(r)).collect::<Vec<_>>())
+            .collect::<Vec<_>>()}),
+    }
+}
+
 pub fn geometry_to_geojson(g: &Geometry) -> Json {
     fn c(c: &Coord) -> Json {
         json!([c.x, c.y])
@@ -899,8 +952,9 @@ pub(crate) fn geojson_geometry(f: &Json) -> std::result::Result<Option<Geometry>
 #[derive(Default)]
 struct Collector {
     schema: Schema,
-    /// Each feature's geometry and its values by field, typed once every feature is in.
-    features: Vec<(Option<Geometry>, Vec<(usize, Value)>)>,
+    /// Each feature's geometry, its heights and its values by field, typed once every feature is
+    /// in.
+    features: Vec<(Option<Geometry>, Option<Vec<f64>>, Vec<(usize, Value)>)>,
     skipped: usize,
 }
 
@@ -924,7 +978,10 @@ impl Collector {
         // Every feature's properties count in the schema, those with unreadable geometry too.
         let attrs: Vec<(usize, Value)> = props.into_iter().flatten().map(|(k, v)| (self.schema.see(k, v), Value::from_json(v))).collect();
         match geojson_geometry(f) {
-            Ok(geom) => self.features.push((geom, attrs)),
+            Ok(geom) => {
+                let z = geom.as_ref().and_then(|_| f.get("geometry")).and_then(geojson_heights);
+                self.features.push((geom, z, attrs));
+            }
             Err(()) => self.skipped += 1,
         }
     }
@@ -939,7 +996,7 @@ impl Collector {
         }
         let declared = declared_crs(root, &mut report.messages);
         let mut unconverted = 0usize;
-        for (n, (geom, values)) in self.features.into_iter().enumerate() {
+        for (n, (geom, z, values)) in self.features.into_iter().enumerate() {
             // A feature that can't be converted is dropped, and its id is not reused, as when the
             // file is read in place.
             let geom = match (&declared, geom) {
@@ -958,7 +1015,13 @@ impl Collector {
                     *slot = coerce(v, field.ty);
                 }
             }
-            ds.features.push(crate::Feature { id: n as u64 + 1, geometry: geom, attrs });
+            let id = n as u64 + 1;
+            if let Some(zm) = z.map(|z| crate::VertexZm { z: Some(z), m: None })
+                && zm.fits(geom.as_ref().map_or(0, Geometry::coord_count))
+            {
+                ds.zm.insert(id, zm);
+            }
+            ds.features.push(crate::Feature { id, geometry: geom, attrs });
         }
         ds.geometry_type = dominant_type(&ds);
         if let Some((crs, _)) = &declared {
@@ -1054,7 +1117,8 @@ pub fn to_geojson(ds: &Dataset) -> Json {
             for (field, v) in ds.fields.iter().zip(&f.attrs) {
                 props.insert(field.name.clone(), v.to_json());
             }
-            json!({"type": "Feature", "id": f.id, "properties": props, "geometry": f.geometry.as_ref().map(geometry_to_geojson)})
+            let z = ds.zm_of(f).and_then(|zm| zm.z.as_deref());
+            json!({"type": "Feature", "id": f.id, "properties": props, "geometry": f.geometry.as_ref().map(|g| geometry_to_geojson_z(g, z))})
         })
         .collect();
     json!({"type": "FeatureCollection", "name": ds.name, "features": features})
@@ -1750,24 +1814,52 @@ fn read_shapefile_parts(parts: ShapefileParts, name: &str, crs: Option<Crs>) -> 
             report.skipped += 1;
             continue;
         };
+        // Heights and measures, per vertex in the order the geometry is built (rings and parts
+        // as stored); M below SHP's no-data value is none (NaN).
+        let (mut zs, mut ms): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
+        let mval = |m: f64| if m <= shapefile::NO_DATA { f64::NAN } else { m };
         let geom = match shape {
             Shape::NullShape => None,
             Shape::Point(p) => Some(Geometry::Point(pt(p.x, p.y))),
-            Shape::PointM(p) => Some(Geometry::Point(pt(p.x, p.y))),
-            Shape::PointZ(p) => Some(Geometry::Point(pt(p.x, p.y))),
+            Shape::PointM(p) => {
+                ms.push(mval(p.m));
+                Some(Geometry::Point(pt(p.x, p.y)))
+            }
+            Shape::PointZ(p) => {
+                zs.push(p.z);
+                ms.push(mval(p.m));
+                Some(Geometry::Point(pt(p.x, p.y)))
+            }
             Shape::Multipoint(m) => Some(Geometry::MultiPoint(m.points().iter().map(|p| pt(p.x, p.y)).collect())),
-            Shape::MultipointM(m) => Some(Geometry::MultiPoint(m.points().iter().map(|p| pt(p.x, p.y)).collect())),
-            Shape::MultipointZ(m) => Some(Geometry::MultiPoint(m.points().iter().map(|p| pt(p.x, p.y)).collect())),
+            Shape::MultipointM(m) => {
+                ms.extend(m.points().iter().map(|p| mval(p.m)));
+                Some(Geometry::MultiPoint(m.points().iter().map(|p| pt(p.x, p.y)).collect()))
+            }
+            Shape::MultipointZ(m) => {
+                zs.extend(m.points().iter().map(|p| p.z));
+                ms.extend(m.points().iter().map(|p| mval(p.m)));
+                Some(Geometry::MultiPoint(m.points().iter().map(|p| pt(p.x, p.y)).collect()))
+            }
             Shape::Polyline(l) => Some(Geometry::Line(l.parts().iter().map(|p| p.iter().map(|q| pt(q.x, q.y)).collect()).collect())),
-            Shape::PolylineM(l) => Some(Geometry::Line(l.parts().iter().map(|p| p.iter().map(|q| pt(q.x, q.y)).collect()).collect())),
-            Shape::PolylineZ(l) => Some(Geometry::Line(l.parts().iter().map(|p| p.iter().map(|q| pt(q.x, q.y)).collect()).collect())),
+            Shape::PolylineM(l) => {
+                ms.extend(l.parts().iter().flatten().map(|q| mval(q.m)));
+                Some(Geometry::Line(l.parts().iter().map(|p| p.iter().map(|q| pt(q.x, q.y)).collect()).collect()))
+            }
+            Shape::PolylineZ(l) => {
+                zs.extend(l.parts().iter().flatten().map(|q| q.z));
+                ms.extend(l.parts().iter().flatten().map(|q| mval(q.m)));
+                Some(Geometry::Line(l.parts().iter().map(|p| p.iter().map(|q| pt(q.x, q.y)).collect()).collect()))
+            }
             Shape::Polygon(p) => {
                 Some(group_rings(p.rings().iter().map(|r| (r.points().iter().map(|q| pt(q.x, q.y)).collect(), is_outer(r))).collect()))
             }
             Shape::PolygonM(p) => {
+                ms.extend(p.rings().iter().flat_map(|r| r.points().iter().map(|q| mval(q.m))));
                 Some(group_rings(p.rings().iter().map(|r| (r.points().iter().map(|q| pt(q.x, q.y)).collect(), is_outer(r))).collect()))
             }
             Shape::PolygonZ(p) => {
+                zs.extend(p.rings().iter().flat_map(|r| r.points().iter().map(|q| q.z)));
+                ms.extend(p.rings().iter().flat_map(|r| r.points().iter().map(|q| mval(q.m))));
                 Some(group_rings(p.rings().iter().map(|r| (r.points().iter().map(|q| pt(q.x, q.y)).collect(), is_outer(r))).collect()))
             }
             Shape::Multipatch(_) => {
@@ -1775,6 +1867,8 @@ fn read_shapefile_parts(parts: ShapefileParts, name: &str, crs: Option<Crs>) -> 
                 continue;
             }
         };
+        let n = geom.as_ref().map_or(0, Geometry::coord_count);
+        let zm = crate::VertexZm::from_values(if zs.len() == n { zs } else { Vec::new() }, if ms.len() == n { ms } else { Vec::new() });
         if source_kind == GeometryType::None
             && let Some(g) = &geom
         {
@@ -1807,7 +1901,7 @@ fn read_shapefile_parts(parts: ShapefileParts, name: &str, crs: Option<Crs>) -> 
                 _ => Value::Null,
             })
             .collect();
-        ds.push_next(geom, attrs);
+        ds.push_next_zm(geom, attrs, zm);
     }
     ds.geometry_type = dominant_type(&ds);
     // A bad .prj must not turn a spatial layer into an attribute-only table and hide the
@@ -1999,61 +2093,29 @@ pub fn shapefile_parts_in(ds: &Dataset, crs: Crs) -> Result<(Vec<(&'static str, 
         rec
     };
 
-    let pt = |c: &Coord| shapefile::Point::new(c.x, c.y);
-    let finite = |c: &&Coord| c.x.is_finite() && c.y.is_finite();
     let (mut shp, mut shx, mut dbf) = (Cursor::new(Vec::new()), Cursor::new(Vec::new()), Cursor::new(Vec::new()));
     let mut left_out = 0;
     let mut written = 0;
+    // With heights the shapes are written as Z shapes (a vertex without one at 0, as GDAL does),
+    // with measures alone as M shapes; M without a value is SHP's no-data.
+    let (has_z, has_m) = (ds.has_z(), ds.has_m());
     {
         let shapes = shapefile::ShapeWriter::with_shx(&mut shp, &mut shx);
         let mut w = shapefile::Writer::new(shapes, table.build_with_dest(&mut dbf));
         let multi_points = ds.features.iter().any(|f| matches!(f.geometry, Some(Geometry::MultiPoint(_))));
+        let nan_or = |v: Option<&Vec<f64>>, k: usize, none: f64| v.and_then(|v| v.get(k)).copied().filter(|x| !x.is_nan()).unwrap_or(none);
         for f in &ds.features {
-            let ok = match (&f.geometry, ds.geometry_type) {
-                (Some(Geometry::Point(c)), GeometryType::Point) if !multi_points && finite(&c) => {
-                    w.write_shape_and_record(&pt(c), &record(f)).map_err(fmt)?;
-                    true
-                }
-                (Some(g @ (Geometry::Point(_) | Geometry::MultiPoint(_))), GeometryType::Point) => {
-                    let mut pts = Vec::new();
-                    g.for_each_coord(|c| pts.push(c));
-                    let pts: Vec<shapefile::Point> = pts.iter().filter(finite).map(pt).collect();
-                    if pts.is_empty() {
-                        false
-                    } else {
-                        w.write_shape_and_record(&shapefile::Multipoint::new(pts), &record(f)).map_err(fmt)?;
-                        true
-                    }
-                }
-                (Some(Geometry::Line(parts)), GeometryType::Polyline) => {
-                    let parts: Vec<Vec<shapefile::Point>> =
-                        parts.iter().map(|p| p.iter().filter(finite).map(pt).collect::<Vec<_>>()).filter(|p| p.len() >= 2).collect();
-                    if parts.is_empty() {
-                        false
-                    } else {
-                        w.write_shape_and_record(&shapefile::Polyline::with_parts(parts), &record(f)).map_err(fmt)?;
-                        true
-                    }
-                }
-                (Some(Geometry::Polygon(polys)), GeometryType::Polygon) => {
-                    let mut rings = Vec::new();
-                    for poly in polys {
-                        let mut it = poly.iter().map(|r| r.iter().filter(finite).map(pt).collect::<Vec<_>>()).filter(|r| r.len() >= 3);
-                        // A polygon whose outer ring is gone loses its holes too.
-                        let outer_kept = poly.first().is_some_and(|r| r.iter().filter(finite).count() >= 3);
-                        if let Some(outer) = it.next().filter(|_| outer_kept) {
-                            rings.push(shapefile::PolygonRing::Outer(outer));
-                            rings.extend(it.map(shapefile::PolygonRing::Inner));
-                        }
-                    }
-                    if rings.is_empty() {
-                        false
-                    } else {
-                        w.write_shape_and_record(&shapefile::Polygon::with_rings(rings), &record(f)).map_err(fmt)?;
-                        true
-                    }
-                }
-                _ => false,
+            let zm = ds.zm_of(f);
+            let (z, m) = (zm.and_then(|zm| zm.z.as_ref()), zm.and_then(|zm| zm.m.as_ref()));
+            let ok = if has_z {
+                let mk = |c: &Coord, k: usize| shapefile::PointZ::new(c.x, c.y, nan_or(z, k, 0.0), nan_or(m, k, shapefile::NO_DATA));
+                write_shp_feature(&mut w, f, ds.geometry_type, multi_points, &record(f), mk).map_err(fmt)?
+            } else if has_m {
+                let mk = |c: &Coord, k: usize| shapefile::PointM::new(c.x, c.y, nan_or(m, k, shapefile::NO_DATA));
+                write_shp_feature(&mut w, f, ds.geometry_type, multi_points, &record(f), mk).map_err(fmt)?
+            } else {
+                let mk = |c: &Coord, _: usize| shapefile::Point::new(c.x, c.y);
+                write_shp_feature(&mut w, f, ds.geometry_type, multi_points, &record(f), mk).map_err(fmt)?
             };
             if ok {
                 written += 1;
@@ -2071,6 +2133,92 @@ pub fn shapefile_parts_in(ds: &Dataset, crs: Crs) -> Result<(Vec<(&'static str, 
     parts.extend(prj.map(|p| ("prj", p.into_bytes())));
     parts.push(("cpg", b"UTF-8".to_vec()));
     Ok((parts, left_out))
+}
+
+/// Writes one feature as a Shapefile shape of point type `P`, made by `mk` from a vertex and its
+/// place among the feature's vertices (for its height and measure). Vertices that aren't finite
+/// are left out, parts left too short with them. `false` when nothing of it could be written.
+fn write_shp_feature<P, T, R>(
+    w: &mut shapefile::Writer<T>,
+    f: &crate::Feature,
+    kind: GeometryType,
+    multi_points: bool,
+    record: &R,
+    mk: impl Fn(&Coord, usize) -> P,
+) -> std::result::Result<bool, shapefile::Error>
+where
+    P: Copy + PartialEq + shapefile::record::traits::HasXY,
+    T: std::io::Write + std::io::Seek,
+    R: shapefile::dbase::WritableRecord,
+    P: shapefile::record::EsriShape,
+    shapefile::record::multipoint::GenericMultipoint<P>: shapefile::record::EsriShape,
+    shapefile::record::polyline::GenericPolyline<P>: shapefile::record::EsriShape,
+    shapefile::record::polygon::GenericPolygon<P>: shapefile::record::EsriShape,
+    P: shapefile::record::traits::ShrinkablePoint + shapefile::record::traits::GrowablePoint,
+{
+    let finite = |c: &Coord| c.x.is_finite() && c.y.is_finite();
+    // Every vertex numbered in `for_each_coord` order, the finite ones made into points.
+    let mut k = 0usize;
+    let mut run = |r: &[Coord]| -> Vec<P> {
+        let out = r.iter().enumerate().filter(|(_, c)| finite(c)).map(|(i, c)| mk(c, k + i)).collect();
+        k += r.len();
+        out
+    };
+    Ok(match (&f.geometry, kind) {
+        (Some(Geometry::Point(c)), GeometryType::Point) if !multi_points && finite(c) => {
+            w.write_shape_and_record(&run(std::slice::from_ref(c))[0], record)?;
+            true
+        }
+        (Some(Geometry::Point(c)), GeometryType::Point) => {
+            let pts = run(std::slice::from_ref(c));
+            !pts.is_empty() && {
+                w.write_shape_and_record(&shapefile::record::multipoint::GenericMultipoint::new(pts), record)?;
+                true
+            }
+        }
+        (Some(Geometry::MultiPoint(v)), GeometryType::Point) => {
+            let pts = run(v);
+            !pts.is_empty() && {
+                w.write_shape_and_record(&shapefile::record::multipoint::GenericMultipoint::new(pts), record)?;
+                true
+            }
+        }
+        (Some(Geometry::Line(parts)), GeometryType::Polyline) => {
+            let parts: Vec<Vec<P>> = parts.iter().map(|p| run(p)).filter(|p| p.len() >= 2).collect();
+            !parts.is_empty() && {
+                w.write_shape_and_record(&shapefile::record::polyline::GenericPolyline::with_parts(parts), record)?;
+                true
+            }
+        }
+        (Some(Geometry::Polygon(polys)), GeometryType::Polygon) => {
+            let mut rings = Vec::new();
+            for poly in polys {
+                let mut kept: Vec<Vec<P>> = poly.iter().map(|r| run(r)).collect();
+                // A ring closed in x and y is closed: its last point takes the first's height and
+                // measure, or the writer would close it again with one more point.
+                for r in &mut kept {
+                    if let Some(&first) = r.first()
+                        && let Some(last) = r.last_mut()
+                        && first.x() == last.x()
+                        && first.y() == last.y()
+                    {
+                        *last = first;
+                    }
+                }
+                // A polygon whose outer ring is gone loses its holes too.
+                if kept.first().is_some_and(|r| r.len() >= 3) {
+                    let outer = kept.remove(0);
+                    rings.push(shapefile::PolygonRing::Outer(outer));
+                    rings.extend(kept.into_iter().filter(|r| r.len() >= 3).map(shapefile::PolygonRing::Inner));
+                }
+            }
+            !rings.is_empty() && {
+                w.write_shape_and_record(&shapefile::record::polygon::GenericPolygon::with_rings(rings), record)?;
+                true
+            }
+        }
+        _ => false,
+    })
 }
 
 fn is_outer<P>(r: &shapefile::PolygonRing<P>) -> bool {

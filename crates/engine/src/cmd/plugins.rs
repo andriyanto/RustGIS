@@ -480,6 +480,7 @@ impl Bridge<'_> {
             crs: None,
             crs_incomplete: false,
             windowed: false,
+            zm: l.dataset.zm.clone(),
         };
         let mut gj = rustgis_data::io::to_geojson(&ds);
         // The row of each feature, for selecting or editing it afterwards.

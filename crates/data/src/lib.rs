@@ -271,13 +271,46 @@ pub struct Dataset {
     /// so they aren't saved: the source is read again instead.
     #[serde(skip)]
     pub windowed: bool,
+    /// Heights and measures of the features' vertices, by feature id ([`VertexZm`]). The geometry
+    /// itself is 2D; a file with Z or M (a Shapefile PointZ or PolylineZ, GeoJSON with a third
+    /// coordinate) keeps them here, and writing it back writes them.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub zm: std::collections::BTreeMap<u64, VertexZm>,
+}
+
+/// A feature's heights (Z) and measures (M), one per vertex in the order
+/// [`Geometry::for_each_coord`] visits them; NaN where a vertex has none. Kept beside the 2D
+/// geometry: an entry whose length no longer matches the feature's vertices (a tool or an edit
+/// changed them) is ignored, so a height is never given to the wrong vertex.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct VertexZm {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub z: Option<Vec<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub m: Option<Vec<f64>>,
+}
+
+impl VertexZm {
+    /// Whether it fits a geometry of `n` vertices (and holds anything).
+    pub fn fits(&self, n: usize) -> bool {
+        (self.z.is_some() || self.m.is_some())
+            && self.z.as_ref().is_none_or(|z| z.len() == n)
+            && self.m.as_ref().is_none_or(|m| m.len() == n)
+    }
+
+    /// From per-vertex values, `None` when every one is missing (NaN) in both.
+    pub fn from_values(z: Vec<f64>, m: Vec<f64>) -> Option<VertexZm> {
+        let z = z.iter().any(|v| !v.is_nan()).then_some(z);
+        let m = m.iter().any(|v| !v.is_nan()).then_some(m);
+        (z.is_some() || m.is_some()).then_some(VertexZm { z, m })
+    }
 }
 
 impl Serialize for Dataset {
     /// Saves CRS recovery state with the dataset, but omits disposable streamed rows.
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("Dataset", 7)?;
+        let mut st = s.serialize_struct("Dataset", 8)?;
         st.serialize_field("name", &self.name)?;
         st.serialize_field("geometry_type", &self.geometry_type)?;
         st.serialize_field("fields", &self.fields)?;
@@ -293,6 +326,11 @@ impl Serialize for Dataset {
             st.serialize_field("crs_incomplete", &true)?;
         } else {
             st.skip_field("crs_incomplete")?;
+        }
+        if self.zm.is_empty() || self.windowed {
+            st.skip_field("zm")?;
+        } else {
+            st.serialize_field("zm", &self.zm)?;
         }
         st.end()
     }
@@ -317,7 +355,34 @@ impl Dataset {
             crs: None,
             crs_incomplete: false,
             windowed: false,
+            zm: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// The heights and measures of `f`'s vertices, when it has them and they still fit its
+    /// geometry.
+    pub fn zm_of(&self, f: &Feature) -> Option<&VertexZm> {
+        let zm = self.zm.get(&f.id)?;
+        zm.fits(f.geometry.as_ref().map_or(0, Geometry::coord_count)).then_some(zm)
+    }
+
+    /// Whether any feature has heights (Z), or measures (M), that fit it.
+    pub fn has_z(&self) -> bool {
+        !self.zm.is_empty() && self.features.iter().any(|f| self.zm_of(f).is_some_and(|zm| zm.z.is_some()))
+    }
+
+    pub fn has_m(&self) -> bool {
+        !self.zm.is_empty() && self.features.iter().any(|f| self.zm_of(f).is_some_and(|zm| zm.m.is_some()))
+    }
+
+    /// Drops the heights and measures that no longer fit their feature, or whose feature is gone.
+    pub fn prune_zm(&mut self) {
+        if self.zm.is_empty() {
+            return;
+        }
+        let keep: std::collections::BTreeMap<u64, VertexZm> =
+            self.features.iter().filter_map(|f| self.zm_of(f).map(|zm| (f.id, zm.clone()))).collect();
+        self.zm = keep;
     }
 
     /// Index of a field by case-insensitive name.
@@ -348,6 +413,17 @@ impl Dataset {
         attrs.resize(self.fields.len(), Value::Null);
         let id = self.features.last().map(|f| f.id.saturating_add(1)).unwrap_or(1);
         self.features.push(Feature { id, geometry, attrs });
+    }
+
+    /// [`Dataset::push_next`] with the feature's heights and measures, kept when they fit it.
+    pub fn push_next_zm(&mut self, geometry: Option<Geometry>, attrs: Vec<Value>, zm: Option<VertexZm>) {
+        let n = geometry.as_ref().map_or(0, Geometry::coord_count);
+        self.push_next(geometry, attrs);
+        if let (Some(zm), Some(f)) = (zm, self.features.last())
+            && zm.fits(n)
+        {
+            self.zm.insert(f.id, zm);
+        }
     }
 
     /// Adds a field (if missing) and returns its index.
