@@ -21,6 +21,8 @@ log = { workspace = true }
 web-time = { workspace = true }
 base64 = { workspace = true }
 rustgis-plugins = { workspace = true }
+rustgis-swat-model = { workspace = true }
+rustgis-swat-txtinout = { workspace = true }
 # The system's time zone and locales, to pick the worldview of the built-in countries.
 iana-time-zone = { version = "0.1", features = ["fallback"] }
 sys-locale = { version = "0.3", features = ["js"] }
@@ -33,6 +35,7 @@ geolibre = ["dep:rustgis-geolibre"]
 [dev-dependencies]
 # Writing sample GeoPackages.
 rusqlite = { workspace = true }
+tempfile = "3"
 rustgis-plugins = { workspace = true, features = ["testing"] }
 tiny-skia = { workspace = true }
 

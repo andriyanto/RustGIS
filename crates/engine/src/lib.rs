@@ -672,6 +672,8 @@ pub struct Session {
     /// one succeeds) through this. Python leaves it unset: a run there holds the interpreter's
     /// lock and can't be interrupted, so it keeps the Script pane's bounds.
     pub long_runs: Option<fn(&str, f64)>,
+    /// The SWAT+ project open beside the map (`swat.*`), not part of the map project.
+    pub swat: Option<Box<cmd::swat::SwatState>>,
 }
 
 /// The most `layer.addUrl` requests kept for the front end at a time.
@@ -857,6 +859,7 @@ impl Session {
             queue_gp_files: false,
             request_only: false,
             plugin_retries: Vec::new(),
+            swat: None,
             retry_tries: 0,
             quiet_failure: false,
             #[cfg(not(target_arch = "wasm32"))]

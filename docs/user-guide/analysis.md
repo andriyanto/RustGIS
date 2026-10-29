@@ -902,3 +902,21 @@ and reporting the accuracy on held-back pixels. Trained models stay in the proje
 Share As › Deep Learning** saves one as a package to apply in other projects. **Analyze › Create
 Hosted Imagery** cuts a raster into XYZ web map tiles (PNG, transparent outside the raster) with
 a TileJSON file and a viewer page.
+
+## SWAT+ models
+
+A SWAT+ model's TxtInOut folder opens beside the map with `swat.open` (Analyze › SWAT+), for
+people, scripts and the AI assistant to look at and change through commands. It isn't part of the
+map project and isn't saved with it.
+
+| Command | What it does |
+| --- | --- |
+| `swat.open` | Reads `file.cio`, the files it names, and those they name (weather and recall files). `"confidential": true` makes every answer counts and statistics only, never a record's name or value; only the user can lift it (`swat.confidential`). |
+| `swat.summary`, `swat.check` | The simulated period, the number of each kind of object, the files and what is missing; values outside `cal_parms.cal`'s calibration ranges (listed, not faults: a project's own values, the SWAT+ Editor's defaults among them, can be outside them). |
+| `swat.find`, `swat.get` | Columns found by part of their name, with each one's range; a column's values, narrowed by record names (`match`, with `*` and `?`) or by another column (`where`). |
+| `swat.set` | Changes the matching records: `replace`, `add` or `multiply` by (1 + value), as SWAT-CUP's `v__`, `a__` and `r__`. A number keeps its decimals and the file its columns; a value outside `cal_parms.cal`'s range is refused unless `force`. |
+| `swat.diff`, `swat.revert` | What changed since the project was opened; undoing all of it, a file's or a column's. |
+| `swat.save` | Writes the changed files over the folder it came from, or the whole project to another folder (`path`). Every other byte is as it was read. |
+
+The model is run by [swatplus-rust](https://github.com/andriyanto/swatplus-rust), the SWAT+ engine
+in Rust; running it from RustGIS and reading its output tables are next.
