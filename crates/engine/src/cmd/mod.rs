@@ -35,6 +35,7 @@ pub mod portals;
 pub mod presentation;
 pub mod project;
 pub mod qgis;
+pub mod rain;
 pub mod raster;
 pub mod repair;
 pub mod report;
@@ -118,6 +119,7 @@ pub fn all() -> Vec<CommandSpec> {
     v.extend(nldi::commands());
     v.extend(time::commands());
     v.extend(swat::commands());
+    v.extend(rain::commands());
     v
 }
 

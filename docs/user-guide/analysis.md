@@ -920,3 +920,17 @@ map project and isn't saved with it.
 
 The model is run by [swatplus-rust](https://github.com/andriyanto/swatplus-rust), the SWAT+ engine
 in Rust; running it from RustGIS and reading its output tables are next.
+
+## Rain grids
+
+Commands for rain grids such as JAXA's GSMaP (Analyze › Rain), for people, scripts and the AI
+assistant:
+
+| Command | What it does |
+| --- | --- |
+| `rain.style` | Draws a rain grid in BMKG's intensity classes. Hourly (mm/h, the default for a rain rate): ringan 1–5, sedang 5–10, lebat 10–20, sangat lebat over 20. Daily (mm, the default for 24 hours or more): ringan 0.5–20, sedang 20–50, lebat 50–100, sangat lebat 100–150, ekstrem over 150. Less than the lightest class isn't drawn. `"scale": "custom"` with `breaks` sets classes of one's own. |
+| `rain.accumulate` | Adds up hourly rain grids on one grid into the rain over the period (mm), as a new layer. A grid whose name gives its start time (as GSMaP layers' do) counts for the time to the next one, so GSMaP_NOW's half-hourly files, each an hour's mean rate, count half an hour each instead of twice; gaps are reported. A cell missing in any grid is missing, unless `ignoreMissing`. |
+| `rain.zonal` | Each zone's mean rain from each grid (zones such as a SWAT+ model's subbasins), as a table: zone, layer, time, mean, units and coverage. Each cell counts by the share of it inside the zone (sampled 8 × 8), since a GSMaP cell (about 11 km) is larger than many subbasins; a zone smaller than every sample takes the cell under its middle. |
+
+The hourly thresholds are the ones BMKG's forecasts commonly use; check them against BMKG's own
+definitions for formal work, or give your own `breaks`.
