@@ -43,9 +43,11 @@ concurrency:
 jobs:
   publish:
     if: >-
+      github.repository == 'opengeos/RustGIS' && (
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.actor.login != 'dependabot[bot]'
+      )
     runs-on: ubuntu-latest
     env:
       HAS_KEY: ${{ secrets.PREVIEW_DEPLOY_KEY != '' }}

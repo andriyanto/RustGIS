@@ -138,6 +138,7 @@ jobs:
     # not need a fresh (paid) review anyway. Skipping here shows the run as
     # skipped instead of failed; a maintainer can still `/claude-review`.
     if: >
+      github.repository == 'opengeos/RustGIS' && (
       (github.event_name == 'pull_request_target' &&
         github.event.action != 'labeled' &&
         github.event.sender.type != 'Bot' &&
@@ -157,6 +158,7 @@ jobs:
         github.event.sender.type != 'Bot' &&
         github.event.pull_request.state == 'open' &&
         github.event.label.name == 'claude-review')
+      )
 
     runs-on: ubuntu-latest
     timeout-minutes: 30

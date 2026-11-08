@@ -16,7 +16,7 @@ concurrency:
 jobs:
   plan:
     name: Platforms
-    if: startsWith(github.event.label.name, 'ci:')
+    if: github.repository == 'opengeos/RustGIS' && (startsWith(github.event.label.name, 'ci:'))
     runs-on: ubuntu-latest
     outputs:
       os: ${{ steps.os.outputs.os }}
@@ -33,7 +33,7 @@ jobs:
 
   rust:
     needs: plan
-    if: needs.plan.outputs.os != '[]'
+    if: github.repository == 'opengeos/RustGIS' && (needs.plan.outputs.os != '[]')
     uses: ./.github/workflows/test-rust.yml
     with:
       os: ${{ needs.plan.outputs.os }}
@@ -41,7 +41,7 @@ jobs:
 
   python:
     needs: plan
-    if: needs.plan.outputs.os != '[]'
+    if: github.repository == 'opengeos/RustGIS' && (needs.plan.outputs.os != '[]')
     uses: ./.github/workflows/test-python.yml
     with:
       os: ${{ needs.plan.outputs.os }}
