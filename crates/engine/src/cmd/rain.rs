@@ -54,7 +54,7 @@ fn colours_for(n: usize) -> Vec<Rgba> {
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("rain.style", "Rain Intensity Classes", WHERE, style).params(
+        C::new("rain.style", "Rain Intensity Classes", WHERE, style).when(super::raster::need_raster).params(
             r#"{"layer"?, "scale"?: "hourly" (mm/h, default for a rain rate) | "daily" (mm a day, default for 24 h or more) | "custom", "breaks"?: [numbers] (custom: the lightest class's lower bound, then each class's upper bound), "band"?: 1..} — draws a rain grid in BMKG's intensity classes: hourly ringan 1–5, sedang 5–10, lebat 10–20, sangat lebat over 20 mm/h; daily ringan 0.5–20, sedang 20–50, lebat 50–100, sangat lebat 100–150, ekstrem over 150 mm; less is not drawn"#,
         ),
         C::new("rain.accumulate", "Accumulate Rain", WHERE, accumulate).params(
