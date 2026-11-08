@@ -16,6 +16,7 @@ concurrency:
 
 jobs:
   build:
+    if: github.repository == 'opengeos/RustGIS'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -51,6 +52,7 @@ jobs:
           path: ./site
 
   deploy:
+    if: github.repository == 'opengeos/RustGIS'
     needs: build
     runs-on: ubuntu-latest
     environment:

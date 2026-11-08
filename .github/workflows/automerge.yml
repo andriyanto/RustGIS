@@ -23,7 +23,7 @@ concurrency:
 jobs:
   enable:
     name: Enable auto-merge
-    if: github.event.action == 'labeled' && github.event.label.name == 'automerge'
+    if: github.repository == 'opengeos/RustGIS' && (github.event.action == 'labeled' && github.event.label.name == 'automerge')
     runs-on: ubuntu-latest
     steps:
       - env:
@@ -57,8 +57,10 @@ jobs:
   revoke:
     name: Revoke auto-merge
     if: >-
+      github.repository == 'opengeos/RustGIS' && (
       (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'automerge'))
       || (github.event.action == 'unlabeled' && github.event.label.name == 'automerge')
+      )
     runs-on: ubuntu-latest
     steps:
       - env:

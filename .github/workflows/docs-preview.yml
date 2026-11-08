@@ -28,8 +28,10 @@ concurrency:
 jobs:
   build:
     if: >-
+      github.repository == 'opengeos/RustGIS' && (
       github.event.action != 'closed' &&
       (github.event.action != 'labeled' || github.event.label.name == 'preview')
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -76,7 +78,7 @@ jobs:
   # The publishing workflow reads the pull request's number from here and checks it against the
   # GitHub API (a fork's run can't be trusted to name its own pull request).
   pr-number:
-    if: github.event.action != 'labeled' || github.event.label.name == 'preview'
+    if: github.repository == 'opengeos/RustGIS' && (github.event.action != 'labeled' || github.event.label.name == 'preview')
     runs-on: ubuntu-latest
     steps:
       - name: Record the pull request number

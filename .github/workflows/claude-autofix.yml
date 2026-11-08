@@ -72,9 +72,11 @@ jobs:
     timeout-minutes: 10
     # sender.type: a bot adding the label would make an automatic loop out of a paid, pushing job.
     if: >-
+      github.repository == 'opengeos/RustGIS' && (
       github.event.label.name == 'claude-autofix' &&
       github.event.sender.type != 'Bot' &&
       github.event.pull_request.state == 'open'
+      )
     runs-on: ubuntu-latest
     outputs:
       login: ${{ steps.who.outputs.login }}
@@ -132,6 +134,7 @@ jobs:
           echo "writers=$(printf '%s\n' "${writers[@]}" | jq -Rnc '[inputs | select(length > 0)]')" >> "$GITHUB_OUTPUT"
 
   fix:
+    if: github.repository == 'opengeos/RustGIS'
     name: Merge the base and fix review comments
     needs: gate
     runs-on: ubuntu-latest
@@ -641,7 +644,7 @@ jobs:
   push:
     name: Push and reply
     needs: fix
-    if: needs.fix.outputs.work == 'true'
+    if: github.repository == 'opengeos/RustGIS' && (needs.fix.outputs.work == 'true')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -789,7 +792,7 @@ jobs:
   done:
     name: Remove the label
     needs: [gate, fix, push]
-    if: always() && github.event.label.name == 'claude-autofix'
+    if: github.repository == 'opengeos/RustGIS' && (always() && github.event.label.name == 'claude-autofix')
     runs-on: ubuntu-latest
     permissions:
       issues: write
