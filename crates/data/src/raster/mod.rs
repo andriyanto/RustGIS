@@ -13,6 +13,7 @@ mod esri;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gdal;
 pub mod geotiff;
+pub mod gsmap;
 mod lzw;
 pub mod pam;
 pub mod wkt;
@@ -40,7 +41,7 @@ pub const READ_EXTENSIONS: &[&str] = &["tif", "tiff", "asc", "png", "jpg", "jpeg
 /// Whether a file name is a raster this module reads.
 pub fn is_raster_name(name: &str) -> bool {
     let ext = Path::new(name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    READ_EXTENSIONS.contains(&ext.as_str())
+    READ_EXTENSIONS.contains(&ext.as_str()) || gsmap::is_gsmap_name(name)
 }
 
 /// Whether a file name is JPEG 2000's (`.jp2`, `.j2k`): read through GDAL on the desktop, from a
@@ -504,6 +505,15 @@ pub fn read_path(path: &Path) -> Result<Raster> {
     }
     let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("raster").to_string();
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if gsmap::is_gsmap_name(&path.to_string_lossy()) {
+        if meta.len() > gsmap::MAX_FILE_BYTES as u64 {
+            return Err(DataError::Format("GSMaP: the file is larger than a GSMaP grid".into()));
+        }
+        let leaf = path.file_name().and_then(|s| s.to_str()).unwrap_or("gsmap.dat");
+        let mut r = gsmap::read(leaf, &std::fs::read(path)?)?;
+        r.source = Some(path.display().to_string());
+        return Ok(r);
+    }
     let mut r = match ext.as_str() {
         "tif" | "tiff" => {
             #[cfg(not(target_arch = "wasm32"))]
@@ -806,6 +816,9 @@ pub fn read_bytes(file_name: &str, bytes: &[u8]) -> Result<Raster> {
     let p = Path::new(file_name);
     let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("raster").to_string();
     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if gsmap::is_gsmap_name(file_name) {
+        return gsmap::read(file_name, bytes);
+    }
     match ext.as_str() {
         // The parts of a large GeoTIFF the web app read (see `geotiff::read_sparse`).
         "tif" | "tiff" if cog::Sparse::is_container(bytes) => {
